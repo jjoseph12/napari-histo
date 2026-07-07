@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "napari-histo-label-editor"
+version = "0.1.0"
+description = "Histology semantic segmentation label editor for napari"
+requires-python = ">=3.10"
+dependencies = [
+  "napari>=0.6,<0.7",
+  "numpy",
+  "pandas",
+  "imageio",
+  "scipy",
+  "scikit-image",
+  "qtpy",
+  "matplotlib"
+]
+
+[project.entry-points."napari.manifest"]
+napari-histo-label-editor = "napari_histo_label_editor:napari.yaml"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+napari_histo_label_editor = ["napari.yaml"]

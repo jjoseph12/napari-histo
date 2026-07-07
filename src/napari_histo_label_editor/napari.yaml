@@ -1,0 +1,10 @@
+name: napari-histo-label-editor
+display_name: Histology Label Editor
+contributions:
+  commands:
+    - id: napari-histo-label-editor.make_widget
+      python_name: napari_histo_label_editor._widget:LabelEditorWidget
+      title: Histology Label Editor
+  widgets:
+    - command: napari-histo-label-editor.make_widget
+      display_name: Histology Label Editor
