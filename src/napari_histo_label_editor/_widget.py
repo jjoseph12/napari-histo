@@ -203,18 +203,22 @@ class LabelEditorWidget(QWidget):
             labels,
             name="labels",
             opacity=0.45,
+            features=self._label_features(self.class_map),
         )
 
         self.labels_layer.colormap = self._multiclass_colormap(self.class_map)
         self.labels_layer.contour = 0
         self.labels_layer.selected_label = 1
         self.labels_layer.refresh()
+        self.viewer.tooltip.visible = True
 
         self.labels_layer.mouse_drag_callbacks.append(self._snapshot_on_mouse_press)
 
         self._populate_class_buttons()
 
-        self.viewer.status = "Loaded multiclass label layer."
+        self.viewer.status = (
+            "Loaded multiclass label layer. Hover over an area to see its label."
+        )
 
     def _populate_class_buttons(self):
         # Clear old buttons
@@ -315,6 +319,17 @@ class LabelEditorWidget(QWidget):
 
         mapping.setdefault(0, "background")
         return mapping
+
+    @staticmethod
+    def _label_features(class_map: Dict[int, str]) -> pd.DataFrame:
+        """Build label metadata used by napari's status bar and tooltips."""
+        values = sorted(class_map)
+        return pd.DataFrame(
+            {
+                "index": values,
+                "Label": [f"{value} — {class_map[value]}" for value in values],
+            }
+        )
 
     def _multiclass_colormap(self, class_map):
         color_dict = {

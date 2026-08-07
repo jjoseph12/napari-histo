@@ -11,6 +11,7 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * Load an RGB histology image and corresponding integer-valued segmentation mask
 * Load a CSV mapping label values to class names
 * Display semantic segmentation as a colored overlay
+* Hover over any area to see its label value and class name
 * One-click class selection buttons (including **Background**)
 * Native napari editing tools:
 
@@ -131,6 +132,10 @@ The plugin will display:
 * a semantic label overlay
 * one shortcut button for every class
 * a shortcut button for **Background**
+
+Hover over the label overlay to see the label value and class name at the
+cursor (for example, `Label: 3 — Tumor`). The overlay can remain visible while
+using this readout.
 
 ---
 
