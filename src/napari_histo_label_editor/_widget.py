@@ -66,6 +66,7 @@ class LabelEditorWidget(QWidget):
 
         self._build_ui()
         self._bind_hotkeys()
+        self.viewer.mouse_move_callbacks.append(self._show_label_tooltip)
 
     def _build_ui(self):
         layout = QVBoxLayout()
@@ -343,6 +344,34 @@ class LabelEditorWidget(QWidget):
     def _snapshot_on_mouse_press(self, layer, event):
         if event.type == "mouse_press":
             self._snapshot()
+
+    def _show_label_tooltip(self, viewer, event):
+        if self.labels_layer is None:
+            viewer.tooltip.visible = False
+            return
+
+        # Mouse position in layer/data coordinates
+        position = self.labels_layer.world_to_data(event.position)
+
+        y = int(round(position[-2]))
+        x = int(round(position[-1]))
+
+        h, w = self.labels_layer.data.shape
+
+        if not (0 <= y < h and 0 <= x < w):
+            viewer.tooltip.visible = False
+            return
+
+        value = int(self.labels_layer.data[y, x])
+
+        if value == 0:
+            text = "Background"
+        else:
+            class_name = self.class_map.get(value, "Unknown")
+            text = f"{value}: {class_name}"
+
+        viewer.tooltip.text = text
+        viewer.tooltip.visible = True
 
     def undo(self):
         #print(f"undo stack size: {len(self.undo_stack)}")
