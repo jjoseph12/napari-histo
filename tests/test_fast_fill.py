@@ -4,8 +4,13 @@ from unittest.mock import patch
 import numpy as np
 from napari.layers import Labels
 from scipy import ndimage as ndi
+from skimage.segmentation import flood as reference_flood
 
-from napari_histo_label_editor._fast_fill import enable_fast_fill, fast_fill
+from napari_histo_label_editor._fast_fill import (
+    bounded_flood_indices,
+    enable_fast_fill,
+    fast_fill,
+)
 
 
 class FastFillTest(unittest.TestCase):
@@ -146,6 +151,104 @@ class FastFillTest(unittest.TestCase):
             fast_fill(layer, (0, 0), 2)
 
         self.assertTrue(np.all(layer.data == 2))
+
+    def test_bounded_flood_matches_reference_across_expanding_windows(self):
+        labels = np.zeros((256, 320), dtype=np.uint8)
+        labels[30:220, 70:92] = 4
+        labels[190:215, 70:280] = 4
+        seed = (40, 80)
+
+        expected = np.nonzero(
+            reference_flood(labels, seed, connectivity=1)
+        )
+        actual = bounded_flood_indices(
+            labels,
+            seed,
+            initial_window=32,
+            max_local_pixels=labels.size,
+        )
+
+        np.testing.assert_array_equal(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+
+    def test_bounded_flood_matches_reference_for_random_components(self):
+        rng = np.random.default_rng(2048)
+        labels = rng.integers(0, 4, size=(80, 96), dtype=np.uint8)
+
+        for seed in [(0, 0), (17, 23), (40, 48), (79, 95)]:
+            expected = np.nonzero(
+                reference_flood(labels, seed, connectivity=1)
+            )
+            actual = bounded_flood_indices(
+                labels,
+                seed,
+                initial_window=15,
+                max_local_pixels=labels.size,
+            )
+            np.testing.assert_array_equal(actual[0], expected[0])
+            np.testing.assert_array_equal(actual[1], expected[1])
+
+    def test_component_can_leave_initial_window_and_reenter(self):
+        labels = np.zeros((320, 360), dtype=np.uint8)
+        labels[80:86, 80:290] = 6
+        labels[80:270, 284:290] = 6
+        labels[264:270, 35:290] = 6
+        labels[155:270, 35:41] = 6
+        labels[155:161, 35:120] = 6
+        seed = (82, 100)
+
+        expected = np.nonzero(
+            reference_flood(labels, seed, connectivity=1)
+        )
+        actual = bounded_flood_indices(
+            labels,
+            seed,
+            initial_window=32,
+            max_local_pixels=labels.size,
+        )
+
+        np.testing.assert_array_equal(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+
+    def test_small_component_never_allocates_a_full_slide_flood_map(self):
+        labels = np.zeros((4096, 4096), dtype=np.uint8)
+        labels[1900:2100, 1900:2100] = 3
+        allocated_shapes = []
+
+        def recording_flood(data, seed, connectivity):
+            allocated_shapes.append(data.shape)
+            return reference_flood(data, seed, connectivity=connectivity)
+
+        with patch(
+            "napari_histo_label_editor._fast_fill.flood",
+            side_effect=recording_flood,
+        ):
+            indices = bounded_flood_indices(labels, (2000, 2000))
+
+        self.assertEqual(len(indices[0]), 200 * 200)
+        self.assertEqual(allocated_shapes, [(1024, 1024)])
+
+    def test_large_component_uses_compiled_full_array_fallback(self):
+        labels = np.ones((300, 400), dtype=np.uint8)
+        allocated_shapes = []
+
+        def recording_flood(data, seed, connectivity):
+            allocated_shapes.append(data.shape)
+            return reference_flood(data, seed, connectivity=connectivity)
+
+        with patch(
+            "napari_histo_label_editor._fast_fill.flood",
+            side_effect=recording_flood,
+        ):
+            indices = bounded_flood_indices(
+                labels,
+                (150, 200),
+                initial_window=32,
+                max_local_pixels=2000,
+            )
+
+        self.assertEqual(len(indices[0]), labels.size)
+        self.assertEqual(allocated_shapes[-1], labels.shape)
 
 
 if __name__ == "__main__":

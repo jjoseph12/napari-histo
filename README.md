@@ -24,6 +24,7 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * Undo support
 * Memory-efficient editing of large semantic masks
 * Lower-memory connected-region fills for large label images
+* Local-window Bucket searches with a safe large-region fallback
 * Bounding-box polygon rendering instead of full-slide temporary masks
 * Cursor-aligned, high-visibility polygon preview on oversized textures
 * Partial GPU brush updates even when napari downsamples the Labels texture
@@ -265,8 +266,11 @@ without changing label values or the saved file dtype. The plugin retains the
 
 Fill and polygon tools are optimized automatically when data is loaded. A
 connected fill avoids napari 0.6's full-size component-label allocation, and
-polygon drawing allocates a temporary mask only for the polygon's bounding
-box. When an editable Labels layer exceeds the GPU texture limit, brush edits
+starts in a bounded window around the clicked region instead of allocating a
+full-slide flood map for every Bucket action. Genuinely large regions retain a
+safe compiled full-image fallback. Polygon drawing allocates a temporary mask
+only for the polygon's bounding box. When an editable Labels layer exceeds the
+GPU texture limit, brush edits
 update only the changed part of napari's downsampled texture instead of
 refreshing the entire layer. The polygon tool uses a crisp outline and compact
 high-contrast vertices while drawing, compensating for napari's texture scale

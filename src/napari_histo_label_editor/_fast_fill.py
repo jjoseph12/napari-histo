@@ -5,9 +5,11 @@ under the cursor.  That creates a full-size ``int32`` component image in
 addition to boolean masks.  On a slide-sized label image, the temporary
 component image alone can approach a gigabyte.
 
-This module keeps napari's public ``Labels.fill`` behaviour while using
-``skimage.segmentation.flood`` for connected fills.  ``flood`` maintains a
-byte-per-pixel visitation map instead of an ``int32`` component image.
+This module keeps napari's public ``Labels.fill`` behaviour while starting
+``skimage.segmentation.flood`` in a bounded window around the clicked region.
+The window expands only across proven same-label connections and falls back to
+the full compiled search for genuinely large regions. Ordinary objects avoid
+both napari's full ``int32`` component image and a full-slide flood map.
 """
 
 from __future__ import annotations
@@ -20,6 +22,143 @@ from skimage.segmentation import flood
 
 if TYPE_CHECKING:
     from napari.layers import Labels
+
+
+LOCAL_FLOOD_WINDOW = 1024
+MAX_LOCAL_FLOOD_PIXELS = 16 * 1024 * 1024
+
+
+def _mask_indices_with_offset(
+    mask: np.ndarray,
+    row_offset: int = 0,
+    column_offset: int = 0,
+) -> tuple[np.ndarray, np.ndarray]:
+    rows, columns = np.nonzero(mask)
+    rows += row_offset
+    columns += column_offset
+    return rows, columns
+
+
+def bounded_flood_indices(
+    labels: np.ndarray,
+    seed: tuple[int, int],
+    *,
+    initial_window: int = LOCAL_FLOOD_WINDOW,
+    max_local_pixels: int = MAX_LOCAL_FLOOD_PIXELS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return a 4-connected component without starting at full-slide size.
+
+    The search begins in a window around ``seed``. It expands only when a
+    component pixel connects to an equal-valued pixel immediately outside the
+    current window. This is exact: when no such boundary connection exists,
+    the complete global component has been found.
+
+    If the local search itself grows large, the function falls back to
+    scikit-image's full-array flood. That keeps giant/background fills on the
+    efficient compiled path while avoiding a slide-sized temporary boolean
+    array for ordinary bounded regions.
+    """
+    labels = np.asarray(labels)
+    if labels.ndim != 2:
+        raise ValueError("bounded_flood_indices requires a 2D label array")
+    if initial_window < 1:
+        raise ValueError("initial_window must be at least 1")
+    if max_local_pixels < 1:
+        raise ValueError("max_local_pixels must be at least 1")
+
+    height, width = labels.shape
+    seed_row, seed_column = (int(seed[0]), int(seed[1]))
+    old_label = labels[seed_row, seed_column]
+
+    window_height = min(int(initial_window), height)
+    window_width = min(int(initial_window), width)
+    row_start = max(
+        0,
+        min(seed_row - window_height // 2, height - window_height),
+    )
+    column_start = max(
+        0,
+        min(seed_column - window_width // 2, width - window_width),
+    )
+    row_stop = row_start + window_height
+    column_stop = column_start + window_width
+
+    while True:
+        local_labels = labels[row_start:row_stop, column_start:column_stop]
+        local_seed = (seed_row - row_start, seed_column - column_start)
+        matches = flood(local_labels, local_seed, connectivity=1)
+
+        expand_top = bool(
+            row_start > 0
+            and np.any(
+                matches[0]
+                & (labels[row_start - 1, column_start:column_stop] == old_label)
+            )
+        )
+        expand_bottom = bool(
+            row_stop < height
+            and np.any(
+                matches[-1]
+                & (labels[row_stop, column_start:column_stop] == old_label)
+            )
+        )
+        expand_left = bool(
+            column_start > 0
+            and np.any(
+                matches[:, 0]
+                & (labels[row_start:row_stop, column_start - 1] == old_label)
+            )
+        )
+        expand_right = bool(
+            column_stop < width
+            and np.any(
+                matches[:, -1]
+                & (labels[row_start:row_stop, column_stop] == old_label)
+            )
+        )
+
+        if not (
+            expand_top or expand_bottom or expand_left or expand_right
+        ):
+            return _mask_indices_with_offset(
+                matches,
+                row_start,
+                column_start,
+            )
+
+        current_height = row_stop - row_start
+        current_width = column_stop - column_start
+        next_row_start = (
+            max(0, row_start - current_height)
+            if expand_top
+            else row_start
+        )
+        next_row_stop = (
+            min(height, row_stop + current_height)
+            if expand_bottom
+            else row_stop
+        )
+        next_column_start = (
+            max(0, column_start - current_width)
+            if expand_left
+            else column_start
+        )
+        next_column_stop = (
+            min(width, column_stop + current_width)
+            if expand_right
+            else column_stop
+        )
+        next_pixels = (next_row_stop - next_row_start) * (
+            next_column_stop - next_column_start
+        )
+
+        if next_pixels > max_local_pixels:
+            # Release the local mask before allocating the full fallback.
+            del matches
+            return np.nonzero(flood(labels, seed, connectivity=1))
+
+        row_start, row_stop = next_row_start, next_row_stop
+        column_start, column_stop = next_column_start, next_column_stop
 
 
 def fast_fill(
@@ -77,14 +216,23 @@ def fast_fill(
     if layer.contiguous:
         # scipy.ndimage.label's default footprint uses orthogonal neighbors,
         # so connectivity=1 is required for exact napari equivalence.
-        matches = flood(labels, slice_coord, connectivity=1)
+        if labels.ndim == 2:
+            match_indices_local = bounded_flood_indices(
+                labels,
+                slice_coord,
+            )
+            matches = None
+        else:
+            matches = flood(labels, slice_coord, connectivity=1)
+            match_indices_local = np.nonzero(matches)
     else:
         matches = labels == old_label
+        match_indices_local = np.nonzero(matches)
 
-    match_indices_local = np.nonzero(matches)
-    # ``nonzero`` owns its coordinate arrays, so release the full-size mask
-    # before ``data_setitem`` allocates its changed-pixel/history arrays.
-    del matches
+    if matches is not None:
+        # ``nonzero`` owns its coordinate arrays, so release the mask before
+        # ``data_setitem`` allocates its changed-pixel/history arrays.
+        del matches
     if layer.ndim not in {2, layer.n_edit_dimensions}:
         n_indices = len(match_indices_local[0])
         match_indices = []
