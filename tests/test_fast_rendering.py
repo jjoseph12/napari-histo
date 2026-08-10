@@ -222,7 +222,7 @@ class FastPolygonPreviewTest(unittest.TestCase):
         viewer = make_viewer(layer, labels_visual, polygon_visual)
         return viewer, layer, overlay, polygon_visual
 
-    def test_polygon_preview_is_visible_fast_outline_with_large_nodes(self):
+    def test_polygon_preview_uses_compact_high_contrast_nodes(self):
         viewer, layer, overlay, visual = self.setup_overlay()
         self.assertTrue(optimize_polygon_preview(viewer, layer))
 
@@ -234,8 +234,16 @@ class FastPolygonPreviewTest(unittest.TestCase):
         self.assertTrue(visual._line.visible)
         self.assertEqual(visual._line.method, "gl")
         self.assertEqual(visual._polygon.border.method, "gl")
-        self.assertEqual(visual._nodes_kwargs["size"], 14.0)
-        self.assertEqual(visual._nodes_kwargs["edge_width"], 2.0)
+        self.assertEqual(visual._nodes_kwargs["size"], 8.0)
+        self.assertEqual(visual._nodes_kwargs["edge_width"], 1.25)
+        self.assertEqual(
+            visual._nodes_kwargs["face_color"],
+            (1.0, 1.0, 1.0, 0.9),
+        )
+        self.assertEqual(
+            visual._nodes_kwargs["edge_color"],
+            (0.1, 0.1, 0.1, 1.0),
+        )
 
         expected_points = np.array(
             [[2, 1], [4, 3], [6, 5], [2, 1]]
@@ -243,7 +251,7 @@ class FastPolygonPreviewTest(unittest.TestCase):
         np.testing.assert_array_equal(
             visual._line.calls[-1]["pos"], expected_points
         )
-        self.assertEqual(visual._line.calls[-1]["width"], 3.0)
+        self.assertEqual(visual._line.calls[-1]["width"], 2.0)
 
     def test_preview_compensates_for_oversized_texture_scale(self):
         viewer, layer, overlay, visual = self.setup_overlay()

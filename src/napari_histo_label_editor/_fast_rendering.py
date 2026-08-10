@@ -7,8 +7,8 @@ layer refresh after every brush update.  This module maps each small changed
 rectangle onto the already-downsampled texture instead.
 
 The stock polygon overlay also triangulates a translucent filled polygon on
-every mouse movement.  The optimized preview uses a thick OpenGL outline and
-larger vertices while drawing, avoiding that repeated triangulation.
+every mouse movement. The optimized preview uses a crisp OpenGL outline and
+compact high-contrast vertices, avoiding that repeated triangulation.
 """
 
 from __future__ import annotations
@@ -17,6 +17,11 @@ from types import MethodType
 from typing import Any
 
 import numpy as np
+
+
+POLYGON_LINE_WIDTH = 2.0
+POLYGON_VERTEX_SIZE = 8.0
+POLYGON_VERTEX_EDGE_WIDTH = 1.25
 
 
 def _qt_viewer(viewer: Any) -> Any | None:
@@ -192,20 +197,20 @@ def fast_polygon_points_change(visual: Any, event: Any = None) -> None:
         points = np.empty((0, 2))
 
     # Never construct the filled preview: VisPy triangulates it on every mouse
-    # move.  A closed outline plus large vertices is faster and easier to see.
+    # move. A closed outline plus compact vertices is faster and easy to see.
     visual._polygon.visible = False
     visual._line.visible = number_of_points >= 2
     if visual._line.visible:
         outline = points
         if number_of_points > 2:
             outline = np.concatenate([points, points[:1]], axis=0)
-        visual._line.set_data(pos=outline, width=3.0)
+        visual._line.set_data(pos=outline, width=POLYGON_LINE_WIDTH)
 
     visual._nodes.set_data(pos=points, **visual._nodes_kwargs)
 
 
 def optimize_polygon_preview(viewer: Any, layer: Any) -> bool:
-    """Install the fast, thick outline-and-vertices polygon preview."""
+    """Install the fast, compact outline-and-vertices polygon preview."""
     qt_viewer = _qt_viewer(viewer)
     canvas = getattr(qt_viewer, "canvas", None)
     overlay_mapping = getattr(canvas, "_layer_overlay_to_visual", None)
@@ -234,9 +239,14 @@ def optimize_polygon_preview(viewer: Any, layer: Any) -> bool:
     replacement_connected = False
     try:
         visual._line.method = "gl"
-        visual._line.set_data(width=3.0)
+        visual._line.set_data(width=POLYGON_LINE_WIDTH)
         visual._polygon.border.method = "gl"
-        visual._nodes_kwargs.update(size=14.0, edge_width=2.0)
+        visual._nodes_kwargs.update(
+            size=POLYGON_VERTEX_SIZE,
+            edge_width=POLYGON_VERTEX_EDGE_WIDTH,
+            face_color=(1.0, 1.0, 1.0, 0.9),
+            edge_color=(0.1, 0.1, 0.1, 1.0),
+        )
         visual._napari_histo_original_polygon_points_change = current
         visual._on_points_change = replacement
         emitter.connect(replacement)

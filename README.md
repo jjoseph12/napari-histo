@@ -268,11 +268,11 @@ connected fill avoids napari 0.6's full-size component-label allocation, and
 polygon drawing allocates a temporary mask only for the polygon's bounding
 box. When an editable Labels layer exceeds the GPU texture limit, brush edits
 update only the changed part of napari's downsampled texture instead of
-refreshing the entire layer. The polygon tool uses a thick outline and larger
-vertices while drawing, compensating for napari's texture scale so the preview
-stays under the cursor. Large RGB images are displayed as a lightweight
-multiscale pyramid. These changes are transparent to the normal napari
-workflow.
+refreshing the entire layer. The polygon tool uses a crisp outline and compact
+high-contrast vertices while drawing, compensating for napari's texture scale
+so the preview stays under the cursor. Large RGB images are displayed as a
+lightweight multiscale pyramid. These changes are transparent to the normal
+napari workflow.
 
 ---
 
