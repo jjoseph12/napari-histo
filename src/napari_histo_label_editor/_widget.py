@@ -53,16 +53,13 @@ class LabelEditorWidget(QWidget):
         self.image_path: Optional[Path] = None
         self.labels_path: Optional[Path] = None
         self.mapping_path: Optional[Path] = None
+        self._labels_output_dtype: Optional[np.dtype] = None
 
         self.class_button_layout = None
 
         self.class_map: Dict[int, str] = {}
-        self.undo_stack = []
-        self.max_undo = 20
 
         self.labels_layer = None
-        self.undo_stack = []
-        self.max_undo = 20
 
         self._build_ui()
         self._bind_hotkeys()
@@ -178,20 +175,11 @@ class LabelEditorWidget(QWidget):
                 f"Image and labels differ: {image.shape[:2]} vs {labels.shape}"
             )
 
-        labels = labels.astype(np.int32, copy=False)
         self.class_map = self._read_class_map(self.mapping_path)
+        self._labels_output_dtype = labels.dtype
+        labels = self._compact_labels(labels, self.class_map)
 
         self.viewer.layers.clear()
-        self.undo_stack.clear()
-
-        self.viewer.add_image(
-            image,
-            name="histology",
-            rgb=image.ndim == 3 and image.shape[-1] in (3, 4),
-        )
-
-        self.viewer.layers.clear()
-        self.undo_stack.clear()
 
         self.viewer.add_image(
             image,
@@ -209,10 +197,10 @@ class LabelEditorWidget(QWidget):
         self.labels_layer.colormap = self._multiclass_colormap(self.class_map)
         self.labels_layer.contour = 0
         self.labels_layer.selected_label = 1
+        self.labels_layer.n_edit_dimensions = 2
+        self.labels_layer.contiguous = True
         self.labels_layer.refresh()
         self.viewer.tooltip.visible = True
-
-        self.labels_layer.mouse_drag_callbacks.append(self._snapshot_on_mouse_press)
 
         self._populate_class_buttons()
 
@@ -344,30 +332,64 @@ class LabelEditorWidget(QWidget):
 
         return DirectLabelColormap(color_dict=color_dict)
 
-    def _snapshot(self):
-        if self.labels_layer is None:
-            print("snapshot skipped: no labels_layer")
-            return
+    @staticmethod
+    def _compact_labels(
+        labels: np.ndarray,
+        class_map: Dict[int, str],
+    ) -> np.ndarray:
+        """Use the smallest integer dtype that can represent all labels.
 
-        #print("snapshot taken")
-        self.undo_stack.append(np.asarray(self.labels_layer.data).copy())
+        The editor previously forced every mask to int32. For a large semantic
+        mask with only a few classes, that needlessly quadruples memory use.
+        """
+        labels = np.asarray(labels)
+        is_integer = np.issubdtype(labels.dtype, np.integer)
+        if not (is_integer or labels.dtype == np.bool_):
+            raise ValueError(
+                f"Label image must have an integer dtype. Got {labels.dtype}"
+            )
 
-        if len(self.undo_stack) > self.max_undo:
-            self.undo_stack.pop(0)
+        if labels.size:
+            minimum = int(labels.min())
+            maximum = int(labels.max())
+        else:
+            minimum = maximum = 0
 
-    def _snapshot_on_mouse_press(self, layer, event):
-        if event.type == "mouse_press":
-            self._snapshot()
+        if class_map:
+            minimum = min(minimum, min(class_map))
+            maximum = max(maximum, max(class_map))
+
+        candidates = (
+            (np.uint8, np.uint16, np.uint32, np.uint64)
+            if minimum >= 0
+            else (np.int8, np.int16, np.int32, np.int64)
+        )
+        for dtype in candidates:
+            limits = np.iinfo(dtype)
+            if limits.min <= minimum and maximum <= limits.max:
+                return labels.astype(dtype, copy=False)
+
+        raise ValueError(
+            f"Label values from {minimum} to {maximum} exceed supported integer ranges"
+        )
+
+    @staticmethod
+    def _undo_labels_layer(layer) -> bool:
+        """Undo one edit using napari's sparse, changed-pixel history."""
+        history = getattr(layer, "_undo_history", None)
+        undo = getattr(layer, "undo", None)
+        if undo is None or (history is not None and not history):
+            return False
+        undo()
+        return True
 
     def undo(self):
-        #print(f"undo stack size: {len(self.undo_stack)}")
-
-        if self.labels_layer is None or not self.undo_stack:
+        if self.labels_layer is None or not self._undo_labels_layer(
+            self.labels_layer
+        ):
             self.viewer.status = "Nothing to undo."
             return
 
-        self.labels_layer.data = self.undo_stack.pop()
-        self.labels_layer.refresh()
         self.viewer.status = "Undo complete."
 
     def save_labels(self):
@@ -376,7 +398,9 @@ class LabelEditorWidget(QWidget):
             return
 
         try:
-            labels = np.asarray(self.labels_layer.data).astype(np.int32)
+            labels = np.asarray(self.labels_layer.data)
+            if self._labels_output_dtype is not None:
+                labels = labels.astype(self._labels_output_dtype, copy=False)
             iio.imwrite(self.labels_path, labels)
         except Exception as e:
             QMessageBox.critical(self, "Save failed", str(e))

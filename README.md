@@ -22,6 +22,7 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * Adjustable overlay opacity
 * Keyboard shortcut for saving
 * Undo support
+* Memory-efficient editing of large semantic masks
 * Saves edits directly back to the original label image
 
 ---
@@ -236,6 +237,11 @@ Undo
 
 to revert the previous edit.
 
+Undo uses napari's changed-pixel history, so each action stores only the
+edited pixels instead of copying the complete label image. Large masks are
+also kept in the smallest safe integer dtype while open, reducing memory use
+without changing label values or the saved file dtype.
+
 ---
 
 # Tips
@@ -270,7 +276,7 @@ Potential future features include:
 * Keyboard shortcuts for rapid class switching
 * Custom color palettes
 * Morphological editing tools
-* Support for very large whole-slide images using multiscale pyramids
+* Transparent tiled editing for images that exceed the GPU texture limit
 * Support for loading and saving OME-TIFF segmentations
 
 ---
