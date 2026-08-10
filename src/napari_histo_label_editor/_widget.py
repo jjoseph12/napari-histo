@@ -7,6 +7,7 @@ import imageio.v3 as iio
 import numpy as np
 import pandas as pd
 from PIL import Image
+from napari.qt.threading import create_worker
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QLineEdit, QFileDialog, QMessageBox, QGridLayout, 
@@ -18,7 +19,13 @@ from napari.viewer import Viewer
 from napari.utils.colormaps import DirectLabelColormap
 from matplotlib.colors import to_rgba
 
+from ._fast_fill import enable_fast_fill
+from ._fast_polygon import enable_fast_polygon
+from ._io import atomic_save_labels, build_image_pyramid
+
 Image.MAX_IMAGE_PIXELS = None
+
+MAX_UNDO_HISTORY = 20
 
 
 CLASS_COLORS = [
@@ -54,6 +61,8 @@ class LabelEditorWidget(QWidget):
         self.labels_path: Optional[Path] = None
         self.mapping_path: Optional[Path] = None
         self._labels_output_dtype: Optional[np.dtype] = None
+        self._save_worker = None
+        self._labels_was_editable = True
 
         self.class_button_layout = None
 
@@ -110,9 +119,9 @@ class LabelEditorWidget(QWidget):
 
         layout.addWidget(self.class_button_scroll)
 
-        save_btn = QPushButton("Save [s]")
-        save_btn.clicked.connect(self.save_labels)
-        layout.addWidget(save_btn)
+        self.save_btn = QPushButton("Save [s]")
+        self.save_btn.clicked.connect(self.save_labels)
+        layout.addWidget(self.save_btn)
 
         undo_btn = QPushButton("Undo [u]")
         undo_btn.clicked.connect(self.undo)
@@ -181,10 +190,14 @@ class LabelEditorWidget(QWidget):
 
         self.viewer.layers.clear()
 
+        is_rgb = image.ndim == 3 and image.shape[-1] in (3, 4)
+        image_pyramid = build_image_pyramid(image) if is_rgb else [image]
+        image_data = image_pyramid if len(image_pyramid) > 1 else image
         self.viewer.add_image(
-            image,
+            image_data,
             name="histology",
-            rgb=image.ndim == 3 and image.shape[-1] in (3, 4),
+            rgb=is_rgb,
+            multiscale=len(image_pyramid) > 1,
         )
 
         self.labels_layer = self.viewer.add_labels(
@@ -199,7 +212,9 @@ class LabelEditorWidget(QWidget):
         self.labels_layer.selected_label = 1
         self.labels_layer.n_edit_dimensions = 2
         self.labels_layer.contiguous = True
-        self.labels_layer.refresh()
+        self._limit_undo_history(self.labels_layer)
+        enable_fast_fill(self.labels_layer)
+        enable_fast_polygon(self.labels_layer)
         self.viewer.tooltip.visible = True
 
         self._populate_class_buttons()
@@ -383,6 +398,15 @@ class LabelEditorWidget(QWidget):
         undo()
         return True
 
+    @staticmethod
+    def _limit_undo_history(layer, limit: int = MAX_UNDO_HISTORY) -> None:
+        """Bound napari's sparse edit history for predictable memory use."""
+        reset_history = getattr(layer, "_reset_history", None)
+        if reset_history is None:
+            return
+        layer._history_limit = int(limit)
+        reset_history()
+
     def undo(self):
         if self.labels_layer is None or not self._undo_labels_layer(
             self.labels_layer
@@ -397,13 +421,44 @@ class LabelEditorWidget(QWidget):
             self.viewer.status = "No labels loaded."
             return
 
-        try:
-            labels = np.asarray(self.labels_layer.data)
-            if self._labels_output_dtype is not None:
-                labels = labels.astype(self._labels_output_dtype, copy=False)
-            iio.imwrite(self.labels_path, labels)
-        except Exception as e:
-            QMessageBox.critical(self, "Save failed", str(e))
+        if self._save_worker is not None and self._save_worker.is_running:
+            self.viewer.status = "A label save is already running."
             return
 
-        self.viewer.status = f"Saved labels to {self.labels_path}"
+        labels = np.asarray(self.labels_layer.data)
+        output_dtype = (
+            labels.dtype
+            if self._labels_output_dtype is None
+            else self._labels_output_dtype
+        )
+        self._labels_was_editable = self.labels_layer.editable
+        self.labels_layer.editable = False
+        self.save_btn.setEnabled(False)
+        self.viewer.status = f"Saving labels to {self.labels_path}…"
+
+        worker = create_worker(
+            atomic_save_labels,
+            labels,
+            self.labels_path,
+            output_dtype,
+            _start_thread=False,
+            _ignore_errors=True,
+        )
+        worker.returned.connect(self._on_save_complete)
+        worker.errored.connect(self._on_save_error)
+        worker.finished.connect(self._on_save_finished)
+        self._save_worker = worker
+        worker.start()
+
+    def _on_save_complete(self, saved_path: Path) -> None:
+        self.viewer.status = f"Saved labels to {saved_path}"
+
+    def _on_save_error(self, error: Exception) -> None:
+        self.viewer.status = f"Save failed: {error}"
+        QMessageBox.critical(self, "Save failed", str(error))
+
+    def _on_save_finished(self) -> None:
+        if self.labels_layer is not None:
+            self.labels_layer.editable = self._labels_was_editable
+        self.save_btn.setEnabled(True)
+        self._save_worker = None

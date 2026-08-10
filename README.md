@@ -23,6 +23,10 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * Keyboard shortcut for saving
 * Undo support
 * Memory-efficient editing of large semantic masks
+* Lower-memory connected-region fills for large label images
+* Bounding-box polygon rendering instead of full-slide temporary masks
+* Automatic multiscale display for large RGB images
+* Non-blocking, atomic saves that keep the interface responsive
 * Saves edits directly back to the original label image
 
 ---
@@ -78,6 +82,17 @@ Example:
 mamba create -n napari-env python=3.11 napari
 mamba activate napari-env
 ```
+
+For a new Qt 6 environment, the equivalent conda-forge command is:
+
+```bash
+conda create -n napari-histo -c conda-forge python=3.12 napari pyqt=6
+conda activate napari-histo
+```
+
+QtPy is the compatibility layer used by the plugin; `pyqt=6` is the actual
+Qt 6 GUI backend. Installing from conda-forge is supported and does not
+require any plugin code changes.
 
 Clone the repository:
 
@@ -217,7 +232,10 @@ or click
 Save
 ```
 
-The edited segmentation is written back to the original label image.
+The edited segmentation is written back to the original label image. Saving
+runs in the background, temporarily pauses editing, and atomically replaces
+the old file only after the new image is complete. Wait for the status bar to
+say that saving finished before closing napari.
 
 ---
 
@@ -240,7 +258,15 @@ to revert the previous edit.
 Undo uses napari's changed-pixel history, so each action stores only the
 edited pixels instead of copying the complete label image. Large masks are
 also kept in the smallest safe integer dtype while open, reducing memory use
-without changing label values or the saved file dtype.
+without changing label values or the saved file dtype. The plugin retains the
+20 most recent undo actions to keep memory use predictable.
+
+Fill and polygon tools are optimized automatically when data is loaded. A
+connected fill avoids napari 0.6's full-size component-label allocation, and
+polygon drawing allocates a temporary mask only for the polygon's bounding
+box. Large RGB images are displayed as a lightweight multiscale pyramid, so
+zoomed-out rendering does not continually send the full-resolution slide to
+the GPU. These changes are transparent to the normal napari workflow.
 
 ---
 
@@ -276,7 +302,7 @@ Potential future features include:
 * Keyboard shortcuts for rapid class switching
 * Custom color palettes
 * Morphological editing tools
-* Transparent tiled editing for images that exceed the GPU texture limit
+* On-disk chunked editing for masks larger than available system memory
 * Support for loading and saving OME-TIFF segmentations
 
 ---

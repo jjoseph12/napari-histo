@@ -1,6 +1,7 @@
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from time import monotonic, sleep
 
 import imageio.v3 as iio
 import numpy as np
@@ -9,6 +10,8 @@ from napari.components import ViewerModel
 from napari.layers import Labels
 from qtpy.QtWidgets import QApplication
 
+from napari_histo_label_editor._fast_fill import fast_fill
+from napari_histo_label_editor._fast_polygon import fast_paint_polygon
 from napari_histo_label_editor._widget import LabelEditorWidget
 
 
@@ -73,6 +76,14 @@ class LoadSaveIntegrationTest(unittest.TestCase):
     def setUpClass(cls):
         cls.app = QApplication.instance() or QApplication([])
 
+    def wait_for_save(self, widget, timeout=5):
+        deadline = monotonic() + timeout
+        while widget._save_worker is not None:
+            self.app.processEvents()
+            if monotonic() >= deadline:
+                self.fail("Background label save did not finish")
+            sleep(0.005)
+
     def test_large_mask_optimizations_are_automatic_and_lossless(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -108,9 +119,16 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(widget._labels_output_dtype, np.dtype(np.int32))
             self.assertEqual(widget.labels_layer.n_edit_dimensions, 2)
             self.assertTrue(widget.labels_layer.contiguous)
+            self.assertEqual(widget.labels_layer._undo_history.maxlen, 20)
+            self.assertIs(widget.labels_layer.fill.__func__, fast_fill)
+            self.assertIs(
+                widget.labels_layer.paint_polygon.__func__,
+                fast_paint_polygon,
+            )
 
             widget.labels_layer.data[0, 0] = 1
             widget.save_labels()
+            self.wait_for_save(widget)
             saved = iio.imread(labels_path)
 
             self.assertEqual(saved.shape, original.shape)
