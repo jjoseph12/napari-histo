@@ -21,6 +21,7 @@ from matplotlib.colors import to_rgba
 
 from ._fast_fill import enable_fast_fill
 from ._fast_polygon import enable_fast_polygon
+from ._fast_rendering import enable_fast_rendering
 from ._io import atomic_save_labels, build_image_pyramid
 
 Image.MAX_IMAGE_PIXELS = None
@@ -215,6 +216,7 @@ class LabelEditorWidget(QWidget):
         self._limit_undo_history(self.labels_layer)
         enable_fast_fill(self.labels_layer)
         enable_fast_polygon(self.labels_layer)
+        enable_fast_rendering(self.viewer, self.labels_layer)
         self.viewer.tooltip.visible = True
 
         self._populate_class_buttons()
