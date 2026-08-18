@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from pathlib import Path
 from typing import Dict, Optional
 
@@ -33,6 +34,9 @@ from ._io import atomic_save_labels, build_image_pyramid
 Image.MAX_IMAGE_PIXELS = None
 
 MAX_UNDO_HISTORY = 20
+OVERSIZED_TEXTURE_WARNING = (
+    r"data shape .* exceeds GL_MAX_TEXTURE_SIZE.*"
+)
 
 
 CLASS_COLORS = [
@@ -227,12 +231,19 @@ class LabelEditorWidget(QWidget):
             multiscale=len(image_pyramid) > 1,
         )
 
-        self.labels_layer = self.viewer.add_labels(
-            labels,
-            name="labels",
-            opacity=0.45,
-            features=self._label_features(self.class_map),
-        )
+        # This oversized-texture warning is expected and handled immediately
+        # below by a balanced display texture; editing data stays full-size.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message=OVERSIZED_TEXTURE_WARNING,
+            )
+            self.labels_layer = self.viewer.add_labels(
+                labels,
+                name="labels",
+                opacity=0.45,
+                features=self._label_features(self.class_map),
+            )
 
         self.labels_layer.colormap = self._multiclass_colormap(self.class_map)
         self.labels_layer.contour = 0
@@ -472,7 +483,12 @@ class LabelEditorWidget(QWidget):
 
         if self.labels_layer is not None:
             if promoted_data is not None:
-                self.labels_layer.data = promoted_data
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=OVERSIZED_TEXTURE_WARNING,
+                    )
+                    self.labels_layer.data = promoted_data
                 enable_fast_fill(self.labels_layer)
                 enable_fast_polygon(self.labels_layer)
                 enable_fast_rendering(self.viewer, self.labels_layer)

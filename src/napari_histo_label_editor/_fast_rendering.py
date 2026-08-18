@@ -13,6 +13,7 @@ compact high-contrast vertices, avoiding that repeated triangulation.
 
 from __future__ import annotations
 
+import warnings
 from types import MethodType
 from typing import Any
 
@@ -22,6 +23,7 @@ import numpy as np
 POLYGON_LINE_WIDTH = 2.0
 POLYGON_VERTEX_SIZE = 8.0
 POLYGON_VERTEX_EDGE_WIDTH = 1.25
+MAX_LABEL_TEXTURE_SIZE = 8192
 
 
 def _qt_viewer(viewer: Any) -> Any | None:
@@ -41,6 +43,74 @@ def _labels_visual(viewer: Any, layer: Any) -> Any | None:
         return mapping[layer]
     except (KeyError, TypeError):
         return None
+
+
+def limit_labels_texture_size(
+    viewer: Any,
+    layer: Any,
+    max_size: int = MAX_LABEL_TEXTURE_SIZE,
+) -> bool:
+    """Limit the fixed Labels display texture used during pan and zoom.
+
+    Editable Labels layers cannot use napari's multiscale image path. On a
+    GPU whose maximum texture axis is 16384, a 13619 x 17072 label mask would
+    therefore remain a roughly 116-million-texel texture. A balanced 8192-px
+    cap reduces that to about 39 million texels while the layer's source data,
+    edit coordinates, saving, and undo remain full resolution.
+    """
+    if not isinstance(max_size, int) or isinstance(max_size, bool):
+        raise TypeError("max_size must be an integer")
+    if max_size < 1:
+        raise ValueError("max_size must be at least 1")
+
+    visual = _labels_visual(viewer, layer)
+    if visual is None:
+        return False
+
+    current = getattr(visual, "MAX_TEXTURE_SIZE_2D", None)
+    if current is None:
+        return False
+
+    target = min(int(current), max_size)
+    if int(current) <= target:
+        return True
+
+    refresh = getattr(visual, "_on_data_change", None)
+    if refresh is None:
+        return False
+
+    try:
+        original_tile_scale = np.asarray(
+            layer._transforms["tile2data"].scale,
+            dtype=float,
+        ).copy()
+    except (AttributeError, KeyError, TypeError, ValueError):
+        original_tile_scale = None
+
+    visual.MAX_TEXTURE_SIZE_2D = target
+    try:
+        raw_shape = tuple(layer._slice.image.raw.shape[:2])
+        if any(int(dimension) > target for dimension in raw_shape):
+            # napari's message calls the configured cap GL_MAX_TEXTURE_SIZE.
+            # Here the lower cap is intentional rather than a hardware limit.
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"data shape .* exceeds GL_MAX_TEXTURE_SIZE.*",
+                )
+                refresh()
+    except Exception:
+        visual.MAX_TEXTURE_SIZE_2D = current
+        if original_tile_scale is not None:
+            try:
+                layer._transforms["tile2data"].scale = original_tile_scale
+                matrix_change = getattr(visual, "_on_matrix_change", None)
+                if callable(matrix_change):
+                    matrix_change()
+            except Exception:
+                pass
+        return False
+    return True
 
 
 def fast_partial_labels_update(visual: Any, event: Any) -> None:
@@ -263,6 +333,7 @@ def optimize_polygon_preview(viewer: Any, layer: Any) -> bool:
 
 def enable_fast_rendering(viewer: Any, layer: Any) -> tuple[bool, bool]:
     """Enable oversized-texture and polygon-preview optimizations."""
+    limit_labels_texture_size(viewer, layer)
     return (
         enable_fast_texture_updates(viewer, layer),
         optimize_polygon_preview(viewer, layer),
@@ -270,9 +341,11 @@ def enable_fast_rendering(viewer: Any, layer: Any) -> tuple[bool, bool]:
 
 
 __all__ = [
+    "MAX_LABEL_TEXTURE_SIZE",
     "enable_fast_rendering",
     "enable_fast_texture_updates",
     "fast_partial_labels_update",
     "fast_polygon_points_change",
+    "limit_labels_texture_size",
     "optimize_polygon_preview",
 ]

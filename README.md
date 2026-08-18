@@ -30,6 +30,7 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * Bounding-box polygon rendering instead of full-slide temporary masks
 * Cursor-aligned, high-visibility polygon preview on oversized textures
 * Partial GPU brush updates even when napari downsamples the Labels texture
+* Balanced large-label display textures for smoother pan and zoom
 * Automatic multiscale display for large RGB images
 * Non-blocking, atomic saves that keep the interface responsive
 * Saves edits directly back to the original label image
@@ -292,13 +293,14 @@ starts in a bounded window around the clicked region instead of allocating a
 full-slide flood map for every Bucket action. Genuinely large regions retain a
 safe compiled full-image fallback. Polygon drawing allocates a temporary mask
 only for the polygon's bounding box. When an editable Labels layer exceeds the
-GPU texture limit, brush edits
-update only the changed part of napari's downsampled texture instead of
-refreshing the entire layer. The polygon tool uses a crisp outline and compact
-high-contrast vertices while drawing, compensating for napari's texture scale
-so the preview stays under the cursor. Large RGB images are displayed as a
-lightweight multiscale pyramid. These changes are transparent to the normal
-napari workflow.
+GPU texture limit, the editor automatically uses a balanced 8192-pixel display
+texture for smoother pan and zoom, and brush edits update only its changed
+part instead of refreshing the entire layer. The source mask, edit coordinates,
+undo history, and saved output remain full resolution. The polygon tool uses a
+crisp outline and compact high-contrast vertices while drawing, compensating
+for napari's texture scale so the preview stays under the cursor. Large RGB
+images are displayed as a lightweight multiscale pyramid. These changes are
+transparent to the normal napari workflow.
 
 ---
 

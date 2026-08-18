@@ -4,9 +4,11 @@ from types import SimpleNamespace
 import numpy as np
 
 from napari_histo_label_editor._fast_rendering import (
+    MAX_LABEL_TEXTURE_SIZE,
     enable_fast_texture_updates,
     fast_partial_labels_update,
     fast_polygon_points_change,
+    limit_labels_texture_size,
     optimize_polygon_preview,
 )
 
@@ -58,7 +60,7 @@ class FakeLayer:
     def __init__(self, raw_shape):
         self.loaded = True
         self._slice = SimpleNamespace(
-            image=SimpleNamespace(raw=np.zeros(raw_shape, dtype=np.uint8))
+            image=SimpleNamespace(raw=SimpleNamespace(shape=raw_shape))
         )
         self.events = SimpleNamespace(labels_update=FakeEmitter())
         self.refresh_count = 0
@@ -76,10 +78,19 @@ class FakeLabelsVisual:
         self.layer = layer
         self.node = FakeNode(texture_shape)
         self.original_count = 0
+        self.MAX_TEXTURE_SIZE_2D = 16_384
+        self.data_change_count = 0
+        self.matrix_change_count = 0
 
     def _on_partial_labels_update(self, event):
         del event
         self.original_count += 1
+
+    def _on_data_change(self):
+        self.data_change_count += 1
+
+    def _on_matrix_change(self):
+        self.matrix_change_count += 1
 
 
 def make_viewer(layer, labels_visual, polygon_visual=None):
@@ -148,6 +159,17 @@ class FastPartialLabelsUpdateTest(unittest.TestCase):
         np.testing.assert_array_equal(upload["data"], update)
         self.assertEqual(upload["offset"], (3, 4))
 
+    def test_nonuniform_texture_factors_keep_updates_aligned(self):
+        viewer, layer, visual = self.setup_visual((20, 30), (10, 10))
+        enable_fast_texture_updates(viewer, layer)
+        update = np.arange(40, dtype=np.uint8).reshape(5, 8)
+
+        layer.events.labels_update.emit(data=update, offset=(3, 4))
+
+        upload = visual.node._texture.uploads[0]
+        np.testing.assert_array_equal(upload["data"], update[1::2, 2::3])
+        self.assertEqual(upload["offset"], (2, 2))
+
     def test_unknown_texture_layout_uses_napari_fallback(self):
         viewer, layer, visual = self.setup_visual((6, 10), (4, 4))
         enable_fast_texture_updates(viewer, layer)
@@ -171,6 +193,69 @@ class FastPartialLabelsUpdateTest(unittest.TestCase):
             fast_partial_labels_update,
         )
         self.assertEqual(len(layer.events.labels_update.callbacks), 1)
+
+
+class LabelTextureLimitTest(unittest.TestCase):
+    def setup_visual(self, raw_shape):
+        layer = FakeLayer(raw_shape)
+        visual = FakeLabelsVisual(layer, raw_shape)
+        viewer = make_viewer(layer, visual)
+        return viewer, layer, visual
+
+    def test_large_labels_use_balanced_navigation_texture_cap(self):
+        viewer, layer, visual = self.setup_visual((13_619, 17_072))
+
+        self.assertTrue(limit_labels_texture_size(viewer, layer))
+
+        self.assertEqual(
+            visual.MAX_TEXTURE_SIZE_2D,
+            MAX_LABEL_TEXTURE_SIZE,
+        )
+        self.assertEqual(visual.data_change_count, 1)
+
+    def test_texture_limit_is_idempotent(self):
+        viewer, layer, visual = self.setup_visual((13_619, 17_072))
+
+        limit_labels_texture_size(viewer, layer)
+        limit_labels_texture_size(viewer, layer)
+
+        self.assertEqual(visual.data_change_count, 1)
+
+    def test_smaller_hardware_limit_is_preserved(self):
+        viewer, layer, visual = self.setup_visual((13_619, 17_072))
+        visual.MAX_TEXTURE_SIZE_2D = 4096
+
+        self.assertTrue(limit_labels_texture_size(viewer, layer))
+
+        self.assertEqual(visual.MAX_TEXTURE_SIZE_2D, 4096)
+        self.assertEqual(visual.data_change_count, 0)
+
+    def test_small_labels_do_not_need_an_extra_upload(self):
+        viewer, layer, visual = self.setup_visual((1024, 2048))
+
+        self.assertTrue(limit_labels_texture_size(viewer, layer))
+
+        self.assertEqual(visual.MAX_TEXTURE_SIZE_2D, 8192)
+        self.assertEqual(visual.data_change_count, 0)
+
+    def test_failed_upload_restores_cap_and_texture_transform(self):
+        viewer, layer, visual = self.setup_visual((13_619, 17_072))
+        original_scale = layer._transforms["tile2data"].scale.copy()
+
+        def fail_after_transform_change():
+            layer._transforms["tile2data"].scale = np.array([2.0, 3.0])
+            raise RuntimeError("simulated texture upload failure")
+
+        visual._on_data_change = fail_after_transform_change
+
+        self.assertFalse(limit_labels_texture_size(viewer, layer))
+
+        self.assertEqual(visual.MAX_TEXTURE_SIZE_2D, 16_384)
+        np.testing.assert_array_equal(
+            layer._transforms["tile2data"].scale,
+            original_scale,
+        )
+        self.assertEqual(visual.matrix_change_count, 1)
 
 
 class FakeDrawable:
@@ -274,6 +359,27 @@ class FastPolygonPreviewTest(unittest.TestCase):
             dtype=float,
         )
         np.testing.assert_array_equal(
+            visual._line.calls[-1]["pos"], expected_points
+        )
+
+    def test_preview_compensates_for_nonuniform_texture_scale(self):
+        viewer, layer, overlay, visual = self.setup_overlay()
+        layer._transforms["tile2data"].scale = np.array([2.0, 3.0])
+        optimize_polygon_preview(viewer, layer)
+
+        overlay.points = [(10, 20), (30, 40), (50, 60)]
+        overlay.events.points.emit()
+
+        expected_points = np.array(
+            [
+                [19 / 3, 4.75],
+                [13, 14.75],
+                [59 / 3, 24.75],
+                [19 / 3, 4.75],
+            ],
+            dtype=float,
+        )
+        np.testing.assert_allclose(
             visual._line.calls[-1]["pos"], expected_points
         )
 
