@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "napari-histo-label-editor"
-version = "0.1.5"
+version = "0.2.0"
 description = "Histology semantic segmentation label editor for napari"
 requires-python = ">=3.10"
 dependencies = [

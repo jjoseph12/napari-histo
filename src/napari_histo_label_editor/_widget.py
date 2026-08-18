@@ -19,6 +19,12 @@ from napari.viewer import Viewer
 from napari.utils.colormaps import DirectLabelColormap
 from matplotlib.colors import to_rgba
 
+from ._class_config import (
+    atomic_write_class_config,
+    normalize_color,
+    read_class_config,
+)
+from ._class_dialog import ClassEditorDialog
 from ._fast_fill import enable_fast_fill
 from ._fast_polygon import enable_fast_polygon
 from ._fast_rendering import enable_fast_rendering
@@ -68,6 +74,7 @@ class LabelEditorWidget(QWidget):
         self.class_button_layout = None
 
         self.class_map: Dict[int, str] = {}
+        self.class_colors: Dict[int, str] = {}
 
         self.labels_layer = None
 
@@ -95,7 +102,19 @@ class LabelEditorWidget(QWidget):
         load_btn.clicked.connect(self.load_data)
         layout.addWidget(load_btn)
 
-        layout.addWidget(QLabel("Class shortcuts"))
+        layout.addWidget(QLabel("Classes"))
+
+        class_actions = QHBoxLayout()
+        self.add_class_btn = QPushButton("+ Add class")
+        self.add_class_btn.setEnabled(False)
+        self.add_class_btn.clicked.connect(self._add_class)
+        class_actions.addWidget(self.add_class_btn)
+
+        self.edit_class_btn = QPushButton("Edit selected")
+        self.edit_class_btn.setEnabled(False)
+        self.edit_class_btn.clicked.connect(self._edit_selected_class)
+        class_actions.addWidget(self.edit_class_btn)
+        layout.addLayout(class_actions)
         self.class_button_container = QWidget()
         self.class_button_container.setSizePolicy(
             QSizePolicy.Ignored,
@@ -129,8 +148,9 @@ class LabelEditorWidget(QWidget):
         layout.addWidget(undo_btn)
 
         layout.addWidget(QLabel(
-            "Usage: select a class channel, then use napari's native Paint, Fill, "
-            "Erase, or Polygon tools. Each class is a distinct label in the same layer."
+            "Usage: select a class, then use napari's native Paint, Fill, "
+            "Erase, or Polygon tools. Add classes above; use Edit selected "
+            "or right-click a class to rename or recolor it."
         ))
 
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
@@ -185,9 +205,15 @@ class LabelEditorWidget(QWidget):
                 f"Image and labels differ: {image.shape[:2]} vs {labels.shape}"
             )
 
-        self.class_map = self._read_class_map(self.mapping_path)
+        self.class_map, self.class_colors = read_class_config(
+            self.mapping_path
+        )
         self._labels_output_dtype = labels.dtype
         labels = self._compact_labels(labels, self.class_map)
+        self._labels_output_dtype = self._promoted_dtype_for_classes(
+            self._labels_output_dtype,
+            self.class_map,
+        )
 
         self.viewer.layers.clear()
 
@@ -213,6 +239,7 @@ class LabelEditorWidget(QWidget):
         self.labels_layer.selected_label = 1
         self.labels_layer.n_edit_dimensions = 2
         self.labels_layer.contiguous = True
+        self.labels_layer.preserve_labels = False
         self._limit_undo_history(self.labels_layer)
         enable_fast_fill(self.labels_layer)
         enable_fast_polygon(self.labels_layer)
@@ -220,6 +247,8 @@ class LabelEditorWidget(QWidget):
         self.viewer.tooltip.visible = True
 
         self._populate_class_buttons()
+        self.add_class_btn.setEnabled(True)
+        self.edit_class_btn.setEnabled(True)
 
         self.viewer.status = (
             "Loaded multiclass label layer. Hover over an area to see its label."
@@ -240,7 +269,8 @@ class LabelEditorWidget(QWidget):
         # ------------------------------------------------------------------
         # Background button
         # ------------------------------------------------------------------
-        bg_btn = QPushButton("0: Background")
+        background_name = self.class_map.get(0, "background")
+        bg_btn = QPushButton(f"0: {background_name}")
         bg_btn.clicked.connect(lambda checked=False: self._select_label(0))
         bg_btn.setStyleSheet(
             "background-color: #d9d9d9;"
@@ -252,7 +282,7 @@ class LabelEditorWidget(QWidget):
         bg_btn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         bg_btn.setMinimumWidth(0)
         bg_btn.setMaximumWidth(10_000)
-        bg_btn.setToolTip(bg_btn.text())
+        bg_btn.setToolTip("Select Background for erasing")
 
         self.class_button_layout.addWidget(bg_btn, row, col)
 
@@ -271,12 +301,17 @@ class LabelEditorWidget(QWidget):
 
             btn = QPushButton(f"{value}: {name}")
             btn.clicked.connect(lambda checked=False, v=value: self._select_label(v))
+            btn.setContextMenuPolicy(Qt.CustomContextMenu)
+            btn.customContextMenuRequested.connect(
+                lambda _position, v=value: self._edit_class(v)
+            )
 
             rgba = self._label_rgba(value)
             qcolor = QColor.fromRgbF(rgba[0], rgba[1], rgba[2], 1.0)
+            foreground = self._button_text_color(qcolor)
             btn.setStyleSheet(
                 f"background-color: {qcolor.name()}; "
-                "color: black; "
+                f"color: {foreground}; "
                 "font-weight: bold;"
                 "padding: 2px;"
                 "font-size: 10px;"
@@ -284,7 +319,9 @@ class LabelEditorWidget(QWidget):
             btn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
             btn.setMinimumWidth(0)
             btn.setMaximumWidth(10_000)
-            btn.setToolTip(btn.text())
+            btn.setToolTip(
+                f"Click to select {name}. Right-click to rename or recolor."
+            )
 
             self.class_button_layout.addWidget(btn, row, col)
 
@@ -302,8 +339,176 @@ class LabelEditorWidget(QWidget):
         self.viewer.layers.selection.active = self.labels_layer
         self.viewer.status = f"Selected label {value}: {self.class_map.get(value, value)}"
 
+    def _add_class(self) -> None:
+        if self.labels_layer is None or self.mapping_path is None:
+            self.viewer.status = "Load an image, labels, and class CSV first."
+            return
+
+        value = 1
+        while value in self.class_map:
+            value += 1
+        dialog = ClassEditorDialog(
+            value,
+            "",
+            self._class_color_hex(value),
+            editing=False,
+            parent=self,
+        )
+        if not self._execute_dialog(dialog):
+            return
+
+        value, name, color = dialog.values()
+        if value in self.class_map:
+            QMessageBox.warning(
+                self,
+                "Class already exists",
+                f"Class value {value} already exists. Edit that class instead.",
+            )
+            return
+        self._apply_class_dialog_values(value, name, color)
+
+    def _edit_selected_class(self) -> None:
+        if self.labels_layer is None:
+            self.viewer.status = "Load labels first."
+            return
+        self._edit_class(int(self.labels_layer.selected_label))
+
+    def _edit_class(self, value: int) -> None:
+        value = int(value)
+        if value == 0:
+            self.viewer.status = "Background is reserved and stays transparent."
+            return
+        if value not in self.class_map:
+            self.viewer.status = f"Class {value} is not in the class mapping."
+            return
+
+        dialog = ClassEditorDialog(
+            value,
+            self.class_map[value],
+            self._class_color_hex(value),
+            editing=True,
+            parent=self,
+        )
+        if self._execute_dialog(dialog):
+            self._apply_class_dialog_values(*dialog.values())
+
+    @staticmethod
+    def _execute_dialog(dialog: ClassEditorDialog) -> bool:
+        """Run a Qt dialog on both Qt 5 and Qt 6 bindings."""
+        execute = getattr(dialog, "exec", None)
+        if execute is None:
+            execute = dialog.exec_
+        return bool(execute())
+
+    def _apply_class_dialog_values(
+        self,
+        value: int,
+        name: str,
+        color: str,
+    ) -> None:
+        try:
+            self._upsert_class(value, name, color, persist=True)
+        except (OSError, TypeError, ValueError, MemoryError) as error:
+            self.viewer.status = f"Could not update class: {error}"
+            QMessageBox.critical(self, "Could not update class", str(error))
+
+    def _upsert_class(
+        self,
+        value: int,
+        name: str,
+        color: str,
+        *,
+        persist: bool = True,
+    ) -> None:
+        """Add or update one class and refresh all live layer metadata."""
+        value = int(value)
+        name = str(name).strip()
+        color = normalize_color(color)
+        if value <= 0:
+            raise ValueError("Class values must be positive; 0 is Background.")
+        if not name:
+            raise ValueError("Class name cannot be blank.")
+        if color is None:
+            raise ValueError("Choose a valid class color.")
+
+        new_class_map = dict(self.class_map)
+        new_class_map[value] = name
+        new_class_colors = dict(self.class_colors)
+        new_class_colors[value] = color
+
+        promoted_data = None
+        promoted_output_dtype = self._labels_output_dtype
+        if self.labels_layer is not None:
+            current_data = np.asarray(self.labels_layer.data)
+            promoted_dtype = self._promoted_dtype_for_classes(
+                current_data.dtype,
+                new_class_map,
+            )
+            if promoted_dtype != current_data.dtype:
+                promoted_data = current_data.astype(promoted_dtype)
+
+            output_dtype = (
+                current_data.dtype
+                if self._labels_output_dtype is None
+                else self._labels_output_dtype
+            )
+            promoted_output_dtype = self._promoted_dtype_for_classes(
+                output_dtype,
+                new_class_map,
+            )
+
+        if persist:
+            if self.mapping_path is None:
+                raise ValueError("No class mapping CSV is loaded.")
+            atomic_write_class_config(
+                self.mapping_path,
+                new_class_map,
+                new_class_colors,
+            )
+
+        self.class_map = new_class_map
+        self.class_colors = new_class_colors
+        self._labels_output_dtype = promoted_output_dtype
+
+        if self.labels_layer is not None:
+            if promoted_data is not None:
+                self.labels_layer.data = promoted_data
+                enable_fast_fill(self.labels_layer)
+                enable_fast_polygon(self.labels_layer)
+                enable_fast_rendering(self.viewer, self.labels_layer)
+            self.labels_layer.features = self._label_features(self.class_map)
+            self.labels_layer.colormap = self._multiclass_colormap(
+                self.class_map
+            )
+            self.labels_layer.preserve_labels = False
+
+        self._populate_class_buttons()
+        self._select_label(value)
+        suffix = " and saved to the class CSV" if persist else ""
+        self.viewer.status = f"Class {value}: {name} updated{suffix}."
+
+    @staticmethod
+    def _button_text_color(color: QColor) -> str:
+        """Choose readable text for a class-colored button."""
+        return "#000000" if color.lightnessF() > 0.55 else "#ffffff"
+
+    def _class_color_hex(self, value: int) -> str:
+        configured = normalize_color(self.class_colors.get(int(value)))
+        if configured is not None:
+            return configured
+        rgba = self._default_label_rgba(int(value))
+        return QColor.fromRgbF(*rgba).name().lower()
 
     def _label_rgba(self, value: int):
+        configured = normalize_color(self.class_colors.get(int(value)))
+        if configured is not None:
+            return np.array(to_rgba(configured))
+        return self._default_label_rgba(value)
+
+    @staticmethod
+    def _default_label_rgba(value: int):
+        if value <= 0:
+            return np.array([0.0, 0.0, 0.0, 0.0])
         if value <= len(CLASS_COLORS):
             return np.array(to_rgba(CLASS_COLORS[value - 1]))
 
@@ -313,17 +518,8 @@ class LabelEditorWidget(QWidget):
         return np.array([rgb[0], rgb[1], rgb[2], 1.0])
 
     def _read_class_map(self, path: Path) -> Dict[int, str]:
-        df = pd.read_csv(path)
-        value_col = df.columns[0]
-        name_col = df.columns[1]
-
-        mapping = {
-            int(row[value_col]): str(row[name_col])
-            for _, row in df.iterrows()
-        }
-
-        mapping.setdefault(0, "background")
-        return mapping
+        """Backward-compatible name-only class mapping reader."""
+        return read_class_config(path)[0]
 
     @staticmethod
     def _label_features(class_map: Dict[int, str]) -> pd.DataFrame:
@@ -388,6 +584,43 @@ class LabelEditorWidget(QWidget):
 
         raise ValueError(
             f"Label values from {minimum} to {maximum} exceed supported integer ranges"
+        )
+
+    @staticmethod
+    def _promoted_dtype_for_classes(
+        current_dtype: np.dtype,
+        class_map: Dict[int, str],
+    ) -> np.dtype:
+        """Keep a dtype when possible, otherwise widen it for new classes."""
+        current_dtype = np.dtype(current_dtype)
+        if current_dtype == np.dtype(np.bool_):
+            minimum, maximum = 0, 1
+        elif np.issubdtype(current_dtype, np.integer):
+            limits = np.iinfo(current_dtype)
+            minimum, maximum = int(limits.min), int(limits.max)
+        else:
+            raise ValueError(
+                f"Label image must have an integer dtype. Got {current_dtype}"
+            )
+
+        if class_map:
+            minimum = min(minimum, min(int(value) for value in class_map))
+            maximum = max(maximum, max(int(value) for value in class_map))
+
+        candidates = (
+            (np.uint8, np.uint16, np.uint32, np.uint64)
+            if minimum >= 0
+            else (np.int8, np.int16, np.int32, np.int64)
+        )
+        for dtype in candidates:
+            dtype = np.dtype(dtype)
+            limits = np.iinfo(dtype)
+            if limits.min <= minimum and maximum <= limits.max:
+                return dtype
+
+        raise ValueError(
+            f"Class values from {minimum} to {maximum} exceed supported "
+            "integer ranges."
         )
 
     @staticmethod

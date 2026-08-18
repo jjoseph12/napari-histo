@@ -63,6 +63,23 @@ class AtomicSaveLabelsTest(unittest.TestCase):
             np.testing.assert_array_equal(iio.imread(destination), original)
             self.assertEqual(list(root.iterdir()), [destination])
 
+    def test_rejects_lossy_integer_conversion_before_touching_destination(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.tif"
+            original = np.full((2, 2), 7, dtype=np.uint8)
+            iio.imwrite(destination, original)
+
+            with self.assertRaisesRegex(ValueError, "without data loss"):
+                atomic_save_labels(
+                    np.array([[0, 300]], dtype=np.uint16),
+                    destination,
+                    np.uint8,
+                )
+
+            np.testing.assert_array_equal(iio.imread(destination), original)
+            self.assertEqual(list(root.iterdir()), [destination])
+
 
 class BuildImagePyramidTest(unittest.TestCase):
     def test_preserves_level_zero_and_builds_expected_view_shapes(self):

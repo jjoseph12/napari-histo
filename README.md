@@ -13,6 +13,8 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * Display semantic segmentation as a colored overlay
 * Hover over any area to see its label value and class name
 * One-click class selection buttons (including **Background**)
+* Add new classes while napari is open
+* Rename classes and change their overlay colors immediately
 * Native napari editing tools:
 
   * Paint
@@ -59,19 +61,23 @@ Example:
 
 ### Class mapping CSV
 
-A two-column CSV with a header.
+A CSV with a header. The first two columns contain the numeric value and class
+name. An optional `color` column stores a class color as a hex value or a
+standard color name.
 
 Example:
 
 ```csv
-value,class_name
-1,Tumor
-2,Stroma
-3,Necrosis
-4,Lymphocytes
+value,class_name,color
+1,Tumor,#d1495b
+2,Stroma,#2a9d8f
+3,Necrosis,#f4a261
+4,Lymphocytes,#6957c2
 ```
 
 The first column must contain the integer label values used in the label image.
+Existing two-column mapping files continue to work and use the built-in color
+palette.
 
 ---
 
@@ -177,6 +183,22 @@ To erase objects, click
 ```
 0: Background
 ```
+
+## Adding or editing a class
+
+Click **+ Add class**, choose a numeric value, enter the class name, and pick a
+color. The new class is selected immediately and works with Paint, Fill, and
+Polygon without reloading the files.
+
+To rename or recolor an existing class, select it and click **Edit selected**.
+You can also right-click its class button. Existing pixels of that class change
+color immediately, and hover text immediately uses the new name.
+
+Class additions and edits are saved directly to the mapping CSV. If a new
+numeric value is larger than the current label image can store, the editor
+automatically promotes the mask to a safe integer dtype before editing or
+saving. Paint, Fill, and Polygon can draw the selected class over existing
+classes; because this is a semantic mask, each pixel retains one class value.
 
 ---
 

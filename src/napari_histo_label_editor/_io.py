@@ -38,9 +38,30 @@ def atomic_save_labels(
     if not target.suffix:
         raise ValueError("Label destination must have an image file extension")
 
+    target_dtype = np.dtype(output_dtype)
+    if target_dtype == np.dtype(np.bool_):
+        output_minimum, output_maximum = 0, 1
+    elif np.issubdtype(target_dtype, np.integer):
+        limits = np.iinfo(target_dtype)
+        output_minimum, output_maximum = int(limits.min), int(limits.max)
+    else:
+        raise ValueError(
+            f"Label output dtype must be an integer. Got {target_dtype}"
+        )
+
+    source = np.asarray(labels)
+    if source.size:
+        minimum = int(source.min())
+        maximum = int(source.max())
+        if minimum < output_minimum or maximum > output_maximum:
+            raise ValueError(
+                f"Label values from {minimum} to {maximum} cannot be saved "
+                f"as {target_dtype} without data loss"
+            )
+
     # Copy even when the dtype already matches.  Label data can remain editable
     # while the worker writes; imageio must see one consistent snapshot.
-    snapshot = np.array(labels, dtype=np.dtype(output_dtype), copy=True, order="C")
+    snapshot = np.array(source, dtype=target_dtype, copy=True, order="C")
 
     file_descriptor, temporary_name = tempfile.mkstemp(
         dir=target.parent,
