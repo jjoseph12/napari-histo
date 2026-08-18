@@ -7,8 +7,8 @@ layer refresh after every brush update.  This module maps each small changed
 rectangle onto the already-downsampled texture instead.
 
 The stock polygon overlay also triangulates a translucent filled polygon on
-every mouse movement. The optimized preview uses a crisp OpenGL outline and
-compact high-contrast vertices, avoiding that repeated triangulation.
+every mouse movement. The optimized preview uses a crisp outline and compact
+high-contrast vertices, avoiding that repeated triangulation.
 """
 
 from __future__ import annotations
@@ -308,9 +308,11 @@ def optimize_polygon_preview(viewer: Any, layer: Any) -> bool:
     replacement = MethodType(fast_polygon_points_change, visual)
     replacement_connected = False
     try:
-        visual._line.method = "gl"
+        # Keep VisPy's existing line implementation. Changing ``method`` after
+        # the overlay is attached replaces an internal subvisual without its
+        # inherited clip filter; napari then crashes when it closes/recreates
+        # overlays after another layer is added.
         visual._line.set_data(width=POLYGON_LINE_WIDTH)
-        visual._polygon.border.method = "gl"
         visual._nodes_kwargs.update(
             size=POLYGON_VERTEX_SIZE,
             edge_width=POLYGON_VERTEX_EDGE_WIDTH,

@@ -84,6 +84,23 @@ class LabelEditorWidget(QWidget):
 
         self._build_ui()
         self._bind_hotkeys()
+        # napari recreates every layer's polygon overlay when layers are added
+        # or removed. Reinstall our preview callback after that core rebuild.
+        self.viewer.layers.events.inserted.connect(
+            self._restore_fast_rendering_after_layer_change
+        )
+        self.viewer.layers.events.removed.connect(
+            self._restore_fast_rendering_after_layer_change
+        )
+
+    def _restore_fast_rendering_after_layer_change(self, event=None):
+        del event
+        layer = self.labels_layer
+        if layer is None or not any(
+            candidate is layer for candidate in self.viewer.layers
+        ):
+            return
+        enable_fast_rendering(self.viewer, layer)
 
     def _build_ui(self):
         layout = QVBoxLayout()

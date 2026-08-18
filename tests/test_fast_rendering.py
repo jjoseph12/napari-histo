@@ -317,8 +317,10 @@ class FastPolygonPreviewTest(unittest.TestCase):
         self.assertEqual(visual.original_count, 0)
         self.assertFalse(visual._polygon.visible)
         self.assertTrue(visual._line.visible)
-        self.assertEqual(visual._line.method, "gl")
-        self.assertEqual(visual._polygon.border.method, "gl")
+        # Switching VisPy line methods after scene attachment corrupts its
+        # inherited clip filters and crashes when napari adds another layer.
+        self.assertEqual(visual._line.method, "agg")
+        self.assertEqual(visual._polygon.border.method, "agg")
         self.assertEqual(visual._nodes_kwargs["size"], 8.0)
         self.assertEqual(visual._nodes_kwargs["edge_width"], 1.25)
         self.assertEqual(

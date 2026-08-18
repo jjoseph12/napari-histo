@@ -2,6 +2,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
+from unittest.mock import patch
 
 import imageio.v3 as iio
 import numpy as np
@@ -172,6 +173,23 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(saved.shape, original.shape)
             self.assertEqual(saved.dtype, original.dtype)
             self.assertEqual(saved[0, 0], 1)
+
+    def test_layer_changes_restore_the_plugin_polygon_preview(self):
+        viewer = ViewerModel()
+        widget = LabelEditorWidget(viewer)
+        widget.labels_layer = viewer.add_labels(
+            np.zeros((8, 10), dtype=np.uint8)
+        )
+
+        with patch(
+            "napari_histo_label_editor._widget.enable_fast_rendering"
+        ) as enable:
+            extra = viewer.add_image(np.zeros((4, 5), dtype=np.uint8))
+            enable.assert_called_once_with(viewer, widget.labels_layer)
+
+            enable.reset_mock()
+            viewer.layers.remove(extra)
+            enable.assert_called_once_with(viewer, widget.labels_layer)
 
     def test_add_and_edit_class_updates_csv_layer_and_color_immediately(self):
         with TemporaryDirectory() as tmp:
