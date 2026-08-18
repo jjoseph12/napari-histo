@@ -14,6 +14,8 @@ from typing import Mapping, Union
 
 from matplotlib.colors import to_hex, to_rgba
 
+from ._io import FileIdentity, file_identity
+
 
 PathLike = Union[str, os.PathLike[str]]
 
@@ -119,6 +121,8 @@ def atomic_write_class_config(
     path: PathLike,
     class_map: Mapping[int, str],
     class_colors: Mapping[int, object] | None = None,
+    *,
+    expected_identity: FileIdentity | None = None,
 ) -> Path:
     """Atomically write a standardized class-configuration CSV.
 
@@ -126,8 +130,23 @@ def atomic_write_class_config(
     directory, so readers never observe a partially written configuration.
     Colors that are absent or invalid are written as empty cells and therefore
     use the editor's palette fallback when loaded again.
+    When ``expected_identity`` is supplied, the destination must remain the
+    exact file that was loaded both before writing the temporary CSV and
+    immediately before its atomic replacement.
     """
-    target = Path(path)
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        raise ValueError(
+            "Class configuration destination must be an absolute path"
+        )
+
+    # Resolve before creating the same-directory temporary file.  In
+    # particular, this preserves an existing symlink and atomically replaces
+    # its referent instead of replacing the symlink itself.
+    target = target.resolve(strict=False)
+    if expected_identity is not None:
+        _verify_expected_identity(target, expected_identity)
+
     classes = {int(value): str(name) for value, name in class_map.items()}
     classes.setdefault(0, "background")
     colors = (
@@ -158,6 +177,8 @@ def atomic_write_class_config(
             stream.flush()
             os.fsync(stream.fileno())
 
+        if expected_identity is not None:
+            _verify_expected_identity(target, expected_identity)
         os.replace(temporary_path, target)
     except BaseException:
         # os.fdopen takes ownership of the descriptor, except if its own
@@ -171,3 +192,22 @@ def atomic_write_class_config(
         raise
 
     return target
+
+
+def _verify_expected_identity(
+    target: Path,
+    expected_identity: FileIdentity,
+) -> None:
+    """Refuse to overwrite a mapping file replaced since it was loaded."""
+    try:
+        current_identity = file_identity(target)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"Class configuration destination no longer exists: {target}"
+        ) from error
+
+    if current_identity != expected_identity:
+        raise RuntimeError(
+            "Class configuration destination changed since it was loaded: "
+            f"{target}"
+        )

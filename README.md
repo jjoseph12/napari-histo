@@ -262,6 +262,15 @@ runs in the background, temporarily pauses editing, and atomically replaces
 the old file only after the new image is complete. Wait for the status bar to
 say that saving finished before closing napari.
 
+The exact canonical file used by Save is always shown in the read-only
+**Save destination (locked by Load)** field. Browsing to or typing different
+project paths does not redirect a save. Until the new files pass **Load**, the
+canvas and Save action still belong to the previous project, the button reads
+**Save locked file**, and the exact destination remains visible. Loading is
+disabled while a save is running. If the locked destination file is moved,
+deleted, or replaced after loading, the editor refuses to write until it is
+selected and loaded again.
+
 ---
 
 # Undo

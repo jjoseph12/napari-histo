@@ -3,26 +3,72 @@
 from __future__ import annotations
 
 import os
-from pathlib import Path
 import tempfile
-from typing import TypeAlias
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Union
 
 import imageio.v3 as iio
 import numpy as np
 from PIL import Image
 
 
-PathLike: TypeAlias = str | os.PathLike[str]
+PathLike = Union[str, os.PathLike[str]]
 _BOX_RESAMPLING = getattr(Image, "Resampling", Image).BOX
 
-__all__ = ["atomic_save_labels", "build_image_pyramid"]
+__all__ = [
+    "FileIdentity",
+    "SaveResult",
+    "atomic_save_labels",
+    "build_image_pyramid",
+    "file_identity",
+]
+
+
+@dataclass(frozen=True)
+class FileIdentity:
+    """Filesystem identity used to detect replacement of a loaded file."""
+
+    device: int
+    inode: int
+    size: int
+    mtime_ns: int
+    ctime_ns: int
+
+
+@dataclass(frozen=True)
+class SaveResult:
+    """Canonical destination and identity installed by an atomic save."""
+
+    __slots__ = ("path", "identity")
+
+    path: Path
+    identity: FileIdentity
+
+
+def file_identity(path: PathLike) -> FileIdentity:
+    """Return the identity of an absolute file path, following symlinks."""
+    target = _canonical_absolute_path(path, "File path")
+    return _file_identity_from_status(target.stat())
+
+
+def _file_identity_from_status(status: os.stat_result) -> FileIdentity:
+    return FileIdentity(
+        device=status.st_dev,
+        inode=status.st_ino,
+        size=status.st_size,
+        mtime_ns=status.st_mtime_ns,
+        ctime_ns=status.st_ctime_ns,
+    )
 
 
 def atomic_save_labels(
     labels: np.ndarray,
     destination: PathLike,
     output_dtype: np.dtype | type[np.generic] | str,
-) -> Path:
+    *,
+    expected_identity: FileIdentity | None = None,
+) -> SaveResult:
     """Write a complete label snapshot and atomically replace *destination*.
 
     This function is intentionally independent of the UI so it can run in a
@@ -34,11 +80,24 @@ def atomic_save_labels(
     The temporary image is created beside the destination so ``os.replace`` is
     an atomic same-filesystem operation.  A failed conversion, write, flush, or
     replace leaves the existing destination untouched and removes the temporary
-    file.
+    file.  The destination must be absolute after ``~`` expansion. Existing
+    symlinks are resolved before writing. The returned ``SaveResult`` contains
+    the canonical destination and the identity of the file actually installed.
+    When ``expected_identity`` is supplied, the destination must still be the
+    exact file represented by that identity both before preparing the snapshot
+    and immediately before the atomic replacement.
     """
-    target = Path(destination)
+    # Resolve once, before creating the temporary file.  Besides freezing the
+    # destination against later working-directory changes, this follows an
+    # existing symlink to its referent.  Replacing the referent keeps the
+    # user-selected symlink intact instead of silently replacing the link with
+    # a regular file.
+    target = _canonical_absolute_path(destination, "Label destination")
     if not target.suffix:
         raise ValueError("Label destination must have an image file extension")
+
+    if expected_identity is not None:
+        _verify_file_identity(target, expected_identity)
 
     target_dtype = np.dtype(output_dtype)
     if target_dtype == np.dtype(np.bool_):
@@ -72,6 +131,7 @@ def atomic_save_labels(
     )
     os.close(file_descriptor)
     temporary_path = Path(temporary_name)
+    replacement_complete = False
 
     try:
         iio.imwrite(temporary_path, snapshot)
@@ -79,12 +139,60 @@ def atomic_save_labels(
         # before making it visible under the destination name.
         with temporary_path.open("rb") as temporary_file:
             os.fsync(temporary_file.fileno())
+        temporary_status = temporary_path.stat()
+        temporary_device_inode = (
+            temporary_status.st_dev,
+            temporary_status.st_ino,
+        )
+        if expected_identity is not None:
+            _verify_file_identity(target, expected_identity)
         os.replace(temporary_path, target)
+        replacement_complete = True
+        try:
+            saved_identity = _file_identity_from_status(target.stat())
+        except FileNotFoundError as error:
+            raise RuntimeError(
+                "Label destination changed immediately after the atomic "
+                f"save: {target}"
+            ) from error
+        if (saved_identity.device, saved_identity.inode) != (
+            temporary_device_inode
+        ):
+            raise RuntimeError(
+                "Label destination changed immediately after the atomic "
+                f"save: {target}"
+            )
     except BaseException:
-        temporary_path.unlink(missing_ok=True)
+        if not replacement_complete:
+            temporary_path.unlink(missing_ok=True)
         raise
 
-    return target
+    return SaveResult(path=target, identity=saved_identity)
+
+
+def _canonical_absolute_path(path: PathLike, description: str) -> Path:
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        raise ValueError(f"{description} must be an absolute path")
+    return target.resolve(strict=False)
+
+
+def _verify_file_identity(
+    target: Path,
+    expected_identity: FileIdentity,
+) -> None:
+    try:
+        current_identity = file_identity(target)
+    except FileNotFoundError as error:
+        raise FileNotFoundError(
+            f"Label destination no longer exists: {target}"
+        ) from error
+
+    if current_identity != expected_identity:
+        raise RuntimeError(
+            "Label destination changed since it was loaded; refusing to "
+            f"overwrite it: {target}"
+        )
 
 
 def build_image_pyramid(

@@ -1,3 +1,4 @@
+import os
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -15,6 +16,32 @@ from napari_histo_label_editor._fast_fill import fast_fill
 from napari_histo_label_editor._fast_polygon import fast_paint_polygon
 from napari_histo_label_editor._class_config import read_class_config
 from napari_histo_label_editor._widget import LabelEditorWidget
+
+
+class FakeSignal:
+    def __init__(self):
+        self.callbacks = []
+
+    def connect(self, callback):
+        self.callbacks.append(callback)
+
+    def emit(self, *args):
+        for callback in list(self.callbacks):
+            callback(*args)
+
+
+class FakeSaveWorker:
+    """Worker whose running flag stays false until after the UI event returns."""
+
+    def __init__(self):
+        self.returned = FakeSignal()
+        self.errored = FakeSignal()
+        self.finished = FakeSignal()
+        self.is_running = False
+        self.start_count = 0
+
+    def start(self):
+        self.start_count += 1
 
 
 class LabelFeaturesTest(unittest.TestCase):
@@ -175,6 +202,397 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(saved.shape, original.shape)
             self.assertEqual(saved.dtype, original.dtype)
             self.assertEqual(saved[0, 0], 1)
+
+    def test_failed_second_load_keeps_original_layer_and_save_destination(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_a = root / "project-a"
+            project_b = root / "project-b"
+            project_a.mkdir()
+            project_b.mkdir()
+            viewer, widget, labels_a, _ = self.load_small_project(project_a)
+            original_layer = widget.labels_layer
+            original_labels_a = iio.imread(labels_a).copy()
+
+            image_b = project_b / "image.png"
+            labels_b = project_b / "labels.tif"
+            mapping_b = project_b / "mapping.csv"
+            iio.imwrite(image_b, np.zeros((8, 10, 3), dtype=np.uint8))
+            iio.imwrite(labels_b, np.full((7, 10), 2, dtype=np.uint8))
+            pd.DataFrame(
+                {"value": [0, 2], "name": ["background", "Stroma"]}
+            ).to_csv(mapping_b, index=False)
+            original_labels_b = iio.imread(labels_b).copy()
+
+            widget.image_line.setText(str(image_b))
+            widget.label_line.setText(str(labels_b))
+            widget.mapping_line.setText(str(mapping_b))
+
+            with self.assertRaisesRegex(ValueError, "differ"):
+                widget.load_data()
+
+            self.assertEqual(widget.labels_path, labels_a.resolve())
+            self.assertIs(widget.labels_layer, original_layer)
+            self.assertTrue(any(layer is original_layer for layer in viewer.layers))
+            self.assertTrue(widget.save_btn.isEnabled())
+            self.assertEqual(widget.save_btn.text(), "Save locked file [s]")
+            self.assertEqual(
+                widget.save_destination_line.text(),
+                str(labels_a.resolve()),
+            )
+
+            original_layer.data[2, 2] = 1
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            expected_labels_a = original_labels_a.copy()
+            expected_labels_a[2, 2] = 1
+            np.testing.assert_array_equal(iio.imread(labels_a), expected_labels_a)
+            np.testing.assert_array_equal(iio.imread(labels_b), original_labels_b)
+
+    def test_moved_loaded_destination_is_not_silently_recreated(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            moved_labels_path = root / "labels-moved.tif"
+            original = iio.imread(labels_path).copy()
+            labels_path.rename(moved_labels_path)
+            widget.labels_layer.data[2, 3] = 1
+
+            with patch(
+                "napari_histo_label_editor._widget.create_worker"
+            ) as create_worker:
+                widget.save_labels()
+
+            create_worker.assert_not_called()
+            self.assertFalse(labels_path.exists())
+            self.assertFalse(widget.labels_path.exists())
+            self.assertTrue(moved_labels_path.is_file())
+            np.testing.assert_array_equal(iio.imread(moved_labels_path), original)
+            self.assertFalse(widget.save_btn.isEnabled())
+
+    def test_add_labels_post_insert_failure_restores_exact_previous_project(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_a = root / "project-a"
+            project_b = root / "project-b"
+            project_a.mkdir()
+            project_b.mkdir()
+            viewer, widget, labels_a, _ = self.load_small_project(project_a)
+
+            previous_layers = list(viewer.layers)
+            previous_labels_layer = widget.labels_layer
+            previous_image_path = widget.image_path
+            previous_labels_path = widget.labels_path
+            previous_mapping_path = widget.mapping_path
+            previous_class_map = widget.class_map
+            previous_class_colors = widget.class_colors
+            previous_output_dtype = widget._labels_output_dtype
+            previous_labels_identity = widget._labels_destination_identity
+            previous_mapping_identity = widget._mapping_destination_identity
+            previous_save_target = widget.save_destination_line.text()
+
+            image_b = project_b / "image.png"
+            labels_b = project_b / "labels.tif"
+            mapping_b = project_b / "mapping.csv"
+            iio.imwrite(image_b, np.ones((8, 10, 3), dtype=np.uint8))
+            labels = np.zeros((8, 10), dtype=np.uint8)
+            labels[4, 5] = 2
+            iio.imwrite(labels_b, labels)
+            original_labels_b = labels.copy()
+            pd.DataFrame(
+                {
+                    "value": [0, 2],
+                    "name": ["background", "Stroma"],
+                    "color": ["#000000", "#123456"],
+                }
+            ).to_csv(mapping_b, index=False)
+            widget.image_line.setText(str(image_b))
+            widget.label_line.setText(str(labels_b))
+            widget.mapping_line.setText(str(mapping_b))
+            inserted_layers = []
+            real_add_labels = type(viewer).add_labels
+
+            def add_labels_then_raise(active_viewer, *args, **kwargs):
+                inserted_layer = real_add_labels(
+                    active_viewer,
+                    *args,
+                    **kwargs,
+                )
+                inserted_layers.append(inserted_layer)
+                raise RuntimeError("simulated post-insert add_labels failure")
+
+            with patch.object(
+                type(viewer),
+                "add_labels",
+                new=add_labels_then_raise,
+            ), self.assertRaisesRegex(RuntimeError, "simulated"):
+                widget.load_data()
+
+            self.assertEqual(len(inserted_layers), 1)
+            self.assertEqual(len(viewer.layers), len(previous_layers))
+            for actual, expected in zip(viewer.layers, previous_layers):
+                self.assertIs(actual, expected)
+            self.assertFalse(
+                any(
+                    layer is inserted_layers[0]
+                    for layer in viewer.layers
+                )
+            )
+            self.assertIs(widget.labels_layer, previous_labels_layer)
+            self.assertIs(widget.image_path, previous_image_path)
+            self.assertIs(widget.labels_path, previous_labels_path)
+            self.assertIs(widget.mapping_path, previous_mapping_path)
+            self.assertIs(widget.class_map, previous_class_map)
+            self.assertIs(widget.class_colors, previous_class_colors)
+            self.assertEqual(widget._labels_output_dtype, previous_output_dtype)
+            self.assertIs(
+                widget._labels_destination_identity,
+                previous_labels_identity,
+            )
+            self.assertIs(
+                widget._mapping_destination_identity,
+                previous_mapping_identity,
+            )
+            self.assertEqual(
+                widget.save_destination_line.text(),
+                previous_save_target,
+            )
+            self.assertTrue(widget.save_btn.isEnabled())
+            self.assertEqual(widget.save_btn.text(), "Save locked file [s]")
+
+            previous_labels_layer.data[2, 3] = 1
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            self.assertEqual(iio.imread(labels_a)[2, 3], 1)
+            np.testing.assert_array_equal(iio.imread(labels_b), original_labels_b)
+
+    def test_replaced_regular_label_file_is_not_overwritten(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            replacement_path = root / "replacement.tif"
+            replacement = np.full((8, 10), 7, dtype=np.uint8)
+            iio.imwrite(replacement_path, replacement)
+            os.replace(replacement_path, labels_path)
+            widget.labels_layer.data[2, 3] = 1
+
+            with patch(
+                "napari_histo_label_editor._widget.create_worker"
+            ) as create_worker:
+                widget.save_labels()
+
+            create_worker.assert_not_called()
+            np.testing.assert_array_equal(iio.imread(labels_path), replacement)
+            self.assertFalse(widget.save_btn.isEnabled())
+
+    def test_mapping_replaced_by_symlink_cannot_update_unrelated_csv(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, _, mapping_path = self.load_small_project(root)
+            victim_path = root / "unrelated-victim.csv"
+            pd.DataFrame(
+                {"value": [0, 99], "name": ["background", "Do not edit"]}
+            ).to_csv(victim_path, index=False)
+            victim_before = victim_path.read_bytes()
+            class_map_before = dict(widget.class_map)
+            class_colors_before = dict(widget.class_colors)
+
+            mapping_path.unlink()
+            mapping_path.symlink_to(victim_path)
+
+            with self.assertRaisesRegex(ValueError, "missing or changed"):
+                widget._upsert_class(2, "Stroma", "#123456")
+
+            self.assertTrue(mapping_path.is_symlink())
+            self.assertEqual(victim_path.read_bytes(), victim_before)
+            self.assertEqual(widget.class_map, class_map_before)
+            self.assertEqual(widget.class_colors, class_colors_before)
+
+    def test_two_consecutive_real_saves_refresh_destination_identity(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+
+            widget.labels_layer.data[2, 3] = 1
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            self.assertEqual(iio.imread(labels_path)[2, 3], 1)
+            self.assertTrue(widget.save_btn.isEnabled())
+
+            widget.labels_layer.data[4, 5] = 1
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            saved = iio.imread(labels_path)
+            self.assertEqual(saved[2, 3], 1)
+            self.assertEqual(saved[4, 5], 1)
+            self.assertTrue(widget.save_btn.isEnabled())
+
+    def test_staged_label_path_keeps_save_locked_to_loaded_file(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            other_labels_path = root / "other-labels.tif"
+            other_labels = np.zeros((8, 10), dtype=np.uint8)
+            other_labels[3, 4] = 1
+            iio.imwrite(other_labels_path, other_labels)
+            original_other_labels = other_labels.copy()
+
+            widget.label_line.setText(str(other_labels_path))
+
+            self.assertTrue(widget.save_btn.isEnabled())
+            self.assertEqual(widget.save_btn.text(), "Save locked file [s]")
+            self.assertEqual(widget.labels_path, labels_path.resolve())
+            self.assertEqual(
+                widget.save_destination_line.text(),
+                str(labels_path.resolve()),
+            )
+
+            widget.labels_layer.data[2, 3] = 1
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            self.assertEqual(iio.imread(labels_path)[2, 3], 1)
+            np.testing.assert_array_equal(
+                iio.imread(other_labels_path),
+                original_other_labels,
+            )
+            self.assertEqual(widget.save_btn.text(), "Save locked file [s]")
+
+            widget.load_data()
+
+            self.assertEqual(widget.labels_path, other_labels_path.resolve())
+            self.assertTrue(widget.save_btn.isEnabled())
+            self.assertEqual(widget.save_btn.text(), "Save [s]")
+
+    def test_rapid_double_save_creates_only_one_worker(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            workers = []
+
+            def make_worker(*args, **kwargs):
+                del args, kwargs
+                worker = FakeSaveWorker()
+                workers.append(worker)
+                return worker
+
+            with patch(
+                "napari_histo_label_editor._widget.create_worker",
+                side_effect=make_worker,
+            ):
+                widget.save_labels()
+                widget.save_labels()
+
+            self.assertEqual(len(workers), 1)
+            self.assertEqual(workers[0].start_count, 1)
+            self.assertIs(widget._save_worker, workers[0])
+            workers[0].finished.emit()
+
+    def test_removing_owned_labels_layer_disables_and_refuses_save(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            viewer, widget, labels_path, _ = self.load_small_project(root)
+            original = iio.imread(labels_path).copy()
+            removed_layer = widget.labels_layer
+
+            viewer.layers.remove(removed_layer)
+
+            self.assertFalse(widget.save_btn.isEnabled())
+            with patch(
+                "napari_histo_label_editor._widget.create_worker"
+            ) as create_worker:
+                widget.save_labels()
+            create_worker.assert_not_called()
+            np.testing.assert_array_equal(iio.imread(labels_path), original)
+
+    def test_load_is_blocked_while_a_save_worker_is_owned(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_a = root / "project-a"
+            project_b = root / "project-b"
+            project_a.mkdir()
+            project_b.mkdir()
+            viewer, widget, labels_a, _ = self.load_small_project(project_a)
+            original_layer = widget.labels_layer
+            _, other_widget, labels_b, mapping_b = self.load_small_project(
+                project_b
+            )
+            image_b = other_widget.image_path
+            other_widget.deleteLater()
+            worker = FakeSaveWorker()
+
+            with patch(
+                "napari_histo_label_editor._widget.create_worker",
+                return_value=worker,
+            ):
+                widget.save_labels()
+
+            self.assertFalse(widget.load_btn.isEnabled())
+            widget.image_line.setText(str(image_b))
+            widget.label_line.setText(str(labels_b))
+            widget.mapping_line.setText(str(mapping_b))
+            widget.load_data()
+
+            self.assertEqual(widget.labels_path, labels_a.resolve())
+            self.assertIs(widget.labels_layer, original_layer)
+            self.assertTrue(any(layer is original_layer for layer in viewer.layers))
+            self.assertIs(widget._save_worker, worker)
+
+            worker.finished.emit()
+            self.assertTrue(widget.load_btn.isEnabled())
+
+    def test_relative_paths_are_canonicalized_before_cwd_changes(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_a = root / "project-a"
+            project_b = root / "project-b"
+            project_a.mkdir()
+            project_b.mkdir()
+
+            for project in (project_a, project_b):
+                iio.imwrite(
+                    project / "image.png",
+                    np.zeros((8, 10, 3), dtype=np.uint8),
+                )
+                iio.imwrite(
+                    project / "labels.tif",
+                    np.zeros((8, 10), dtype=np.uint8),
+                )
+                pd.DataFrame(
+                    {"value": [0, 1], "name": ["background", "Tumor"]}
+                ).to_csv(project / "mapping.csv", index=False)
+
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(project_a)
+                viewer = ViewerModel()
+                widget = LabelEditorWidget(viewer)
+                widget.image_line.setText("image.png")
+                widget.label_line.setText("labels.tif")
+                widget.mapping_line.setText("mapping.csv")
+                widget.load_data()
+
+                self.assertEqual(
+                    widget.labels_path,
+                    (project_a / "labels.tif").resolve(),
+                )
+                self.assertEqual(
+                    widget.label_line.text(),
+                    str((project_a / "labels.tif").resolve()),
+                )
+
+                os.chdir(project_b)
+                widget.labels_layer.data[2, 3] = 1
+                widget.save_labels()
+                self.wait_for_save(widget)
+            finally:
+                os.chdir(previous_cwd)
+
+            self.assertEqual(iio.imread(project_a / "labels.tif")[2, 3], 1)
+            self.assertEqual(iio.imread(project_b / "labels.tif")[2, 3], 0)
 
     def test_oversized_rgb_uses_filtered_multiscale_image_data(self):
         with TemporaryDirectory() as tmp:
