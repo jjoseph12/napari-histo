@@ -4,11 +4,10 @@ from types import SimpleNamespace
 import numpy as np
 
 from napari_histo_label_editor._fast_rendering import (
-    MAX_LABEL_TEXTURE_SIZE,
+    enable_fast_rendering,
     enable_fast_texture_updates,
     fast_partial_labels_update,
     fast_polygon_points_change,
-    limit_labels_texture_size,
     optimize_polygon_preview,
 )
 
@@ -79,18 +78,10 @@ class FakeLabelsVisual:
         self.node = FakeNode(texture_shape)
         self.original_count = 0
         self.MAX_TEXTURE_SIZE_2D = 16_384
-        self.data_change_count = 0
-        self.matrix_change_count = 0
 
     def _on_partial_labels_update(self, event):
         del event
         self.original_count += 1
-
-    def _on_data_change(self):
-        self.data_change_count += 1
-
-    def _on_matrix_change(self):
-        self.matrix_change_count += 1
 
 
 def make_viewer(layer, labels_visual, polygon_visual=None):
@@ -194,68 +185,15 @@ class FastPartialLabelsUpdateTest(unittest.TestCase):
         )
         self.assertEqual(len(layer.events.labels_update.callbacks), 1)
 
-
-class LabelTextureLimitTest(unittest.TestCase):
-    def setup_visual(self, raw_shape):
-        layer = FakeLayer(raw_shape)
-        visual = FakeLabelsVisual(layer, raw_shape)
-        viewer = make_viewer(layer, visual)
-        return viewer, layer, visual
-
-    def test_large_labels_use_balanced_navigation_texture_cap(self):
-        viewer, layer, visual = self.setup_visual((13_619, 17_072))
-
-        self.assertTrue(limit_labels_texture_size(viewer, layer))
-
-        self.assertEqual(
-            visual.MAX_TEXTURE_SIZE_2D,
-            MAX_LABEL_TEXTURE_SIZE,
+    def test_rendering_install_preserves_napari_texture_limit(self):
+        viewer, layer, visual = self.setup_visual(
+            (13_619, 17_072),
+            (13_619, 8_536),
         )
-        self.assertEqual(visual.data_change_count, 1)
 
-    def test_texture_limit_is_idempotent(self):
-        viewer, layer, visual = self.setup_visual((13_619, 17_072))
-
-        limit_labels_texture_size(viewer, layer)
-        limit_labels_texture_size(viewer, layer)
-
-        self.assertEqual(visual.data_change_count, 1)
-
-    def test_smaller_hardware_limit_is_preserved(self):
-        viewer, layer, visual = self.setup_visual((13_619, 17_072))
-        visual.MAX_TEXTURE_SIZE_2D = 4096
-
-        self.assertTrue(limit_labels_texture_size(viewer, layer))
-
-        self.assertEqual(visual.MAX_TEXTURE_SIZE_2D, 4096)
-        self.assertEqual(visual.data_change_count, 0)
-
-    def test_small_labels_do_not_need_an_extra_upload(self):
-        viewer, layer, visual = self.setup_visual((1024, 2048))
-
-        self.assertTrue(limit_labels_texture_size(viewer, layer))
-
-        self.assertEqual(visual.MAX_TEXTURE_SIZE_2D, 8192)
-        self.assertEqual(visual.data_change_count, 0)
-
-    def test_failed_upload_restores_cap_and_texture_transform(self):
-        viewer, layer, visual = self.setup_visual((13_619, 17_072))
-        original_scale = layer._transforms["tile2data"].scale.copy()
-
-        def fail_after_transform_change():
-            layer._transforms["tile2data"].scale = np.array([2.0, 3.0])
-            raise RuntimeError("simulated texture upload failure")
-
-        visual._on_data_change = fail_after_transform_change
-
-        self.assertFalse(limit_labels_texture_size(viewer, layer))
+        enable_fast_rendering(viewer, layer)
 
         self.assertEqual(visual.MAX_TEXTURE_SIZE_2D, 16_384)
-        np.testing.assert_array_equal(
-            layer._transforms["tile2data"].scale,
-            original_scale,
-        )
-        self.assertEqual(visual.matrix_change_count, 1)
 
 
 class FakeDrawable:
