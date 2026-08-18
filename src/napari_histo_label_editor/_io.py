@@ -9,9 +9,11 @@ from typing import TypeAlias
 
 import imageio.v3 as iio
 import numpy as np
+from PIL import Image
 
 
 PathLike: TypeAlias = str | os.PathLike[str]
+_BOX_RESAMPLING = getattr(Image, "Resampling", Image).BOX
 
 __all__ = ["atomic_save_labels", "build_image_pyramid"]
 
@@ -87,28 +89,42 @@ def atomic_save_labels(
 
 def build_image_pyramid(
     image: np.ndarray,
-    max_dimension: int = 4096,
+    single_scale_limit: int = 8_192,
     downsample: int = 2,
+    overview_limit: int = 2_048,
 ) -> list[np.ndarray]:
-    """Return lightweight multiscale views for a large RGB(A) image.
+    """Return filtered, GPU-friendly levels for an oversized RGB(A) image.
 
-    Level zero is the original array.  Coarser levels sample every
-    ``downsample`` pixels in each spatial dimension without copying data, until
-    the largest spatial dimension is at most ``max_dimension``.  This is a
-    deliberately conservative display pyramid: it uses no extra large image
-    allocations and never changes the source data.
+    Images that fit inside ``single_scale_limit`` are returned unchanged. This
+    matters for napari 0.6: a multiscale image is cropped and re-uploaded on
+    every pan, whereas a single-scale texture remains resident on the GPU.
 
-    The stride sampling is suitable for interactive overview rendering, not for
-    quantitative resampling or export.
+    Truly oversized images keep level zero at full resolution and receive
+    antialiased, C-contiguous overview levels.  Pre-filtering avoids the severe
+    color aliasing caused by stride sampling, and compact arrays avoid VisPy's
+    expensive gather-copy on every multiscale tile upload.  Levels continue
+    until the largest spatial dimension is at most ``overview_limit`` so the
+    initial whole-slide view is inexpensive.
     """
-    if not isinstance(max_dimension, int) or isinstance(max_dimension, bool):
-        raise TypeError("max_dimension must be an integer")
-    if max_dimension < 1:
-        raise ValueError("max_dimension must be at least 1")
+    if not isinstance(single_scale_limit, int) or isinstance(
+        single_scale_limit,
+        bool,
+    ):
+        raise TypeError("single_scale_limit must be an integer")
+    if single_scale_limit < 1:
+        raise ValueError("single_scale_limit must be at least 1")
     if not isinstance(downsample, int) or isinstance(downsample, bool):
         raise TypeError("downsample must be an integer")
     if downsample < 2:
         raise ValueError("downsample must be at least 2")
+    if not isinstance(overview_limit, int) or isinstance(overview_limit, bool):
+        raise TypeError("overview_limit must be an integer")
+    if overview_limit < 1:
+        raise ValueError("overview_limit must be at least 1")
+    if overview_limit >= single_scale_limit:
+        raise ValueError(
+            "overview_limit must be smaller than single_scale_limit"
+        )
 
     level = np.asarray(image)
     if level.ndim != 3 or level.shape[-1] not in (3, 4):
@@ -118,8 +134,126 @@ def build_image_pyramid(
         )
 
     pyramid = [level]
-    while max(level.shape[:2]) > max_dimension:
-        level = level[::downsample, ::downsample, :]
+    if max(level.shape[:2]) <= single_scale_limit:
+        return pyramid
+
+    while max(level.shape[:2]) > overview_limit:
+        level = _box_downsample_rgb(level, downsample)
         pyramid.append(level)
 
     return pyramid
+
+
+def _box_downsample_rgb(image: np.ndarray, factor: int) -> np.ndarray:
+    """Area-filter an RGB(A) level into an owned C-contiguous array.
+
+    Pillow's compiled RGB(A) reducer handles the common uint8 histology path in
+    one fast operation. Other dtypes are reduced channel-by-channel so uint16
+    and floating-point inputs keep their dtype and numeric range.
+    """
+    height, width, channels = image.shape
+    output_height = (height + factor - 1) // factor
+    output_width = (width + factor - 1) // factor
+    output_size = (output_width, output_height)
+
+    if image.dtype == np.dtype(np.uint8):
+        pil_image = Image.fromarray(image)
+        try:
+            reduced_image = pil_image.reduce(factor)
+        except ValueError:
+            reduced_image = pil_image.resize(
+                output_size,
+                resample=_BOX_RESAMPLING,
+            )
+        return np.array(
+            reduced_image,
+            dtype=np.uint8,
+            copy=True,
+            order="C",
+        )
+
+    output = np.empty(
+        (output_height, output_width, channels),
+        dtype=image.dtype,
+        order="C",
+    )
+
+    for channel_index in range(channels):
+        channel = image[..., channel_index]
+        try:
+            pil_channel = Image.fromarray(channel)
+            try:
+                reduced = pil_channel.reduce(factor)
+            except ValueError:
+                reduced = pil_channel.resize(
+                    output_size,
+                    resample=_BOX_RESAMPLING,
+                )
+            reduced_channel = np.asarray(reduced)
+        except (KeyError, TypeError, ValueError):
+            reduced_channel = _box_downsample_channel_numpy(channel, factor)
+
+        if reduced_channel.shape != (output_height, output_width):
+            # Pillow's mode-specific reducer should have the same ceil-sized
+            # output, but use an explicit BOX resize if a backend differs.
+            reduced_channel = np.asarray(
+                Image.fromarray(channel).resize(
+                    output_size,
+                    resample=_BOX_RESAMPLING,
+                )
+            )
+        output[..., channel_index] = _cast_filtered_channel(
+            reduced_channel,
+            image.dtype,
+        )
+
+    return output
+
+
+def _box_downsample_channel_numpy(
+    channel: np.ndarray,
+    factor: int,
+) -> np.ndarray:
+    """Small-memory typed BOX fallback for Pillow-unsupported channel modes."""
+    height, width = channel.shape
+    output_height = (height + factor - 1) // factor
+    output_width = (width + factor - 1) // factor
+    output = np.empty((output_height, output_width), dtype=np.float64)
+
+    for output_row in range(output_height):
+        row_start = output_row * factor
+        row_stop = min(row_start + factor, height)
+        rows = channel[row_start:row_stop]
+        full_columns = (width // factor) * factor
+        if full_columns:
+            blocks = rows[:, :full_columns].reshape(
+                row_stop - row_start,
+                full_columns // factor,
+                factor,
+            )
+            output[output_row, : full_columns // factor] = blocks.mean(
+                axis=(0, 2),
+                dtype=np.float64,
+            )
+        if full_columns < width:
+            output[output_row, -1] = rows[:, full_columns:].mean(
+                dtype=np.float64
+            )
+
+    return output
+
+
+def _cast_filtered_channel(
+    channel: np.ndarray,
+    dtype: np.dtype,
+) -> np.ndarray:
+    """Cast a filtered channel back without integer wraparound."""
+    target_dtype = np.dtype(dtype)
+    if np.dtype(channel.dtype) == target_dtype:
+        return channel
+    if target_dtype == np.dtype(np.bool_):
+        return np.asarray(channel >= 0.5, dtype=target_dtype)
+    if np.issubdtype(target_dtype, np.integer):
+        limits = np.iinfo(target_dtype)
+        channel = np.clip(np.rint(channel), limits.min, limits.max)
+    return np.asarray(channel, dtype=target_dtype)

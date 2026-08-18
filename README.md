@@ -296,8 +296,10 @@ GPU texture limit, brush edits update only the changed part of napari's native
 downsampled texture instead of refreshing the entire layer. The polygon tool
 uses a crisp outline and compact high-contrast vertices while drawing,
 compensating for napari's texture scale so the preview stays under the cursor.
-Large RGB images are displayed as a lightweight multiscale pyramid. These
-changes are transparent to the normal napari workflow.
+Moderate RGB images stay single-scale so pan and zoom do not re-upload textures.
+Truly oversized images use an antialiased, contiguous multiscale pyramid for
+stable colors and fast tile uploads. These changes are transparent to the normal
+napari workflow.
 
 ---
 

@@ -154,6 +154,8 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 [layer.name for layer in viewer.layers],
                 ["histology", "labels"],
             )
+            self.assertFalse(viewer.layers[0].multiscale)
+            self.assertEqual(viewer.layers[0].interpolation2d, "linear")
             self.assertEqual(widget.labels_layer.data.dtype, np.dtype(np.uint8))
             self.assertEqual(widget._labels_output_dtype, np.dtype(np.int32))
             self.assertEqual(widget.labels_layer.n_edit_dimensions, 2)
@@ -173,6 +175,40 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(saved.shape, original.shape)
             self.assertEqual(saved.dtype, original.dtype)
             self.assertEqual(saved[0, 0], 1)
+
+    def test_oversized_rgb_uses_filtered_multiscale_image_data(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.png"
+            labels_path = root / "labels.tif"
+            mapping_path = root / "mapping.csv"
+            image = np.zeros((16, 20, 3), dtype=np.uint8)
+            coarse = np.zeros((8, 10, 3), dtype=np.uint8)
+            iio.imwrite(image_path, image)
+            iio.imwrite(labels_path, np.zeros((16, 20), dtype=np.uint8))
+            pd.DataFrame(
+                {"value": [0, 1], "name": ["background", "Tumor"]}
+            ).to_csv(mapping_path, index=False)
+
+            viewer = ViewerModel()
+            widget = LabelEditorWidget(viewer)
+            widget.image_line.setText(str(image_path))
+            widget.label_line.setText(str(labels_path))
+            widget.mapping_line.setText(str(mapping_path))
+
+            with patch(
+                "napari_histo_label_editor._widget.build_image_pyramid",
+                return_value=[image, coarse],
+            ):
+                widget.load_data()
+
+            histology = viewer.layers[0]
+            self.assertTrue(histology.multiscale)
+            self.assertEqual(histology.interpolation2d, "linear")
+            self.assertEqual(
+                [level.shape for level in histology.data],
+                [(16, 20, 3), (8, 10, 3)],
+            )
 
     def test_layer_changes_restore_the_plugin_polygon_preview(self):
         viewer = ViewerModel()

@@ -82,10 +82,14 @@ class AtomicSaveLabelsTest(unittest.TestCase):
 
 
 class BuildImagePyramidTest(unittest.TestCase):
-    def test_preserves_level_zero_and_builds_expected_view_shapes(self):
+    def test_preserves_level_zero_and_builds_expected_filtered_shapes(self):
         image = np.arange(17 * 13 * 3, dtype=np.uint16).reshape(17, 13, 3)
 
-        pyramid = build_image_pyramid(image, max_dimension=5)
+        pyramid = build_image_pyramid(
+            image,
+            single_scale_limit=8,
+            overview_limit=5,
+        )
 
         self.assertIs(pyramid[0], image)
         self.assertEqual(
@@ -93,32 +97,80 @@ class BuildImagePyramidTest(unittest.TestCase):
             [(17, 13, 3), (9, 7, 3), (5, 4, 3)],
         )
         for level in pyramid[1:]:
-            self.assertTrue(np.shares_memory(level, image))
+            self.assertTrue(level.flags.c_contiguous)
+            self.assertTrue(level.flags.owndata)
+            self.assertFalse(np.shares_memory(level, image))
+            self.assertEqual(level.dtype, image.dtype)
 
-    def test_levels_sample_source_values_at_cumulative_strides(self):
-        image = np.arange(16 * 12 * 4, dtype=np.int32).reshape(16, 12, 4)
+    def test_box_filter_prevents_chromatic_stride_aliasing(self):
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        image[::2, ::2, 1] = 255
 
         pyramid = build_image_pyramid(
             image,
-            max_dimension=3,
+            single_scale_limit=7,
+            overview_limit=4,
             downsample=2,
         )
 
-        np.testing.assert_array_equal(pyramid[1], image[::2, ::2, :])
-        np.testing.assert_array_equal(pyramid[2], image[::4, ::4, :])
-        np.testing.assert_array_equal(pyramid[3], image[::8, ::8, :])
+        self.assertEqual(len(pyramid), 2)
+        self.assertTrue(pyramid[1].flags.c_contiguous)
+        self.assertTrue(pyramid[1].flags.owndata)
+        self.assertTrue(np.all((pyramid[1][..., 1] >= 63)))
+        self.assertTrue(np.all((pyramid[1][..., 1] <= 64)))
+        self.assertTrue(np.all(pyramid[1][..., (0, 2)] == 0))
+
+    def test_odd_rgba_levels_have_ceil_shapes_and_preserve_dtype(self):
+        image = np.full((19, 13, 4), 100.5, dtype=np.float32)
+
+        pyramid = build_image_pyramid(
+            image,
+            single_scale_limit=10,
+            overview_limit=3,
+        )
+
+        self.assertEqual(
+            [level.shape for level in pyramid],
+            [(19, 13, 4), (10, 7, 4), (5, 4, 4), (3, 2, 4)],
+        )
+        for level in pyramid[1:]:
+            self.assertEqual(level.dtype, np.dtype(np.float32))
+            self.assertTrue(level.flags.c_contiguous)
+            np.testing.assert_allclose(level, 100.5)
 
     def test_small_image_returns_only_original_array(self):
         image = np.zeros((32, 40, 3), dtype=np.uint8)
 
-        pyramid = build_image_pyramid(image, max_dimension=40)
+        pyramid = build_image_pyramid(
+            image,
+            single_scale_limit=40,
+            overview_limit=20,
+        )
 
         self.assertEqual(len(pyramid), 1)
+        self.assertIs(pyramid[0], image)
+
+    def test_default_keeps_current_8001_pixel_image_single_scale(self):
+        image = np.zeros((1, 8_001, 3), dtype=np.uint8)
+
+        pyramid = build_image_pyramid(image)
+
+        self.assertEqual(pyramid, [image])
         self.assertIs(pyramid[0], image)
 
     def test_rejects_non_rgb_image(self):
         with self.assertRaisesRegex(ValueError, "RGB or RGBA"):
             build_image_pyramid(np.zeros((32, 40), dtype=np.uint8))
+
+    def test_validates_trigger_and_overview_limits(self):
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+
+        with self.assertRaisesRegex(ValueError, "smaller"):
+            build_image_pyramid(
+                image,
+                single_scale_limit=8,
+                overview_limit=8,
+            )
 
 
 if __name__ == "__main__":

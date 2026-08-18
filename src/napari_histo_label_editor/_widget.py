@@ -242,6 +242,7 @@ class LabelEditorWidget(QWidget):
             name="histology",
             rgb=is_rgb,
             multiscale=len(image_pyramid) > 1,
+            interpolation2d="linear",
         )
 
         self.labels_layer = self.viewer.add_labels(
