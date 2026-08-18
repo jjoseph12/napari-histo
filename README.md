@@ -15,6 +15,7 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * One-click class selection buttons (including **Background**)
 * Add new classes while napari is open
 * Rename classes and change their overlay colors immediately
+* Safely delete classes, with optional pixel reassignment staged until Save
 * Native napari editing tools:
 
   * Paint
@@ -184,7 +185,7 @@ To erase objects, click
 0: Background
 ```
 
-## Adding or editing a class
+## Adding, editing, or deleting a class
 
 Click **+ Add class**, choose a numeric value, enter the class name, and pick a
 color. The new class is selected immediately and works with Paint, Fill, and
@@ -199,6 +200,19 @@ numeric value is larger than the current label image can store, the editor
 automatically promotes the mask to a safe integer dtype before editing or
 saving. Paint, Fill, and Polygon can draw the selected class over existing
 classes; because this is a semantic mask, each pixel retains one class value.
+
+To remove a class, select it and click **Delete selected…**. If the class is
+used in the mask, choose the class its pixels should become; **Background** is
+the default. An unused class can be removed without a replacement. Background
+(value `0`) is reserved and cannot be deleted.
+
+Class deletion is irreversible and clears the current Undo history so an old
+Undo operation cannot restore a removed value. The deletion and any pixel
+reassignment are only staged in memory at first:
+neither the label image nor the class mapping CSV changes on disk until you
+press **Save**. Closing or loading another project before saving leaves both
+original files unchanged. While a deletion is pending, save it before adding,
+editing, or deleting another class.
 
 ---
 
@@ -261,6 +275,10 @@ The edited segmentation is written back to the original label image. Saving
 runs in the background, temporarily pauses editing, and atomically replaces
 the old file only after the new image is complete. Wait for the status bar to
 say that saving finished before closing napari.
+
+If a class deletion is pending, **Save** commits both the reassigned label
+image and the updated class mapping CSV. Until **Save** is pressed, the files
+on disk are unchanged.
 
 The exact canonical file used by Save is always shown in the read-only
 **Save destination (locked by Load)** field. Browsing to or typing different

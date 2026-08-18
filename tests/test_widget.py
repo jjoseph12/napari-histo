@@ -717,6 +717,515 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(saved.dtype, np.dtype(np.uint16))
             self.assertEqual(saved[2, 3], 300)
 
+    def test_delete_class_is_staged_until_save_then_updates_both_files(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            labels_before = labels_path.read_bytes()
+            mapping_before = mapping_path.read_bytes()
+
+            with patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ), patch(
+                "napari_histo_label_editor._widget.atomic_save_labels"
+            ) as save_labels, patch(
+                "napari_histo_label_editor._widget.atomic_write_class_config"
+            ) as write_class_config:
+                widget._delete_class(1)
+
+            save_labels.assert_not_called()
+            write_class_config.assert_not_called()
+
+            self.assertNotIn(1, widget.class_map)
+            self.assertEqual(widget.labels_layer.data[1, 1], 0)
+            self.assertTrue(widget._class_config_pending_save)
+            self.assertEqual(widget.save_btn.text(), "Save class deletion [s]")
+            self.assertEqual(labels_path.read_bytes(), labels_before)
+            self.assertEqual(mapping_path.read_bytes(), mapping_before)
+
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            self.assertEqual(iio.imread(labels_path)[1, 1], 0)
+            saved_map, _ = read_class_config(mapping_path)
+            self.assertNotIn(1, saved_map)
+            self.assertFalse(widget._class_config_pending_save)
+            self.assertEqual(widget.save_btn.text(), "Save [s]")
+
+    def test_delete_class_can_reassign_pixels_to_an_existing_class(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            widget._upsert_class(2, "Stroma", "#123456")
+            mapping_before = mapping_path.read_bytes()
+
+            class FakeDeleteDialog:
+                replacement_value = 2
+
+                def __init__(self, *args, **kwargs):
+                    del args, kwargs
+
+            with patch(
+                "napari_histo_label_editor._widget.DeleteClassDialog",
+                FakeDeleteDialog,
+            ), patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ):
+                widget._delete_class(1)
+
+            self.assertEqual(widget.labels_layer.data[1, 1], 2)
+            self.assertEqual(widget.labels_layer.selected_label, 2)
+            self.assertEqual(mapping_path.read_bytes(), mapping_before)
+            self.assertIn("Press Save", widget.viewer.status)
+
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            self.assertEqual(iio.imread(labels_path)[1, 1], 2)
+            saved_map, _ = read_class_config(mapping_path)
+            self.assertEqual(saved_map[2], "Stroma")
+            self.assertNotIn(1, saved_map)
+
+    def test_delete_class_preserves_every_unrelated_pixel_exactly(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            widget._upsert_class(2, "Stroma", "#123456")
+            original = np.array(
+                [
+                    [0, 1, 2, 0, 2, 1, 0, 2, 0, 1],
+                    [2, 0, 0, 1, 0, 2, 2, 0, 1, 0],
+                    [0, 2, 1, 2, 0, 0, 1, 0, 2, 2],
+                    [1, 0, 2, 0, 1, 2, 0, 0, 2, 0],
+                    [0, 0, 2, 1, 2, 0, 0, 1, 0, 2],
+                    [2, 1, 0, 0, 2, 1, 2, 0, 0, 1],
+                    [0, 2, 0, 1, 0, 2, 1, 2, 0, 0],
+                    [1, 0, 2, 0, 0, 1, 0, 2, 2, 0],
+                ],
+                dtype=np.uint8,
+            )
+            widget.labels_layer.data[...] = original
+
+            class FakeDeleteDialog:
+                replacement_value = 2
+
+                def __init__(self, *args, **kwargs):
+                    del args, kwargs
+
+            with patch(
+                "napari_histo_label_editor._widget.DeleteClassDialog",
+                FakeDeleteDialog,
+            ), patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ):
+                widget._delete_class(1)
+
+            expected = original.copy()
+            expected[original == 1] = 2
+            np.testing.assert_array_equal(widget.labels_layer.data, expected)
+
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            np.testing.assert_array_equal(iio.imread(labels_path), expected)
+            saved_map, _ = read_class_config(mapping_path)
+            self.assertEqual(saved_map, {0: "background", 2: "Stroma"})
+
+    def test_deleting_unused_class_stays_staged_and_keeps_labels_identical(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            widget._upsert_class(2, "Unused", "#123456")
+            labels_before = iio.imread(labels_path)
+            label_bytes_before = labels_path.read_bytes()
+            mapping_bytes_before = mapping_path.read_bytes()
+
+            class FakeDeleteDialog:
+                replacement_value = 0
+
+                def __init__(self, *args, **kwargs):
+                    del args, kwargs
+
+            with patch(
+                "napari_histo_label_editor._widget.DeleteClassDialog",
+                FakeDeleteDialog,
+            ), patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ):
+                widget._delete_class(2)
+
+            np.testing.assert_array_equal(widget.labels_layer.data, labels_before)
+            self.assertEqual(labels_path.read_bytes(), label_bytes_before)
+            self.assertEqual(mapping_path.read_bytes(), mapping_bytes_before)
+            self.assertTrue(widget._class_config_pending_save)
+            self.assertIn("not used by any pixels", widget.viewer.status)
+
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            np.testing.assert_array_equal(iio.imread(labels_path), labels_before)
+            saved_map, _ = read_class_config(mapping_path)
+            self.assertNotIn(2, saved_map)
+
+    def test_label_save_failure_leaves_pending_class_csv_untouched(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            label_bytes_before = labels_path.read_bytes()
+            mapping_bytes_before = mapping_path.read_bytes()
+            with patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ):
+                widget._delete_class(1)
+
+            worker = FakeSaveWorker()
+            with patch(
+                "napari_histo_label_editor._widget.create_worker",
+                return_value=worker,
+            ), patch(
+                "napari_histo_label_editor._widget.atomic_write_class_config"
+            ) as write_class_config, patch(
+                "napari_histo_label_editor._widget.QMessageBox.critical"
+            ):
+                widget.save_labels()
+                worker.errored.emit(RuntimeError("simulated label failure"))
+                worker.finished.emit()
+
+            write_class_config.assert_not_called()
+            self.assertEqual(labels_path.read_bytes(), label_bytes_before)
+            self.assertEqual(mapping_path.read_bytes(), mapping_bytes_before)
+            self.assertTrue(widget._class_config_pending_save)
+            self.assertEqual(widget.save_btn.text(), "Save class deletion [s]")
+            self.assertIn("simulated label failure", widget.viewer.status)
+
+    def test_external_label_replacement_blocks_pending_delete_save(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            mapping_bytes_before = mapping_path.read_bytes()
+            with patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ):
+                widget._delete_class(1)
+
+            external_labels = np.full((8, 10), 7, dtype=np.uint8)
+            replacement_path = root / "external-labels.tif"
+            iio.imwrite(replacement_path, external_labels)
+            os.replace(replacement_path, labels_path)
+
+            with patch(
+                "napari_histo_label_editor._widget.create_worker"
+            ) as create_worker, patch(
+                "napari_histo_label_editor._widget.atomic_write_class_config"
+            ) as write_class_config:
+                widget.save_labels()
+
+            create_worker.assert_not_called()
+            write_class_config.assert_not_called()
+            np.testing.assert_array_equal(iio.imread(labels_path), external_labels)
+            self.assertEqual(mapping_path.read_bytes(), mapping_bytes_before)
+            self.assertTrue(widget._class_config_pending_save)
+            self.assertFalse(widget.save_btn.isEnabled())
+
+    def test_external_mapping_replacement_blocks_both_pending_delete_writes(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            label_bytes_before = labels_path.read_bytes()
+            with patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ):
+                widget._delete_class(1)
+
+            external_mapping_path = root / "external-mapping.csv"
+            pd.DataFrame(
+                {
+                    "value": [0, 99],
+                    "name": ["background", "External"],
+                }
+            ).to_csv(external_mapping_path, index=False)
+            external_mapping_bytes = external_mapping_path.read_bytes()
+            os.replace(external_mapping_path, mapping_path)
+
+            with patch(
+                "napari_histo_label_editor._widget.create_worker"
+            ) as create_worker, patch(
+                "napari_histo_label_editor._widget.atomic_write_class_config"
+            ) as write_class_config:
+                widget.save_labels()
+
+            create_worker.assert_not_called()
+            write_class_config.assert_not_called()
+            self.assertEqual(labels_path.read_bytes(), label_bytes_before)
+            self.assertEqual(mapping_path.read_bytes(), external_mapping_bytes)
+            self.assertTrue(widget._class_config_pending_save)
+            self.assertIn("both left untouched", widget.viewer.status)
+
+    def test_external_mapping_change_during_confirmation_is_exact_no_op(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            labels_before = np.array(widget.labels_layer.data, copy=True)
+            class_map_before = dict(widget.class_map)
+            class_colors_before = dict(widget.class_colors)
+            label_bytes_before = labels_path.read_bytes()
+
+            external_mapping_path = root / "external-mapping.csv"
+            pd.DataFrame(
+                {
+                    "value": [0, 8],
+                    "name": ["background", "External"],
+                }
+            ).to_csv(external_mapping_path, index=False)
+            external_mapping_bytes = external_mapping_path.read_bytes()
+
+            def replace_mapping_and_accept(*args):
+                del args
+                os.replace(external_mapping_path, mapping_path)
+                return True
+
+            with patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                side_effect=replace_mapping_and_accept,
+            ), patch(
+                "napari_histo_label_editor._widget.QMessageBox.critical"
+            ):
+                widget._delete_class(1)
+
+            np.testing.assert_array_equal(widget.labels_layer.data, labels_before)
+            self.assertEqual(widget.class_map, class_map_before)
+            self.assertEqual(widget.class_colors, class_colors_before)
+            self.assertEqual(labels_path.read_bytes(), label_bytes_before)
+            self.assertEqual(mapping_path.read_bytes(), external_mapping_bytes)
+            self.assertFalse(widget._class_config_pending_save)
+            self.assertIn("missing or changed", widget.viewer.status)
+
+    def test_delete_button_tracks_selected_mapped_nonbackground_class(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+
+            self.assertEqual(widget.labels_layer.selected_label, 1)
+            self.assertTrue(widget.delete_class_btn.isEnabled())
+
+            widget.labels_layer.selected_label = 0
+            self.assertFalse(widget.delete_class_btn.isEnabled())
+
+            widget.labels_layer.selected_label = 7
+            self.assertEqual(widget.labels_layer.selected_label, 0)
+            self.assertFalse(widget.delete_class_btn.isEnabled())
+
+            widget.labels_layer.selected_label = 1
+            self.assertTrue(widget.delete_class_btn.isEnabled())
+
+    def test_load_selects_a_mapped_value_when_class_one_is_absent(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            image_path = root / "image.png"
+            labels_path = root / "labels.tif"
+            mapping_path = root / "mapping.csv"
+            iio.imwrite(image_path, np.zeros((8, 10, 3), dtype=np.uint8))
+            labels = np.zeros((8, 10), dtype=np.uint8)
+            labels[1, 1] = 23
+            iio.imwrite(labels_path, labels)
+            pd.DataFrame(
+                {
+                    "value": [0, 23],
+                    "name": ["background", "Tumor"],
+                }
+            ).to_csv(mapping_path, index=False)
+
+            viewer = ViewerModel()
+            widget = LabelEditorWidget(viewer)
+            widget.image_line.setText(str(image_path))
+            widget.label_line.setText(str(labels_path))
+            widget.mapping_line.setText(str(mapping_path))
+            widget.load_data()
+
+            self.assertEqual(widget.labels_layer.selected_label, 23)
+            self.assertTrue(widget.delete_class_btn.isEnabled())
+
+    def test_deleted_value_reintroduced_before_save_is_sanitized(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            with patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ):
+                widget._delete_class(1)
+
+            # Defense in depth: even direct/plugin code cannot smuggle the
+            # removed value back into the saved mask after deletion.
+            widget.labels_layer.data_setitem(
+                (np.array([3]), np.array([4])),
+                1,
+            )
+            self.assertEqual(widget.labels_layer.data[3, 4], 1)
+
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            saved = iio.imread(labels_path)
+            self.assertFalse(np.any(saved == 1))
+            saved_map, _ = read_class_config(mapping_path)
+            self.assertNotIn(1, saved_map)
+
+    def test_loading_again_discards_unsaved_class_deletion_state(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            label_bytes_before = labels_path.read_bytes()
+            mapping_bytes_before = mapping_path.read_bytes()
+            with patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ):
+                widget._delete_class(1)
+
+            self.assertTrue(widget._class_config_pending_save)
+            self.assertNotIn(1, widget.class_map)
+            self.assertEqual(widget.labels_layer.data[1, 1], 0)
+
+            widget.load_data()
+
+            self.assertFalse(widget._class_config_pending_save)
+            self.assertIn(1, widget.class_map)
+            self.assertEqual(widget.labels_layer.data[1, 1], 1)
+            self.assertEqual(widget.labels_layer.selected_label, 1)
+            self.assertTrue(widget.delete_class_btn.isEnabled())
+            self.assertEqual(widget.save_btn.text(), "Save [s]")
+            self.assertEqual(labels_path.read_bytes(), label_bytes_before)
+            self.assertEqual(mapping_path.read_bytes(), mapping_bytes_before)
+
+    def test_cancel_delete_is_an_exact_no_op(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            labels_before = np.array(widget.labels_layer.data, copy=True)
+            class_map_before = dict(widget.class_map)
+            class_colors_before = dict(widget.class_colors)
+            label_bytes_before = labels_path.read_bytes()
+            mapping_bytes_before = mapping_path.read_bytes()
+
+            with patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=False,
+            ):
+                widget._delete_class(1)
+
+            np.testing.assert_array_equal(widget.labels_layer.data, labels_before)
+            self.assertEqual(widget.class_map, class_map_before)
+            self.assertEqual(widget.class_colors, class_colors_before)
+            self.assertFalse(widget._class_config_pending_save)
+            self.assertEqual(labels_path.read_bytes(), label_bytes_before)
+            self.assertEqual(mapping_path.read_bytes(), mapping_bytes_before)
+
+    def test_background_cannot_be_deleted(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, mapping_path = self.load_small_project(Path(tmp))
+            mapping_before = mapping_path.read_bytes()
+
+            with patch(
+                "napari_histo_label_editor._widget.DeleteClassDialog"
+            ) as delete_dialog:
+                widget._delete_class(0)
+
+            delete_dialog.assert_not_called()
+            self.assertIn(0, widget.class_map)
+            self.assertFalse(widget._class_config_pending_save)
+            self.assertEqual(mapping_path.read_bytes(), mapping_before)
+            self.assertIn("cannot be deleted", widget.viewer.status)
+
+    def test_failed_class_csv_phase_leaves_safe_extra_mapping_and_can_retry(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            with patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ):
+                widget._delete_class(1)
+
+            with patch(
+                "napari_histo_label_editor._widget.atomic_write_class_config",
+                side_effect=RuntimeError("simulated CSV failure"),
+            ), patch(
+                "napari_histo_label_editor._widget.QMessageBox.critical"
+            ):
+                widget.save_labels()
+                self.wait_for_save(widget)
+
+            self.assertEqual(iio.imread(labels_path)[1, 1], 0)
+            saved_map, _ = read_class_config(mapping_path)
+            self.assertIn(1, saved_map)
+            self.assertTrue(widget._class_config_pending_save)
+            self.assertIn("class CSV was not updated", widget.viewer.status)
+
+            widget.save_labels()
+            self.wait_for_save(widget)
+            saved_map, _ = read_class_config(mapping_path)
+            self.assertNotIn(1, saved_map)
+            self.assertFalse(widget._class_config_pending_save)
+
+    def test_class_scan_and_reassignment_use_bounded_chunks(self):
+        labels = np.arange(60, dtype=np.uint16).reshape(6, 10) % 3
+        original = labels.copy()
+        expected_count = int(np.count_nonzero(labels == 1))
+
+        count = LabelEditorWidget._count_label_pixels(
+            labels[:, ::-1],
+            1,
+            mask_bytes=20,
+        )
+        changed = LabelEditorWidget._reassign_label_pixels(
+            labels,
+            1,
+            2,
+            mask_bytes=20,
+        )
+
+        self.assertEqual(count, expected_count)
+        self.assertEqual(changed, expected_count)
+        expected = original.copy()
+        expected[original == 1] = 2
+        np.testing.assert_array_equal(labels, expected)
+
+    def test_pending_delete_blocks_more_class_definition_changes(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            with patch.object(
+                LabelEditorWidget,
+                "_execute_dialog",
+                return_value=True,
+            ):
+                widget._delete_class(1)
+
+            self.assertFalse(widget.add_class_btn.isEnabled())
+            self.assertFalse(widget.edit_class_btn.isEnabled())
+            self.assertFalse(widget.delete_class_btn.isEnabled())
+            self.assertTrue(widget.class_button_container.isEnabled())
+            with self.assertRaisesRegex(ValueError, "pending class deletion"):
+                widget._upsert_class(2, "Stroma", "#123456")
+
 
 if __name__ == "__main__":
     unittest.main()

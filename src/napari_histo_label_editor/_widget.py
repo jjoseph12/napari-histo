@@ -25,6 +25,7 @@ from ._class_config import (
     read_class_config,
 )
 from ._class_dialog import ClassEditorDialog
+from ._delete_class_dialog import DeleteClassDialog
 from ._fast_fill import enable_fast_fill
 from ._fast_polygon import enable_fast_polygon
 from ._fast_rendering import enable_fast_rendering
@@ -39,6 +40,7 @@ from ._io import (
 Image.MAX_IMAGE_PIXELS = None
 
 MAX_UNDO_HISTORY = 20
+CLASS_SCAN_MASK_BYTES = 8 * 1024 * 1024
 
 
 CLASS_COLORS = [
@@ -76,6 +78,10 @@ class LabelEditorWidget(QWidget):
         self._labels_output_dtype: Optional[np.dtype] = None
         self._labels_destination_identity: Optional[FileIdentity] = None
         self._mapping_destination_identity: Optional[FileIdentity] = None
+        self._class_config_pending_save = False
+        self._pending_deleted_value: Optional[int] = None
+        self._pending_deleted_replacement: Optional[int] = None
+        self._changing_selected_label = False
         self._save_worker = None
         self._active_save_path: Optional[Path] = None
         self._active_save_layer = None
@@ -145,6 +151,14 @@ class LabelEditorWidget(QWidget):
         self.edit_class_btn.clicked.connect(self._edit_selected_class)
         class_actions.addWidget(self.edit_class_btn)
         layout.addLayout(class_actions)
+
+        self.delete_class_btn = QPushButton("Delete selected…")
+        self.delete_class_btn.setEnabled(False)
+        self.delete_class_btn.clicked.connect(self._delete_selected_class)
+        self.delete_class_btn.setToolTip(
+            "Delete the selected class and optionally reassign its pixels"
+        )
+        layout.addWidget(self.delete_class_btn)
         self.class_button_container = QWidget()
         self.class_button_container.setSizePolicy(
             QSizePolicy.Ignored,
@@ -194,7 +208,8 @@ class LabelEditorWidget(QWidget):
         layout.addWidget(QLabel(
             "Usage: select a class, then use napari's native Paint, Fill, "
             "Erase, or Polygon tools. Add classes above; use Edit selected "
-            "or right-click a class to rename or recolor it."
+            "or right-click a class to rename or recolor it. Delete selected "
+            "stages a class removal until Save."
         ))
 
         self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
@@ -306,22 +321,37 @@ class LabelEditorWidget(QWidget):
             )
         )
         self.save_btn.setEnabled(
-            active_layer and not busy and destination_available
+            active_layer
+            and not busy
+            and destination_available
+            and (not self._class_config_pending_save or mapping_available)
         )
-        self.save_btn.setText(
-            "Save locked file [s]"
-            if active_layer and not inputs_match
-            else "Save [s]"
-        )
+        if self._class_config_pending_save:
+            self.save_btn.setText("Save class deletion [s]")
+        elif active_layer and not inputs_match:
+            self.save_btn.setText("Save locked file [s]")
+        else:
+            self.save_btn.setText("Save [s]")
         self.undo_btn.setEnabled(active_layer and not busy)
         class_actions_enabled = (
             project_actions_enabled
             and destination_available
             and mapping_available
+            and not self._class_config_pending_save
         )
         self.add_class_btn.setEnabled(class_actions_enabled)
         self.edit_class_btn.setEnabled(class_actions_enabled)
-        self.class_button_container.setEnabled(class_actions_enabled)
+        selected_value = (
+            int(self.labels_layer.selected_label) if active_layer else 0
+        )
+        self.delete_class_btn.setEnabled(
+            class_actions_enabled
+            and selected_value > 0
+            and selected_value in self.class_map
+        )
+        # A pending deletion blocks further class-definition changes until it
+        # is saved, but class selection and painting remain available.
+        self.class_button_container.setEnabled(project_actions_enabled)
 
         if self.labels_path is None:
             self.save_destination_line.clear()
@@ -346,6 +376,14 @@ class LabelEditorWidget(QWidget):
         elif not destination_available:
             self.save_destination_caption.setText(
                 "Save disabled — destination is missing or changed"
+            )
+        elif self._class_config_pending_save and not mapping_available:
+            self.save_destination_caption.setText(
+                "Save disabled — class CSV is missing or changed"
+            )
+        elif self._class_config_pending_save:
+            self.save_destination_caption.setText(
+                "Class deletion pending — Save writes labels and classes to"
             )
         elif not inputs_match:
             self.save_destination_caption.setText(
@@ -504,7 +542,10 @@ class LabelEditorWidget(QWidget):
                 class_colors=class_colors,
             )
             labels_layer.contour = 0
-            labels_layer.selected_label = 1
+            labels_layer.selected_label = next(
+                (value for value in sorted(class_map) if value > 0),
+                0,
+            )
             labels_layer.n_edit_dimensions = 2
             labels_layer.contiguous = True
             labels_layer.preserve_labels = False
@@ -548,7 +589,13 @@ class LabelEditorWidget(QWidget):
         self._labels_output_dtype = labels_output_dtype
         self._labels_destination_identity = labels_destination_identity
         self._mapping_destination_identity = mapping_destination_identity
+        self._class_config_pending_save = False
+        self._pending_deleted_value = None
+        self._pending_deleted_replacement = None
         self.labels_layer = labels_layer
+        self.labels_layer.events.selected_label.connect(
+            self._on_selected_label_change
+        )
 
         self.viewer.tooltip.visible = True
 
@@ -647,6 +694,31 @@ class LabelEditorWidget(QWidget):
         self.labels_layer.selected_label = int(value)
         self.viewer.layers.selection.active = self.labels_layer
         self.viewer.status = f"Selected label {value}: {self.class_map.get(value, value)}"
+        self._update_project_controls()
+
+    def _on_selected_label_change(self, event=None) -> None:
+        """Keep napari's numeric label control within the loaded class map."""
+        del event
+        if self._changing_selected_label or not self._labels_layer_is_active():
+            return
+        value = int(self.labels_layer.selected_label)
+        if value not in self.class_map:
+            fallback = 0
+            if (
+                value == self._pending_deleted_value
+                and self._pending_deleted_replacement in self.class_map
+            ):
+                fallback = int(self._pending_deleted_replacement)
+            self._changing_selected_label = True
+            try:
+                self.labels_layer.selected_label = fallback
+            finally:
+                self._changing_selected_label = False
+            self.viewer.status = (
+                f"Label value {value} is not a loaded class; selected "
+                f"{fallback}: {self.class_map.get(fallback, 'Background')}."
+            )
+        self._update_project_controls()
 
     def _add_class(self) -> None:
         if self._save_worker is not None:
@@ -699,6 +771,11 @@ class LabelEditorWidget(QWidget):
         if self._save_worker is not None:
             self.viewer.status = "Wait for the current label save to finish."
             return
+        if self._class_config_pending_save:
+            self.viewer.status = (
+                "Save the pending class deletion before editing classes."
+            )
+            return
         if (
             not self._labels_layer_is_active()
             or not self._project_inputs_match_loaded()
@@ -723,8 +800,207 @@ class LabelEditorWidget(QWidget):
         if self._execute_dialog(dialog):
             self._apply_class_dialog_values(*dialog.values())
 
+    def _delete_selected_class(self) -> None:
+        if not self._labels_layer_is_active():
+            self.viewer.status = "Load labels before deleting a class."
+            return
+        self._delete_class(int(self.labels_layer.selected_label))
+
+    def _delete_class(self, value: int) -> None:
+        """Stage one class removal without writing either project file."""
+        try:
+            value = int(value)
+            self._validate_class_deletion(value)
+            layer = self.labels_layer
+            pixel_count = self._count_label_pixels(layer.data, value)
+        except (OSError, TypeError, ValueError, RuntimeError) as error:
+            self.viewer.status = f"Could not delete class: {error}"
+            return
+
+        dialog = DeleteClassDialog(
+            value,
+            self.class_map[value],
+            pixel_count,
+            self.class_map,
+            parent=self,
+        )
+        if not self._execute_dialog(dialog):
+            return
+
+        try:
+            # Revalidate after the modal confirmation. This protects against
+            # external replacement of either locked destination while the
+            # dialog was open.
+            self._validate_class_deletion(value)
+            replacement = dialog.replacement_value
+            if replacement != 0 and replacement not in self.class_map:
+                raise ValueError(
+                    f"Replacement class {replacement} is no longer available."
+                )
+
+            new_class_map = dict(self.class_map)
+            deleted_name = new_class_map.pop(value)
+            new_class_colors = dict(self.class_colors)
+            new_class_colors.pop(value, None)
+            new_features = self._label_features(new_class_map)
+            new_colormap = self._multiclass_colormap(
+                new_class_map,
+                class_colors=new_class_colors,
+            )
+
+            changed = self._reassign_label_pixels(
+                layer.data,
+                value,
+                replacement,
+            )
+
+            # Class deletion deliberately has no large sparse undo snapshot:
+            # on a slide-sized mask, storing two int64 coordinate arrays can
+            # consume several gigabytes. Resetting history also prevents an
+            # older Undo operation from reintroducing the removed value.
+            self._limit_undo_history(layer)
+            self.class_map = new_class_map
+            self.class_colors = new_class_colors
+            self._class_config_pending_save = True
+            self._pending_deleted_value = value
+            self._pending_deleted_replacement = replacement
+
+            layer.selected_label = int(replacement)
+            layer.features = new_features
+            layer.colormap = new_colormap
+            layer.preserve_labels = False
+            self._populate_class_buttons()
+            self.viewer.layers.selection.active = layer
+            self._update_project_controls()
+
+            replacement_name = self.class_map.get(
+                replacement,
+                "Background" if replacement == 0 else str(replacement),
+            )
+            if changed:
+                change_summary = (
+                    f"; reassigned {changed:,} pixels to "
+                    f"{replacement}: {replacement_name}"
+                )
+            else:
+                change_summary = "; it was not used by any pixels"
+            self.viewer.status = (
+                f"Deleted class {value}: {deleted_name}{change_summary}. "
+                "Press Save to write this change."
+            )
+        except (
+            OSError,
+            TypeError,
+            ValueError,
+            RuntimeError,
+            MemoryError,
+        ) as error:
+            self.viewer.status = f"Could not delete class: {error}"
+            QMessageBox.critical(self, "Could not delete class", str(error))
+
+    def _validate_class_deletion(self, value: int) -> None:
+        if self._save_worker is not None:
+            raise ValueError("Wait for the current label save to finish.")
+        if self._class_config_pending_save:
+            raise ValueError(
+                "Save the pending class deletion before deleting another class."
+            )
+        if not self._labels_layer_is_active():
+            raise ValueError("The loaded Labels layer is no longer present.")
+        if not self._project_inputs_match_loaded():
+            raise ValueError(
+                "Project paths changed; click Load before deleting classes."
+            )
+        if value == 0:
+            raise ValueError("Background is reserved and cannot be deleted.")
+        if value not in self.class_map:
+            raise ValueError(f"Class value {value} is not in the class mapping.")
+        if (
+            self.labels_path is None
+            or not self.labels_path.is_absolute()
+            or not self._destination_identity_matches(
+                self.labels_path,
+                self._labels_destination_identity,
+            )
+        ):
+            raise ValueError(
+                "The loaded label image is missing or changed; nothing was "
+                "deleted. Choose it again and click Load."
+            )
+        if (
+            self.mapping_path is None
+            or not self.mapping_path.is_absolute()
+            or not self._destination_identity_matches(
+                self.mapping_path,
+                self._mapping_destination_identity,
+            )
+        ):
+            raise ValueError(
+                "The loaded class mapping CSV is missing or changed; nothing "
+                "was deleted. Choose it again and click Load."
+            )
+
     @staticmethod
-    def _execute_dialog(dialog: ClassEditorDialog) -> bool:
+    def _count_label_pixels(
+        labels,
+        value: int,
+        *,
+        mask_bytes: int = CLASS_SCAN_MASK_BYTES,
+    ) -> int:
+        """Count one label using a bounded reusable boolean buffer."""
+        data = np.asarray(labels)
+        if data.ndim != 2:
+            raise ValueError("Class deletion requires a 2D label image.")
+        if mask_bytes < 1:
+            raise ValueError("mask_bytes must be at least 1.")
+        height, width = data.shape
+        if height == 0 or width == 0:
+            return 0
+        rows_per_chunk = max(1, min(height, mask_bytes // width))
+        matches = np.empty((rows_per_chunk, width), dtype=bool)
+        count = 0
+        for row_start in range(0, height, rows_per_chunk):
+            row_stop = min(height, row_start + rows_per_chunk)
+            local_matches = matches[: row_stop - row_start]
+            np.equal(data[row_start:row_stop], value, out=local_matches)
+            count += int(np.count_nonzero(local_matches))
+        return count
+
+    @staticmethod
+    def _reassign_label_pixels(
+        labels,
+        value: int,
+        replacement: int,
+        *,
+        mask_bytes: int = CLASS_SCAN_MASK_BYTES,
+    ) -> int:
+        """Replace one label in-place with bounded temporary memory."""
+        data = np.asarray(labels)
+        if data.ndim != 2:
+            raise ValueError("Class deletion requires a 2D label image.")
+        if not data.flags.writeable:
+            raise ValueError("The loaded label image is not editable.")
+        if value == replacement:
+            raise ValueError("A deleted class cannot replace itself.")
+        if mask_bytes < 1:
+            raise ValueError("mask_bytes must be at least 1.")
+        height, width = data.shape
+        if height == 0 or width == 0:
+            return 0
+        rows_per_chunk = max(1, min(height, mask_bytes // width))
+        matches = np.empty((rows_per_chunk, width), dtype=bool)
+        changed = 0
+        for row_start in range(0, height, rows_per_chunk):
+            row_stop = min(height, row_start + rows_per_chunk)
+            chunk = data[row_start:row_stop]
+            local_matches = matches[: row_stop - row_start]
+            np.equal(chunk, value, out=local_matches)
+            changed += int(np.count_nonzero(local_matches))
+            np.putmask(chunk, local_matches, replacement)
+        return changed
+
+    @staticmethod
+    def _execute_dialog(dialog) -> bool:
         """Run a Qt dialog on both Qt 5 and Qt 6 bindings."""
         execute = getattr(dialog, "exec", None)
         if execute is None:
@@ -760,6 +1036,10 @@ class LabelEditorWidget(QWidget):
         """Add or update one class and refresh all live layer metadata."""
         if self._save_worker is not None:
             raise ValueError("Wait for the current label save to finish.")
+        if self._class_config_pending_save:
+            raise ValueError(
+                "Save the pending class deletion before editing classes."
+            )
         if self.labels_layer is not None and not self._labels_layer_is_active():
             raise ValueError("The loaded Labels layer is no longer present.")
         if (
@@ -1058,6 +1338,42 @@ class LabelEditorWidget(QWidget):
             self._update_project_controls()
             return
 
+        if self._class_config_pending_save and (
+            self.mapping_path is None
+            or not self.mapping_path.is_absolute()
+            or not self._destination_identity_matches(
+                self.mapping_path,
+                self._mapping_destination_identity,
+            )
+        ):
+            self.viewer.status = (
+                "Save failed: the class mapping CSV is missing or changed. "
+                "The label image and CSV were both left untouched. Choose "
+                "the project files again and click Load."
+            )
+            self._update_project_controls()
+            return
+
+        if self._class_config_pending_save:
+            try:
+                self._sanitize_pending_class_deletion()
+            except (
+                TypeError,
+                ValueError,
+                RuntimeError,
+                MemoryError,
+            ) as error:
+                self.viewer.status = (
+                    f"Save failed while validating the class deletion: {error}"
+                )
+                QMessageBox.critical(
+                    self,
+                    "Could not validate class deletion",
+                    str(error),
+                )
+                self._update_project_controls()
+                return
+
         labels = np.asarray(self.labels_layer.data)
         output_dtype = (
             labels.dtype
@@ -1133,7 +1449,103 @@ class LabelEditorWidget(QWidget):
             )
             return
         self._labels_destination_identity = result.identity
+        if self._class_config_pending_save:
+            try:
+                saved_mapping_path = self._write_pending_class_config()
+            except (
+                OSError,
+                TypeError,
+                ValueError,
+                RuntimeError,
+            ) as error:
+                self.viewer.status = (
+                    f"Labels saved to {saved_path}, but the class CSV was "
+                    f"not updated: {error}"
+                )
+                QMessageBox.critical(
+                    self,
+                    "Labels saved; class CSV not updated",
+                    "The label image was saved safely, but the class mapping "
+                    f"CSV was not changed:\n\n{error}\n\nIf it is still the "
+                    "original CSV, its extra deleted-class row is harmless "
+                    "because the saved labels no longer use that value. "
+                    "Restore or reload the CSV before trying again.",
+                )
+                return
+            self.viewer.status = (
+                f"Saved labels to {saved_path} and class definitions to "
+                f"{saved_mapping_path}"
+            )
+            return
         self.viewer.status = f"Saved labels to {saved_path}"
+
+    def _write_pending_class_config(self) -> Path:
+        """Persist staged class metadata after its label mask is safely saved."""
+        if not self._class_config_pending_save:
+            raise ValueError("No class definition changes are pending.")
+        if self.mapping_path is None:
+            raise ValueError("No class mapping CSV is loaded.")
+        if (
+            not self.mapping_path.is_absolute()
+            or not self._destination_identity_matches(
+                self.mapping_path,
+                self._mapping_destination_identity,
+            )
+        ):
+            raise ValueError(
+                "The loaded class mapping CSV is missing or changed; it was "
+                "not overwritten. Choose it again and click Load."
+            )
+
+        saved_mapping_path = atomic_write_class_config(
+            self.mapping_path,
+            self.class_map,
+            self.class_colors,
+            expected_identity=self._mapping_destination_identity,
+        )
+        updated_identity = file_identity(saved_mapping_path)
+        if not self._destination_identity_matches(
+            saved_mapping_path,
+            updated_identity,
+        ):
+            raise RuntimeError(
+                "The class mapping destination changed immediately after it "
+                "was written. Click Load before changing classes again."
+            )
+        self._mapping_destination_identity = updated_identity
+        self._class_config_pending_save = False
+        self._pending_deleted_value = None
+        self._pending_deleted_replacement = None
+        return saved_mapping_path
+
+    def _sanitize_pending_class_deletion(self) -> int:
+        """Remove a deleted value reintroduced through napari's numeric UI."""
+        if not self._class_config_pending_save:
+            return 0
+        if self._pending_deleted_value is None:
+            raise RuntimeError("The pending deleted class value is missing.")
+        if self._pending_deleted_replacement is None:
+            raise RuntimeError("The pending replacement class is missing.")
+        if not self._labels_layer_is_active():
+            raise RuntimeError("The loaded Labels layer is no longer present.")
+
+        deleted_value = int(self._pending_deleted_value)
+        replacement = int(self._pending_deleted_replacement)
+        if replacement not in self.class_map:
+            raise RuntimeError(
+                f"Replacement class {replacement} is no longer available."
+            )
+        changed = self._reassign_label_pixels(
+            self.labels_layer.data,
+            deleted_value,
+            replacement,
+        )
+        if int(self.labels_layer.selected_label) == deleted_value:
+            self.labels_layer.selected_label = replacement
+        if changed:
+            self._limit_undo_history(self.labels_layer)
+            self.labels_layer.refresh()
+        return changed
 
     def _on_save_error(self, error: Exception) -> None:
         self.viewer.status = f"Save failed: {error}"
