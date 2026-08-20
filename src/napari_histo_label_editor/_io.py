@@ -12,6 +12,8 @@ import imageio.v3 as iio
 import numpy as np
 from PIL import Image
 
+from ._embedded_annotations import write_image_with_annotations
+
 
 PathLike = Union[str, os.PathLike[str]]
 _BOX_RESAMPLING = getattr(Image, "Resampling", Image).BOX
@@ -68,6 +70,8 @@ def atomic_save_labels(
     output_dtype: np.dtype | type[np.generic] | str,
     *,
     expected_identity: FileIdentity | None = None,
+    annotation_payload: bytes | None = None,
+    _copy_snapshot: bool = True,
 ) -> SaveResult:
     """Write a complete label snapshot and atomically replace *destination*.
 
@@ -86,6 +90,11 @@ def atomic_save_labels(
     When ``expected_identity`` is supplied, the destination must still be the
     exact file represented by that identity both before preparing the snapshot
     and immediately before the atomic replacement.
+
+    When ``annotation_payload`` is provided, it is embedded in the same PNG or
+    TIFF as private metadata. The public image remains the supplied 2-D label
+    projection, while this plugin can restore lossless overlapping labels from
+    the embedded payload.
     """
     # Resolve once, before creating the temporary file.  Besides freezing the
     # destination against later working-directory changes, this follows an
@@ -95,6 +104,14 @@ def atomic_save_labels(
     target = _canonical_absolute_path(destination, "Label destination")
     if not target.suffix:
         raise ValueError("Label destination must have an image file extension")
+    if annotation_payload is not None:
+        if not isinstance(annotation_payload, (bytes, bytearray, memoryview)):
+            raise TypeError("Embedded annotation payload must be bytes-like")
+        if target.suffix.lower() not in {".png", ".tif", ".tiff"}:
+            raise ValueError(
+                "Lossless overlapping annotations require a PNG or TIFF "
+                f"label destination. Got: {target.suffix}"
+            )
 
     if expected_identity is not None:
         _verify_file_identity(target, expected_identity)
@@ -110,6 +127,23 @@ def atomic_save_labels(
             f"Label output dtype must be an integer. Got {target_dtype}"
         )
 
+    if target.suffix.lower() == ".png" and target_dtype not in {
+        np.dtype(np.bool_),
+        np.dtype(np.uint8),
+        np.dtype(np.uint16),
+    }:
+        # Pillow/imageio silently converts wider or signed integer PNG input
+        # to uint16 (and clamps values above 65,535).  That would make the
+        # public projection disagree with the embedded overlap payload after
+        # an apparently successful save.  Refuse before allocating a
+        # slide-sized snapshot or temporary file; TIFF remains available for
+        # wider class IDs.
+        raise ValueError(
+            "PNG label images can safely store only bool, uint8, or uint16 "
+            f"values. Got {target_dtype}; use a TIFF label image for wider "
+            "class values."
+        )
+
     source = np.asarray(labels)
     if source.size:
         minimum = int(source.min())
@@ -120,9 +154,16 @@ def atomic_save_labels(
                 f"as {target_dtype} without data loss"
             )
 
-    # Copy even when the dtype already matches.  Label data can remain editable
-    # while the worker writes; imageio must see one consistent snapshot.
-    snapshot = np.array(source, dtype=target_dtype, copy=True, order="C")
+    if not isinstance(_copy_snapshot, bool):
+        raise TypeError("_copy_snapshot must be a boolean")
+    # Normal callers keep the defensive copy because their label array may be
+    # edited while a worker writes. The overlap save worker owns a freshly
+    # projected, C-contiguous array and can explicitly skip that duplicate
+    # slide-sized allocation.
+    if _copy_snapshot:
+        snapshot = np.array(source, dtype=target_dtype, copy=True, order="C")
+    else:
+        snapshot = np.ascontiguousarray(source, dtype=target_dtype)
 
     file_descriptor, temporary_name = tempfile.mkstemp(
         dir=target.parent,
@@ -134,7 +175,14 @@ def atomic_save_labels(
     replacement_complete = False
 
     try:
-        iio.imwrite(temporary_path, snapshot)
+        if annotation_payload is None:
+            iio.imwrite(temporary_path, snapshot)
+        else:
+            write_image_with_annotations(
+                temporary_path,
+                snapshot,
+                annotation_payload,
+            )
         # imageio has closed its handle at this point.  Flush the completed file
         # before making it visible under the destination name.
         with temporary_path.open("rb") as temporary_file:
@@ -148,6 +196,7 @@ def atomic_save_labels(
             _verify_file_identity(target, expected_identity)
         os.replace(temporary_path, target)
         replacement_complete = True
+        _fsync_directory(target.parent)
         try:
             saved_identity = _file_identity_from_status(target.stat())
         except FileNotFoundError as error:
@@ -168,6 +217,24 @@ def atomic_save_labels(
         raise
 
     return SaveResult(path=target, identity=saved_identity)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Make a completed atomic rename durable where the OS supports it."""
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    try:
+        descriptor = os.open(directory, flags)
+    except OSError:
+        # Some platforms/filesystems do not permit opening directories. The
+        # file itself was already fsynced and atomically installed.
+        return
+    try:
+        try:
+            os.fsync(descriptor)
+        except OSError:
+            pass
+    finally:
+        os.close(descriptor)
 
 
 def _canonical_absolute_path(path: PathLike, description: str) -> Path:

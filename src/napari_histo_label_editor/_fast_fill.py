@@ -161,6 +161,246 @@ def bounded_flood_indices(
         column_start, column_stop = next_column_start, next_column_stop
 
 
+def _visible_overlap_patch(
+    composite: np.ndarray,
+    active_mask: np.ndarray,
+    active_value: int,
+    row_slice,
+    column_slice,
+) -> np.ndarray:
+    del active_mask, active_value
+    return np.array(
+        composite[row_slice, column_slice],
+        copy=True,
+        order="C",
+    )
+
+
+def bounded_overlap_flood_indices(
+    composite: np.ndarray,
+    active_mask: np.ndarray,
+    active_value: int,
+    seed: tuple[int, int],
+    *,
+    initial_window: int = LOCAL_FLOOD_WINDOW,
+    max_local_pixels: int = MAX_LOCAL_FLOOD_PIXELS,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Flood one component in the authoritative visible ``composite``.
+
+    Only the expanding local rectangle is materialized for ordinary objects.
+    This keeps bucket fill fast for slide-sized annotations while respecting
+    visible class boundaries that are absent from the binary edit mask. The
+    active mask is intentionally not drawn on top: it is a transparent tool
+    layer and can contain membership hidden below another visible class.
+    """
+    composite = np.asarray(composite)
+    active_mask = np.asarray(active_mask)
+    if composite.ndim != 2 or active_mask.ndim != 2:
+        raise ValueError("Overlap fill requires two 2-D arrays")
+    if composite.shape != active_mask.shape:
+        raise ValueError("Composite and active mask shapes must match")
+    if initial_window < 1:
+        raise ValueError("initial_window must be at least 1")
+    if max_local_pixels < 1:
+        raise ValueError("max_local_pixels must be at least 1")
+
+    height, width = composite.shape
+    seed_row, seed_column = (int(seed[0]), int(seed[1]))
+    if not (0 <= seed_row < height and 0 <= seed_column < width):
+        raise IndexError("Overlap fill seed is outside the annotation")
+    active_value = int(active_value)
+    old_label = composite[seed_row, seed_column]
+
+    window_height = min(int(initial_window), height)
+    window_width = min(int(initial_window), width)
+    row_start = max(
+        0,
+        min(seed_row - window_height // 2, height - window_height),
+    )
+    column_start = max(
+        0,
+        min(seed_column - window_width // 2, width - window_width),
+    )
+    row_stop = row_start + window_height
+    column_stop = column_start + window_width
+
+    def visible_patch(rs, cs):
+        return _visible_overlap_patch(
+            composite,
+            active_mask,
+            active_value,
+            rs,
+            cs,
+        )
+
+    while True:
+        local_visible = visible_patch(
+            slice(row_start, row_stop),
+            slice(column_start, column_stop),
+        )
+        local_seed = (seed_row - row_start, seed_column - column_start)
+        matches = flood(local_visible, local_seed, connectivity=1)
+
+        expand_top = bool(
+            row_start > 0
+            and np.any(
+                matches[0]
+                & (
+                    visible_patch(
+                        row_start - 1,
+                        slice(column_start, column_stop),
+                    )
+                    == old_label
+                )
+            )
+        )
+        expand_bottom = bool(
+            row_stop < height
+            and np.any(
+                matches[-1]
+                & (
+                    visible_patch(
+                        row_stop,
+                        slice(column_start, column_stop),
+                    )
+                    == old_label
+                )
+            )
+        )
+        expand_left = bool(
+            column_start > 0
+            and np.any(
+                matches[:, 0]
+                & (
+                    visible_patch(
+                        slice(row_start, row_stop),
+                        column_start - 1,
+                    )
+                    == old_label
+                )
+            )
+        )
+        expand_right = bool(
+            column_stop < width
+            and np.any(
+                matches[:, -1]
+                & (
+                    visible_patch(
+                        slice(row_start, row_stop),
+                        column_stop,
+                    )
+                    == old_label
+                )
+            )
+        )
+
+        if not (expand_top or expand_bottom or expand_left or expand_right):
+            return _mask_indices_with_offset(matches, row_start, column_start)
+
+        current_height = row_stop - row_start
+        current_width = column_stop - column_start
+        next_row_start = (
+            max(0, row_start - current_height) if expand_top else row_start
+        )
+        next_row_stop = (
+            min(height, row_stop + current_height) if expand_bottom else row_stop
+        )
+        next_column_start = (
+            max(0, column_start - current_width)
+            if expand_left
+            else column_start
+        )
+        next_column_stop = (
+            min(width, column_stop + current_width)
+            if expand_right
+            else column_stop
+        )
+        next_pixels = (next_row_stop - next_row_start) * (
+            next_column_stop - next_column_start
+        )
+        if next_pixels > max_local_pixels:
+            del matches, local_visible
+            visible = visible_patch(slice(None), slice(None))
+            return np.nonzero(flood(visible, seed, connectivity=1))
+
+        row_start, row_stop = next_row_start, next_row_stop
+        column_start, column_stop = next_column_start, next_column_stop
+
+
+def overlap_fill(
+    layer: "Labels",
+    coord,
+    new_label: int,
+    refresh: bool = True,
+) -> None:
+    """Fill the clicked visible class into one binary active-class layer."""
+    int_coord = tuple(np.round(coord).astype(int))
+    data = np.asarray(layer.data)
+    if data.ndim != 2:
+        raise ValueError("Overlap fill is implemented only in 2D")
+    if np.any(np.less(int_coord, 0)) or np.any(
+        np.greater_equal(int_coord, data.shape)
+    ):
+        return
+    new_label = int(new_label)
+    if new_label not in {0, 1}:
+        raise ValueError("The active overlap layer accepts only 0 or 1")
+
+    # Erasing is deliberately limited to the connected active membership.
+    # It must not use the lower composite, or it could remove disconnected
+    # active objects that merely reveal the same lower class.
+    if new_label == 0:
+        if int(data[int_coord]) == 0:
+            return
+        fast_fill(layer, int_coord, 0, refresh)
+        return
+
+    composite = getattr(layer, "_napari_histo_overlap_composite", None)
+    active_value = getattr(layer, "_napari_histo_active_value", None)
+    if composite is None or active_value is None:
+        raise RuntimeError("Overlap fill is not bound to an active class")
+    # A 1 in the transparent edit mask may be hidden under another visible
+    # class. That is not a completed fill: use the authoritative composite's
+    # component so absent neighboring memberships are still painted. Exact
+    # repaint of the already-present seed membership remains idempotent; the
+    # store adapter promotes only actual 0 -> 1 additions locally.
+    if (
+        int(data[int_coord]) == 1
+        and int(np.asarray(composite)[int_coord]) == int(active_value)
+    ):
+        return
+
+    if layer.contiguous:
+        indices = bounded_overlap_flood_indices(
+            composite,
+            data,
+            active_value,
+            int_coord,
+        )
+    else:
+        visible = _visible_overlap_patch(
+            np.asarray(composite),
+            data,
+            int(active_value),
+            slice(None),
+            slice(None),
+        )
+        target = visible[int_coord]
+        indices = np.nonzero(visible == target)
+    layer.data_setitem(indices, 1, refresh)
+
+
+def enable_overlap_fill(
+    layer: "Labels",
+    composite: np.ndarray,
+    active_value: int | None,
+) -> None:
+    """Bind visible-composite bucket semantics to a binary Labels layer."""
+    layer._napari_histo_overlap_composite = composite
+    layer._napari_histo_active_value = active_value
+    layer.fill = MethodType(overlap_fill, layer)
+
+
 def fast_fill(
     layer: "Labels",
     coord,

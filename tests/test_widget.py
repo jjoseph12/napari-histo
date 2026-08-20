@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import imageio.v3 as iio
@@ -10,11 +11,16 @@ import numpy as np
 import pandas as pd
 from napari.components import ViewerModel
 from napari.layers import Labels
+from napari.layers.labels._labels_constants import Mode
 from qtpy.QtWidgets import QApplication
 
-from napari_histo_label_editor._fast_fill import fast_fill
+from napari_histo_label_editor._embedded_annotations import (
+    read_embedded_annotations,
+)
+from napari_histo_label_editor._fast_fill import overlap_fill
 from napari_histo_label_editor._fast_polygon import fast_paint_polygon
 from napari_histo_label_editor._class_config import read_class_config
+from napari_histo_label_editor._overlap_store import OverlapStore
 from napari_histo_label_editor._widget import LabelEditorWidget
 
 
@@ -130,9 +136,14 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             sleep(0.005)
 
     @staticmethod
-    def load_small_project(root, *, labels_dtype=np.uint8):
+    def load_small_project(
+        root,
+        *,
+        labels_dtype=np.uint8,
+        labels_suffix=".tif",
+    ):
         image_path = root / "image.png"
-        labels_path = root / "labels.tif"
+        labels_path = root / f"labels{labels_suffix}"
         mapping_path = root / "mapping.csv"
         iio.imwrite(image_path, np.zeros((8, 10, 3), dtype=np.uint8))
         labels = np.zeros((8, 10), dtype=labels_dtype)
@@ -179,16 +190,23 @@ class LoadSaveIntegrationTest(unittest.TestCase):
 
             self.assertEqual(
                 [layer.name for layer in viewer.layers],
-                ["histology", "labels"],
+                [
+                    "histology",
+                    "labels — all classes",
+                    "active class — 1: tumor",
+                ],
             )
             self.assertFalse(viewer.layers[0].multiscale)
             self.assertEqual(viewer.layers[0].interpolation2d, "linear")
             self.assertEqual(widget.labels_layer.data.dtype, np.dtype(np.uint8))
+            self.assertEqual(widget.composite_layer.data.dtype, np.dtype(np.uint8))
             self.assertEqual(widget._labels_output_dtype, np.dtype(np.int32))
             self.assertEqual(widget.labels_layer.n_edit_dimensions, 2)
             self.assertTrue(widget.labels_layer.contiguous)
             self.assertEqual(widget.labels_layer._undo_history.maxlen, 20)
-            self.assertIs(widget.labels_layer.fill.__func__, fast_fill)
+            self.assertFalse(widget.composite_layer.data.flags.writeable)
+            self.assertFalse(widget.composite_layer.editable)
+            self.assertIs(widget.labels_layer.fill.__func__, overlap_fill)
             self.assertIs(
                 widget.labels_layer.paint_polygon.__func__,
                 fast_paint_polygon,
@@ -202,6 +220,158 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(saved.shape, original.shape)
             self.assertEqual(saved.dtype, original.dtype)
             self.assertEqual(saved[0, 0], 1)
+
+    def test_save_preserves_sparse_undo_history(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, labels_path, _ = self.load_small_project(Path(tmp))
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+            native_history_size = len(widget.labels_layer._undo_history)
+            top_history_size = len(
+                widget.labels_layer._napari_histo_edit_tracker.undo_items
+            )
+
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            self.assertEqual(
+                len(widget.labels_layer._undo_history),
+                native_history_size,
+            )
+            self.assertEqual(
+                len(widget.labels_layer._napari_histo_edit_tracker.undo_items),
+                top_history_size,
+            )
+            self.assertEqual(iio.imread(labels_path)[2, 3], 1)
+            widget.undo()
+            self.assertEqual(widget.labels_layer.data[2, 3], 0)
+            self.assertEqual(widget.composite_layer.data[2, 3], 0)
+
+    def test_overlap_survives_save_and_reload_in_the_same_label_file(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            viewer, widget, labels_path, mapping_path = self.load_small_project(
+                root
+            )
+            # Add class 2 beneath the active class at one pixel, then paint
+            # class 1 over it through napari's normal partial-update path.
+            widget._upsert_class(2, "Stroma", "#123456")
+            widget._select_label(2)
+            widget.labels_layer.data_setitem(
+                (np.array([3]), np.array([4])),
+                1,
+            )
+            widget._select_label(1)
+            widget.labels_layer.data_setitem(
+                (np.array([3]), np.array([4])),
+                1,
+            )
+
+            self.assertEqual(
+                widget.overlap_store.memberships_at(3, 4),
+                (2, 1),
+            )
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            projection = iio.imread(labels_path)
+            self.assertEqual(projection[3, 4], 1)
+            payload = read_embedded_annotations(labels_path)
+            self.assertIsNotNone(payload)
+            restored = OverlapStore.from_payload(payload, projection)
+            self.assertEqual(restored.memberships_at(3, 4), (2, 1))
+            self.assertEqual(list(labels_path.parent.glob("*.overlap*")), [])
+
+            # A fresh widget recovers both memberships from that same TIFF.
+            reloaded_viewer = ViewerModel()
+            reloaded = LabelEditorWidget(reloaded_viewer)
+            reloaded.image_line.setText(str(widget.image_path))
+            reloaded.label_line.setText(str(labels_path))
+            reloaded.mapping_line.setText(str(mapping_path))
+            reloaded.load_data()
+            self.assertEqual(
+                reloaded.overlap_store.memberships_at(3, 4),
+                (2, 1),
+            )
+
+    def test_overlap_edit_uploads_only_the_changed_composite_patch(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            emitted_updates = []
+            emitted_offsets = []
+
+            def record_event(event):
+                emitted_updates.append(np.array(event.data, copy=True))
+                emitted_offsets.append(tuple(event.offset))
+
+            widget.composite_layer.events.labels_update.connect(record_event)
+
+            with patch.object(widget.composite_layer, "refresh") as full_refresh:
+                widget.labels_layer.data_setitem(
+                    (np.array([2]), np.array([3])),
+                    1,
+                )
+
+            self.assertEqual(emitted_offsets, [(2, 3)])
+            full_refresh.assert_not_called()
+            self.assertEqual(widget.composite_layer.data[2, 3], 1)
+            updated_slice = (slice(2, 3), slice(3, 4))
+            expected_texture = widget.composite_layer._raw_to_displayed(
+                widget.composite_layer._slice.image.raw,
+                data_slice=updated_slice,
+            )
+            np.testing.assert_array_equal(
+                widget.composite_layer._slice.image.view[updated_slice],
+                expected_texture,
+            )
+            self.assertTrue(emitted_updates)
+            np.testing.assert_array_equal(
+                emitted_updates[-1],
+                expected_texture,
+            )
+
+    def test_class_switch_does_not_reproject_or_refresh_composite(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            widget._upsert_class(2, "Stroma", "#123456")
+            composite_identity = id(widget.overlap_editor.composite)
+            previous_preview_color = widget.labels_layer._selected_color.copy()
+
+            with patch.object(
+                widget.overlap_editor,
+                "refresh_projection",
+                wraps=widget.overlap_editor.refresh_projection,
+            ) as reproject, patch.object(
+                widget.composite_layer,
+                "refresh",
+            ) as full_refresh, patch.object(
+                widget.labels_layer,
+                "refresh",
+            ) as hidden_refresh:
+                widget._select_label(1)
+
+            reproject.assert_not_called()
+            full_refresh.assert_not_called()
+            hidden_refresh.assert_not_called()
+            self.assertEqual(id(widget.overlap_editor.composite), composite_identity)
+            self.assertEqual(widget.overlap_editor.active_class, 1)
+            self.assertFalse(
+                np.array_equal(
+                    widget.labels_layer._selected_color,
+                    previous_preview_color,
+                )
+            )
+            np.testing.assert_allclose(
+                widget.labels_layer._selected_color,
+                widget._label_rgba(1),
+            )
+            np.testing.assert_allclose(
+                widget.labels_layer.get_color(1),
+                widget._label_rgba(1),
+                atol=1 / 255,
+            )
 
     def test_failed_second_load_keeps_original_layer_and_save_destination(self):
         with TemporaryDirectory() as tmp:
@@ -249,6 +419,53 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             expected_labels_a[2, 2] = 1
             np.testing.assert_array_equal(iio.imread(labels_a), expected_labels_a)
             np.testing.assert_array_equal(iio.imread(labels_b), original_labels_b)
+
+    def test_png_mapping_above_uint16_fails_before_replacing_active_project(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project_a = root / "project-a"
+            project_b = root / "project-b"
+            project_a.mkdir()
+            project_b.mkdir()
+            viewer, widget, labels_a, mapping_a = self.load_small_project(
+                project_a
+            )
+            previous_layers = list(viewer.layers)
+            previous_store = widget.overlap_store
+            previous_editor = widget.overlap_editor
+            previous_class_map = dict(widget.class_map)
+            previous_labels = labels_a.read_bytes()
+            previous_mapping = mapping_a.read_bytes()
+
+            image_b = project_b / "image.png"
+            labels_b = project_b / "labels.png"
+            mapping_b = project_b / "mapping.csv"
+            iio.imwrite(image_b, np.zeros((8, 10, 3), dtype=np.uint8))
+            iio.imwrite(labels_b, np.zeros((8, 10), dtype=np.uint8))
+            pd.DataFrame(
+                {
+                    "value": [0, 70000],
+                    "name": ["background", "Too large"],
+                }
+            ).to_csv(mapping_b, index=False)
+
+            widget.image_line.setText(str(image_b))
+            widget.label_line.setText(str(labels_b))
+            widget.mapping_line.setText(str(mapping_b))
+            with self.assertRaisesRegex(
+                ValueError,
+                "PNG supports class IDs up to 65535; use TIFF",
+            ):
+                widget.load_data()
+
+            self.assertEqual(list(viewer.layers), previous_layers)
+            self.assertIs(widget.overlap_store, previous_store)
+            self.assertIs(widget.overlap_editor, previous_editor)
+            self.assertEqual(widget.labels_path, labels_a.resolve())
+            self.assertEqual(widget.mapping_path, mapping_a.resolve())
+            self.assertEqual(widget.class_map, previous_class_map)
+            self.assertEqual(labels_a.read_bytes(), previous_labels)
+            self.assertEqual(mapping_a.read_bytes(), previous_mapping)
 
     def test_moved_loaded_destination_is_not_silently_recreated(self):
         with TemporaryDirectory() as tmp:
@@ -491,6 +708,93 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertIs(widget._save_worker, workers[0])
             workers[0].finished.emit()
 
+    def test_programmatic_edit_cannot_bypass_active_save_lock_or_break_undo(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            widget._upsert_class(2, "Stroma", "#123456")
+            widget._select_label(1)
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+            data_before = widget.labels_layer.data.copy()
+            projection_before = widget.overlap_store.project()
+            active_before = widget.overlap_editor.active_class
+            native_history_before = len(widget.labels_layer._undo_history)
+            native_redo_before = len(widget.labels_layer._redo_history)
+            top_history_before = len(
+                widget.labels_layer._napari_histo_edit_tracker.undo_items
+            )
+            top_redo_before = len(
+                widget.labels_layer._napari_histo_edit_tracker.redo_items
+            )
+            worker = FakeSaveWorker()
+
+            with patch(
+                "napari_histo_label_editor._widget.create_worker",
+                return_value=worker,
+            ):
+                widget.save_labels()
+
+            # Simulate a caller overriding the UI's PAN_ZOOM lock while the
+            # worker still owns the packed store.
+            widget.labels_layer.mode = Mode.PAINT
+            widget.labels_layer.data_setitem(
+                (np.array([4]), np.array([5])),
+                1,
+            )
+            # Native Cmd-Z/Cmd-Shift-Z dispatch directly to these layer
+            # methods, so both must obey the same worker ownership lock.
+            widget.labels_layer.undo()
+            widget.labels_layer.redo()
+            widget._select_label(2)
+            event = SimpleNamespace(
+                position=(0, 0),
+                view_direction=None,
+                dims_displayed=(0, 1),
+            )
+            with patch.object(
+                widget.composite_layer,
+                "get_value",
+                return_value=2,
+            ):
+                widget.labels_layer._drag_modes[Mode.PICK](
+                    widget.labels_layer,
+                    event,
+                )
+
+            np.testing.assert_array_equal(widget.labels_layer.data, data_before)
+            np.testing.assert_array_equal(
+                widget.overlap_store.project(),
+                projection_before,
+            )
+            self.assertEqual(widget.overlap_editor.active_class, active_before)
+            self.assertEqual(
+                len(widget.labels_layer._undo_history),
+                native_history_before,
+            )
+            self.assertEqual(
+                len(widget.labels_layer._redo_history),
+                native_redo_before,
+            )
+            self.assertEqual(
+                len(widget.labels_layer._napari_histo_edit_tracker.undo_items),
+                top_history_before,
+            )
+            self.assertEqual(
+                len(widget.labels_layer._napari_histo_edit_tracker.redo_items),
+                top_redo_before,
+            )
+            self.assertIn("save to finish", widget.viewer.status)
+
+            worker.finished.emit()
+            widget.undo()
+            self.assertEqual(widget.labels_layer.data[2, 3], 0)
+            self.assertEqual(widget.composite_layer.data[2, 3], 0)
+            widget.labels_layer.redo()
+            self.assertEqual(widget.labels_layer.data[2, 3], 1)
+            self.assertEqual(widget.composite_layer.data[2, 3], 1)
+
     def test_removing_owned_labels_layer_disables_and_refuses_save(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -654,22 +958,32 @@ class LoadSaveIntegrationTest(unittest.TestCase):
 
             self.assertEqual(widget.class_map[2], "Stroma")
             self.assertEqual(widget.class_colors[2], "#123456")
-            self.assertEqual(widget.labels_layer.selected_label, 2)
+            self.assertEqual(widget.overlap_editor.active_class, 2)
+            self.assertEqual(widget.labels_layer.selected_label, 1)
             self.assertIs(viewer.layers.selection.active, widget.labels_layer)
             self.assertFalse(widget.labels_layer.preserve_labels)
             np.testing.assert_allclose(
-                widget.labels_layer.get_color(2),
+                widget.composite_layer.get_color(2),
                 np.array([0x12, 0x34, 0x56, 0xFF]) / 255,
                 atol=1 / 255,
             )
 
             widget.labels_layer.data_setitem(
                 (np.array([1]), np.array([1])),
-                2,
+                1,
             )
             self.assertEqual(
                 widget.labels_layer._get_tooltip_text((1, 1)),
-                "Label: 2 — Stroma",
+                "Top: 2 — Stroma | Memberships: 1 — Tumor, 2 — Stroma",
+            )
+            self.assertEqual(
+                widget.labels_layer._get_tooltip_text(
+                    (1, 1),
+                    view_direction=np.array([0.0, 0.0]),
+                    dims_displayed=[0, 1],
+                    world=True,
+                ),
+                "Top: 2 — Stroma | Memberships: 1 — Tumor, 2 — Stroma",
             )
 
             widget._upsert_class(2, "Fibrosis", "red")
@@ -681,12 +995,218 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual((rows["value"] == 2).sum(), 1)
             self.assertEqual(
                 widget.labels_layer._get_tooltip_text((1, 1)),
-                "Label: 2 — Fibrosis",
+                "Top: 2 — Fibrosis | Memberships: 1 — Tumor, 2 — Fibrosis",
             )
             np.testing.assert_allclose(
-                widget.labels_layer.get_color(2),
+                widget.composite_layer.get_color(2),
                 np.array([1.0, 0.0, 0.0, 1.0]),
             )
+
+    def test_semantic_tooltip_reports_top_overlap_background_and_high_id(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            widget._upsert_class(2, "Stroma", "#123456")
+            widget.labels_layer.data_setitem(
+                (np.array([1]), np.array([1])),
+                1,
+            )
+            widget._select_label(1)
+
+            self.assertEqual(widget.overlap_editor.active_class, 1)
+            self.assertEqual(widget.composite_layer.data[1, 1], 2)
+            self.assertEqual(
+                widget.labels_layer._get_tooltip_text((1, 1)),
+                "Top: 2 — Stroma | Memberships: 1 — Tumor, 2 — Stroma",
+            )
+            self.assertEqual(
+                widget.labels_layer._get_tooltip_text((0, 0)),
+                "Label: 0 — background",
+            )
+            self.assertEqual(
+                widget.labels_layer._get_tooltip_text((-1, -1)),
+                "",
+            )
+
+            widget._upsert_class(300, "Review", "#abcdef")
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+            self.assertEqual(
+                widget.labels_layer._get_tooltip_text((2, 3)),
+                "Label: 300 — Review",
+            )
+
+    def test_plugin_opacity_slider_controls_only_visible_composite(self):
+        viewer = ViewerModel()
+        empty_widget = LabelEditorWidget(viewer)
+        self.assertFalse(empty_widget.overlay_opacity_slider.isEnabled())
+
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            self.assertTrue(widget.overlay_opacity_slider.isEnabled())
+            self.assertEqual(widget.overlay_opacity_slider.value(), 45)
+            self.assertAlmostEqual(widget.composite_layer.opacity, 0.45)
+            self.assertEqual(widget.labels_layer.opacity, 0.0)
+
+            widget.overlay_opacity_slider.setValue(67)
+            self.assertEqual(widget.overlay_opacity_value.text(), "67%")
+            self.assertAlmostEqual(widget.composite_layer.opacity, 0.67)
+            self.assertEqual(widget.labels_layer.opacity, 0.0)
+
+            widget.labels_layer.opacity = 0.8
+            self.assertEqual(widget.labels_layer.opacity, 0.0)
+
+            widget._save_worker = object()
+            widget._update_project_controls()
+            self.assertFalse(widget.overlay_opacity_slider.isEnabled())
+
+    def test_repaint_hidden_memberships_is_local_and_undo_redo_exact(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+
+            # Build class A broadly, then class B above it in four disjoint
+            # regions used by Paint, Polygon, Fill, and an unrelated control.
+            a_rows, a_columns = np.indices((6, 8))
+            widget.labels_layer.data_setitem(
+                (a_rows.reshape(-1) + 1, a_columns.reshape(-1) + 1),
+                1,
+            )
+            widget._upsert_class(2, "B", "#123456")
+            b_coordinates = np.array(
+                [
+                    [1, 1],
+                    [1, 4],
+                    [1, 5],
+                    [2, 4],
+                    [2, 5],
+                    [4, 1],
+                    [4, 2],
+                    [5, 1],
+                    [5, 2],
+                    [6, 8],
+                ],
+                dtype=np.intp,
+            )
+            widget.labels_layer.data_setitem(
+                (b_coordinates[:, 0], b_coordinates[:, 1]),
+                1,
+            )
+            widget._select_label(1)
+            self.assertTrue(
+                np.all(
+                    widget.labels_layer.data[
+                        b_coordinates[:, 0],
+                        b_coordinates[:, 1],
+                    ]
+                )
+            )
+
+            # Paint over an already-present hidden A membership.
+            widget.labels_layer.data_setitem(
+                (np.array([1]), np.array([1])),
+                1,
+            )
+            self.assertEqual(widget.composite_layer.data[1, 1], 1)
+
+            # Polygon over another hidden A region.
+            widget.labels_layer.paint_polygon(
+                np.array([[1, 4], [1, 5], [2, 5], [2, 4]]),
+                1,
+            )
+            self.assertEqual(widget.composite_layer.data[1, 4], 1)
+
+            # Fill follows the visible B component and raises all touched A
+            # memberships without removing B underneath.
+            widget.labels_layer.fill((4, 1), 1)
+            np.testing.assert_array_equal(
+                widget.composite_layer.data[4:6, 1:3],
+                np.ones((2, 2), dtype=widget.composite_layer.data.dtype),
+            )
+            self.assertEqual(widget.composite_layer.data[6, 8], 2)
+            for row, column in b_coordinates:
+                self.assertIn(2, widget.overlap_store.memberships_at(row, column))
+
+            # Native Undo/Redo includes top-only 1 -> 1 actions and restores
+            # the exact visible class while retaining both memberships.
+            widget.labels_layer.undo()
+            np.testing.assert_array_equal(
+                widget.composite_layer.data[4:6, 1:3],
+                np.full((2, 2), 2, dtype=widget.composite_layer.data.dtype),
+            )
+            widget.labels_layer.redo()
+            np.testing.assert_array_equal(
+                widget.composite_layer.data[4:6, 1:3],
+                np.ones((2, 2), dtype=widget.composite_layer.data.dtype),
+            )
+
+            # Erasing a hidden A leaves B visible; Undo must not accidentally
+            # promote A when it restores the membership.
+            widget.labels_layer.data_setitem(
+                (np.array([6]), np.array([8])),
+                0,
+            )
+            self.assertEqual(widget.composite_layer.data[6, 8], 2)
+            widget.labels_layer.undo()
+            self.assertIn(1, widget.overlap_store.memberships_at(6, 8))
+            self.assertIn(2, widget.overlap_store.memberships_at(6, 8))
+            self.assertEqual(widget.composite_layer.data[6, 8], 2)
+
+            widget.save_labels()
+            self.wait_for_save(widget)
+            projection = iio.imread(labels_path)
+            payload = read_embedded_annotations(labels_path)
+            restored = OverlapStore.from_payload(payload, projection)
+            self.assertEqual(restored.project()[4, 1], 1)
+            self.assertEqual(restored.project()[6, 8], 2)
+            self.assertEqual(restored.memberships_at(4, 1), (2, 1))
+            self.assertEqual(restored.memberships_at(6, 8), (1, 2))
+            saved_map, _ = read_class_config(mapping_path)
+            self.assertIn(2, saved_map)
+
+    def test_pick_uses_visible_semantic_class_without_binary_id_leak(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            widget._upsert_class(2, "B", "#123456")
+            widget._upsert_class(300, "Review", "#abcdef")
+            callback = widget.labels_layer._drag_modes[Mode.PICK]
+            event = SimpleNamespace(
+                position=(0, 0),
+                view_direction=None,
+                dims_displayed=(0, 1),
+            )
+
+            self.assertIsNot(
+                widget.labels_layer._drag_modes,
+                type(widget.labels_layer)._drag_modes,
+            )
+            with patch.object(
+                widget.composite_layer,
+                "get_value",
+                return_value=2,
+            ):
+                callback(widget.labels_layer, event)
+            self.assertEqual(widget.overlap_editor.active_class, 2)
+            self.assertEqual(widget.labels_layer.selected_label, 1)
+
+            with patch.object(
+                widget.composite_layer,
+                "get_value",
+                return_value=300,
+            ):
+                callback(widget.labels_layer, event)
+            self.assertEqual(widget.overlap_editor.active_class, 300)
+            self.assertEqual(widget.labels_layer.selected_label, 1)
+
+            with patch.object(
+                widget.composite_layer,
+                "get_value",
+                return_value=0,
+            ):
+                callback(widget.labels_layer, event)
+            self.assertEqual(widget.overlap_editor.active_class, 300)
+            self.assertEqual(widget.labels_layer.selected_label, 0)
 
     def test_large_new_class_promotes_edit_and_save_dtypes_losslessly(self):
         with TemporaryDirectory() as tmp:
@@ -698,9 +1218,11 @@ class LoadSaveIntegrationTest(unittest.TestCase):
 
             widget._upsert_class(300, "Review", "#abcdef")
 
-            self.assertEqual(widget.labels_layer.data.dtype, np.dtype(np.uint16))
+            self.assertEqual(widget.labels_layer.data.dtype, np.dtype(np.uint8))
+            self.assertEqual(widget.composite_layer.data.dtype, np.dtype(np.uint16))
+            self.assertFalse(widget.composite_layer.editable)
             self.assertEqual(widget._labels_output_dtype, np.dtype(np.uint16))
-            self.assertIs(widget.labels_layer.fill.__func__, fast_fill)
+            self.assertIs(widget.labels_layer.fill.__func__, overlap_fill)
             self.assertIs(
                 widget.labels_layer.paint_polygon.__func__,
                 fast_paint_polygon,
@@ -708,7 +1230,19 @@ class LoadSaveIntegrationTest(unittest.TestCase):
 
             widget.labels_layer.data_setitem(
                 (np.array([2]), np.array([3])),
-                300,
+                1,
+            )
+            self.assertEqual(widget.composite_layer.data[2, 3], 300)
+            self.assertTrue(
+                np.shares_memory(
+                    widget.composite_layer.data,
+                    widget.overlap_store.projection_view,
+                )
+            )
+            np.testing.assert_allclose(
+                widget.composite_layer.get_color(300),
+                np.array([0xAB, 0xCD, 0xEF, 0xFF]) / 255,
+                atol=1 / 255,
             )
             widget.save_labels()
             self.wait_for_save(widget)
@@ -716,6 +1250,88 @@ class LoadSaveIntegrationTest(unittest.TestCase):
 
             self.assertEqual(saved.dtype, np.dtype(np.uint16))
             self.assertEqual(saved[2, 3], 300)
+
+    def test_png_class_300_promotes_saves_and_reloads_uint16(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(
+                root,
+                labels_suffix=".png",
+            )
+
+            widget._upsert_class(300, "Review", "#abcdef")
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            saved = iio.imread(labels_path)
+            self.assertEqual(saved.dtype, np.dtype(np.uint16))
+            self.assertEqual(saved[2, 3], 300)
+            payload = read_embedded_annotations(labels_path)
+            self.assertIsNotNone(payload)
+            restored_store = OverlapStore.from_payload(payload, saved)
+            self.assertIn(300, restored_store.memberships_at(2, 3))
+
+            reloaded_viewer = ViewerModel()
+            reloaded = LabelEditorWidget(reloaded_viewer)
+            reloaded.image_line.setText(str(root / "image.png"))
+            reloaded.label_line.setText(str(labels_path))
+            reloaded.mapping_line.setText(str(mapping_path))
+            reloaded.load_data()
+
+            self.assertEqual(reloaded.composite_layer.data.dtype, np.uint16)
+            self.assertEqual(reloaded.composite_layer.data[2, 3], 300)
+            self.assertIn(300, reloaded.overlap_store.memberships_at(2, 3))
+
+    def test_png_class_above_uint16_is_rejected_without_side_effects(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(
+                root,
+                labels_suffix=".png",
+            )
+            labels_before = labels_path.read_bytes()
+            mapping_before = mapping_path.read_bytes()
+            class_map_before = dict(widget.class_map)
+            class_colors_before = dict(widget.class_colors)
+            class_values_before = widget.overlap_store.class_values
+            z_order_before = widget.overlap_store.z_order
+            projection_before = widget.overlap_store.project()
+            output_dtype_before = widget._labels_output_dtype
+            active_before = widget.overlap_editor.active_class
+            button_texts_before = [
+                widget.class_button_layout.itemAt(index).widget().text()
+                for index in range(widget.class_button_layout.count())
+            ]
+
+            with self.assertRaisesRegex(
+                ValueError,
+                "PNG supports class IDs up to 65535; use TIFF",
+            ):
+                widget._upsert_class(70000, "Too large", "#abcdef")
+
+            self.assertEqual(labels_path.read_bytes(), labels_before)
+            self.assertEqual(mapping_path.read_bytes(), mapping_before)
+            self.assertEqual(widget.class_map, class_map_before)
+            self.assertEqual(widget.class_colors, class_colors_before)
+            self.assertEqual(widget.overlap_store.class_values, class_values_before)
+            self.assertEqual(widget.overlap_store.z_order, z_order_before)
+            np.testing.assert_array_equal(
+                widget.overlap_store.project(),
+                projection_before,
+            )
+            self.assertEqual(widget._labels_output_dtype, output_dtype_before)
+            self.assertEqual(widget.overlap_editor.active_class, active_before)
+            self.assertEqual(
+                [
+                    widget.class_button_layout.itemAt(index).widget().text()
+                    for index in range(widget.class_button_layout.count())
+                ],
+                button_texts_before,
+            )
 
     def test_delete_class_is_staged_until_save_then_updates_both_files(self):
         with TemporaryDirectory() as tmp:
@@ -777,8 +1393,9 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             ):
                 widget._delete_class(1)
 
-            self.assertEqual(widget.labels_layer.data[1, 1], 2)
-            self.assertEqual(widget.labels_layer.selected_label, 2)
+            self.assertEqual(widget.labels_layer.data[1, 1], 1)
+            self.assertEqual(widget.overlap_editor.active_class, 2)
+            self.assertEqual(widget.labels_layer.selected_label, 1)
             self.assertEqual(mapping_path.read_bytes(), mapping_before)
             self.assertIn("Press Save", widget.viewer.status)
 
@@ -808,7 +1425,12 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 ],
                 dtype=np.uint8,
             )
-            widget.labels_layer.data[...] = original
+            widget.overlap_store.update_plane(1, original == 1)
+            widget.overlap_store.update_plane(2, original == 2)
+            widget.overlap_editor.refresh_projection()
+            widget.overlap_editor.select_class(2)
+            widget.labels_layer.refresh()
+            widget.composite_layer.refresh()
 
             class FakeDeleteDialog:
                 replacement_value = 2
@@ -828,7 +1450,10 @@ class LoadSaveIntegrationTest(unittest.TestCase):
 
             expected = original.copy()
             expected[original == 1] = 2
-            np.testing.assert_array_equal(widget.labels_layer.data, expected)
+            np.testing.assert_array_equal(
+                widget.overlap_store.project(),
+                expected,
+            )
 
             widget.save_labels()
             self.wait_for_save(widget)
@@ -862,7 +1487,10 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             ):
                 widget._delete_class(2)
 
-            np.testing.assert_array_equal(widget.labels_layer.data, labels_before)
+            np.testing.assert_array_equal(
+                widget.overlap_store.project(),
+                labels_before,
+            )
             self.assertEqual(labels_path.read_bytes(), label_bytes_before)
             self.assertEqual(mapping_path.read_bytes(), mapping_bytes_before)
             self.assertTrue(widget._class_config_pending_save)
@@ -1023,11 +1651,11 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertTrue(widget.delete_class_btn.isEnabled())
 
             widget.labels_layer.selected_label = 0
-            self.assertFalse(widget.delete_class_btn.isEnabled())
+            self.assertTrue(widget.delete_class_btn.isEnabled())
 
             widget.labels_layer.selected_label = 7
             self.assertEqual(widget.labels_layer.selected_label, 0)
-            self.assertFalse(widget.delete_class_btn.isEnabled())
+            self.assertTrue(widget.delete_class_btn.isEnabled())
 
             widget.labels_layer.selected_label = 1
             self.assertTrue(widget.delete_class_btn.isEnabled())
@@ -1056,7 +1684,8 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             widget.mapping_line.setText(str(mapping_path))
             widget.load_data()
 
-            self.assertEqual(widget.labels_layer.selected_label, 23)
+            self.assertEqual(widget.overlap_editor.active_class, 23)
+            self.assertEqual(widget.labels_layer.selected_label, 1)
             self.assertTrue(widget.delete_class_btn.isEnabled())
 
     def test_deleted_value_reintroduced_before_save_is_sanitized(self):

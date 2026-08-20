@@ -8,8 +8,11 @@ from skimage.segmentation import flood as reference_flood
 
 from napari_histo_label_editor._fast_fill import (
     bounded_flood_indices,
+    bounded_overlap_flood_indices,
     enable_fast_fill,
+    enable_overlap_fill,
     fast_fill,
+    overlap_fill,
 )
 
 
@@ -249,6 +252,107 @@ class FastFillTest(unittest.TestCase):
 
         self.assertEqual(len(indices[0]), labels.size)
         self.assertEqual(allocated_shapes[-1], labels.shape)
+
+    def test_overlap_fill_follows_visible_semantic_component(self):
+        composite = np.array(
+            [
+                [2, 2, 0, 3, 3],
+                [2, 0, 0, 3, 0],
+                [0, 0, 4, 4, 0],
+            ],
+            dtype=np.uint8,
+        )
+        layer = self.make_layer(np.zeros(composite.shape, dtype=np.uint8))
+        layer.contiguous = True
+        enable_overlap_fill(layer, composite, active_value=9)
+
+        layer.fill((0, 0), 1)
+
+        expected = np.zeros_like(composite)
+        expected[0, :2] = 1
+        expected[1, 0] = 1
+        np.testing.assert_array_equal(layer.data, expected)
+        self.assertIs(layer.fill.__func__, overlap_fill)
+
+    def test_overlap_erase_removes_only_clicked_active_component(self):
+        composite = np.full((4, 6), 2, dtype=np.uint8)
+        active = np.array(
+            [
+                [1, 1, 0, 0, 1, 1],
+                [1, 0, 0, 0, 1, 0],
+                [0, 0, 0, 0, 0, 0],
+                [1, 1, 0, 0, 0, 0],
+            ],
+            dtype=np.uint8,
+        )
+        layer = self.make_layer(active.copy())
+        layer.contiguous = True
+        enable_overlap_fill(layer, composite, active_value=9)
+
+        layer.fill((0, 0), 0)
+
+        expected = active.copy()
+        expected[0, :2] = 0
+        expected[1, 0] = 0
+        np.testing.assert_array_equal(layer.data, expected)
+
+    def test_overlap_fill_crosses_hidden_active_membership(self):
+        # The transparent active mask must not split the actually visible
+        # class-2 component. Painting from the left reaches the right side.
+        composite = np.full((1, 3), 2, dtype=np.uint8)
+        active = np.array([[0, 1, 0]], dtype=np.uint8)
+        layer = self.make_layer(active.copy())
+        layer.contiguous = True
+        enable_overlap_fill(layer, composite, active_value=9)
+
+        layer.fill((0, 0), 1)
+
+        np.testing.assert_array_equal(
+            layer.data,
+            np.ones((1, 3), dtype=np.uint8),
+        )
+
+    def test_overlap_fill_seeded_on_hidden_membership_paints_neighbors(self):
+        # The clicked membership is already 1 in the transparent edit mask,
+        # but class 2 is authoritative/visible there. It must not trigger the
+        # ordinary binary-layer early return before the visible component is
+        # flooded.
+        composite = np.full((1, 3), 2, dtype=np.uint8)
+        active = np.array([[0, 1, 0]], dtype=np.uint8)
+        layer = self.make_layer(active.copy())
+        layer.contiguous = True
+        enable_overlap_fill(layer, composite, active_value=9)
+
+        layer.fill((0, 1), 1)
+
+        np.testing.assert_array_equal(
+            layer.data,
+            np.ones((1, 3), dtype=np.uint8),
+        )
+
+    def test_bounded_overlap_fill_materializes_only_local_object_window(self):
+        composite = np.zeros((4096, 4096), dtype=np.uint8)
+        composite[1900:2100, 1900:2100] = 3
+        active = np.zeros_like(composite)
+        allocated_shapes = []
+
+        def recording_flood(data, seed, connectivity):
+            allocated_shapes.append(data.shape)
+            return reference_flood(data, seed, connectivity=connectivity)
+
+        with patch(
+            "napari_histo_label_editor._fast_fill.flood",
+            side_effect=recording_flood,
+        ):
+            indices = bounded_overlap_flood_indices(
+                composite,
+                active,
+                active_value=9,
+                seed=(2000, 2000),
+            )
+
+        self.assertEqual(len(indices[0]), 200 * 200)
+        self.assertEqual(allocated_shapes, [(1024, 1024)])
 
 
 if __name__ == "__main__":
