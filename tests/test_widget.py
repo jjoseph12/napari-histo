@@ -405,7 +405,7 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertIs(widget.labels_layer, original_layer)
             self.assertTrue(any(layer is original_layer for layer in viewer.layers))
             self.assertTrue(widget.save_btn.isEnabled())
-            self.assertEqual(widget.save_btn.text(), "Save locked file [s]")
+            self.assertEqual(widget.save_btn.text(), "Save [s]")
             self.assertEqual(
                 widget.save_destination_line.text(),
                 str(labels_a.resolve()),
@@ -477,16 +477,108 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             widget.labels_layer.data[2, 3] = 1
 
             with patch(
+                "napari_histo_label_editor._widget.QFileDialog.getSaveFileName",
+                return_value=("", ""),
+            ) as save_as_dialog, patch(
                 "napari_histo_label_editor._widget.create_worker"
             ) as create_worker:
                 widget.save_labels()
 
+            save_as_dialog.assert_called_once()
             create_worker.assert_not_called()
             self.assertFalse(labels_path.exists())
             self.assertFalse(widget.labels_path.exists())
             self.assertTrue(moved_labels_path.is_file())
             np.testing.assert_array_equal(iio.imread(moved_labels_path), original)
-            self.assertFalse(widget.save_btn.isEnabled())
+            self.assertTrue(widget.save_btn.isEnabled())
+            self.assertEqual(widget.save_btn.text(), "Save As… [s]")
+
+    def test_save_as_rescues_all_overlaps_and_becomes_next_save_target(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            widget._upsert_class(2, "Stroma", "#123456")
+            widget._select_label(2)
+            widget.labels_layer.data_setitem(
+                (np.array([1]), np.array([1])),
+                1,
+            )
+            self.assertEqual(
+                widget.overlap_store.memberships_at(1, 1),
+                (1, 2),
+            )
+            self.assertTrue(widget.save_btn.isEnabled())
+
+            moved_path = root / "original-moved.tif"
+            labels_path.rename(moved_path)
+            moved_bytes = moved_path.read_bytes()
+            rescued_path = root / "rescued.tif"
+            with patch(
+                "napari_histo_label_editor._widget.QFileDialog.getSaveFileName",
+                return_value=(str(rescued_path), ""),
+            ) as save_as_dialog:
+                widget.save_labels()
+                self.wait_for_save(widget)
+
+            save_as_dialog.assert_called_once()
+            self.assertFalse(labels_path.exists())
+            self.assertEqual(moved_path.read_bytes(), moved_bytes)
+            self.assertEqual(widget.labels_path, rescued_path.resolve())
+            self.assertEqual(widget.label_line.text(), str(rescued_path.resolve()))
+            self.assertEqual(
+                widget.save_destination_line.text(),
+                str(rescued_path.resolve()),
+            )
+            projection = iio.imread(rescued_path)
+            payload = read_embedded_annotations(rescued_path)
+            self.assertIsNotNone(payload)
+            restored = OverlapStore.from_payload(payload, projection=projection)
+            self.assertEqual(restored.memberships_at(1, 1), (1, 2))
+
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+            self.assertTrue(widget.save_btn.isEnabled())
+            with patch(
+                "napari_histo_label_editor._widget.QFileDialog.getSaveFileName"
+            ) as save_as_dialog:
+                widget.save_labels()
+                self.wait_for_save(widget)
+            save_as_dialog.assert_not_called()
+            self.assertEqual(iio.imread(rescued_path)[2, 3], 2)
+
+    def test_save_as_refuses_project_inputs_and_symlink_aliases(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, mapping_path = self.load_small_project(root)
+            image_bytes = widget.image_path.read_bytes()
+            mapping_bytes = mapping_path.read_bytes()
+            mapping_alias = root / "mapping-alias.tif"
+            mapping_alias.symlink_to(mapping_path)
+
+            for forbidden in (widget.image_path, mapping_alias):
+                with self.subTest(forbidden=forbidden), patch(
+                    "napari_histo_label_editor._widget.QFileDialog.getSaveFileName",
+                    return_value=(str(forbidden), ""),
+                ), self.assertRaisesRegex(ValueError, "cannot overwrite"):
+                    widget._choose_save_as_destination()
+
+            self.assertEqual(widget.image_path.read_bytes(), image_bytes)
+            self.assertEqual(mapping_path.read_bytes(), mapping_bytes)
+
+            replacement = np.full((8, 10), 7, dtype=np.uint8)
+            replacement_path = root / "replacement.tif"
+            iio.imwrite(replacement_path, replacement)
+            os.replace(replacement_path, labels_path)
+            compromised_alias = root / "compromised-alias.tif"
+            compromised_alias.symlink_to(labels_path)
+            with patch(
+                "napari_histo_label_editor._widget.QFileDialog.getSaveFileName",
+                return_value=(str(compromised_alias), ""),
+            ), self.assertRaisesRegex(ValueError, "missing or changed"):
+                widget._choose_save_as_destination()
+            np.testing.assert_array_equal(iio.imread(labels_path), replacement)
 
     def test_add_labels_post_insert_failure_restores_exact_previous_project(self):
         with TemporaryDirectory() as tmp:
@@ -576,7 +668,7 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 previous_save_target,
             )
             self.assertTrue(widget.save_btn.isEnabled())
-            self.assertEqual(widget.save_btn.text(), "Save locked file [s]")
+            self.assertEqual(widget.save_btn.text(), "Save [s]")
 
             previous_labels_layer.data[2, 3] = 1
             widget.save_labels()
@@ -596,13 +688,18 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             widget.labels_layer.data[2, 3] = 1
 
             with patch(
+                "napari_histo_label_editor._widget.QFileDialog.getSaveFileName",
+                return_value=("", ""),
+            ) as save_as_dialog, patch(
                 "napari_histo_label_editor._widget.create_worker"
             ) as create_worker:
                 widget.save_labels()
 
+            save_as_dialog.assert_called_once()
             create_worker.assert_not_called()
             np.testing.assert_array_equal(iio.imread(labels_path), replacement)
-            self.assertFalse(widget.save_btn.isEnabled())
+            self.assertTrue(widget.save_btn.isEnabled())
+            self.assertEqual(widget.save_btn.text(), "Save As… [s]")
 
     def test_mapping_replaced_by_symlink_cannot_update_unrelated_csv(self):
         with TemporaryDirectory() as tmp:
@@ -661,7 +758,7 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             widget.label_line.setText(str(other_labels_path))
 
             self.assertTrue(widget.save_btn.isEnabled())
-            self.assertEqual(widget.save_btn.text(), "Save locked file [s]")
+            self.assertEqual(widget.save_btn.text(), "Save [s]")
             self.assertEqual(widget.labels_path, labels_path.resolve())
             self.assertEqual(
                 widget.save_destination_line.text(),
@@ -677,7 +774,7 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 iio.imread(other_labels_path),
                 original_other_labels,
             )
-            self.assertEqual(widget.save_btn.text(), "Save locked file [s]")
+            self.assertEqual(widget.save_btn.text(), "Save [s]")
 
             widget.load_data()
 
@@ -1554,20 +1651,25 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             os.replace(replacement_path, labels_path)
 
             with patch(
+                "napari_histo_label_editor._widget.QFileDialog.getSaveFileName",
+                return_value=("", ""),
+            ) as save_as_dialog, patch(
                 "napari_histo_label_editor._widget.create_worker"
             ) as create_worker, patch(
                 "napari_histo_label_editor._widget.atomic_write_class_config"
             ) as write_class_config:
                 widget.save_labels()
 
+            save_as_dialog.assert_called_once()
             create_worker.assert_not_called()
             write_class_config.assert_not_called()
             np.testing.assert_array_equal(iio.imread(labels_path), external_labels)
             self.assertEqual(mapping_path.read_bytes(), mapping_bytes_before)
             self.assertTrue(widget._class_config_pending_save)
-            self.assertFalse(widget.save_btn.isEnabled())
+            self.assertTrue(widget.save_btn.isEnabled())
+            self.assertEqual(widget.save_btn.text(), "Save As… [s]")
 
-    def test_external_mapping_replacement_blocks_both_pending_delete_writes(self):
+    def test_save_as_preserves_pending_deletion_without_touching_changed_csv(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
             _, widget, labels_path, mapping_path = self.load_small_project(root)
@@ -1588,20 +1690,28 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             ).to_csv(external_mapping_path, index=False)
             external_mapping_bytes = external_mapping_path.read_bytes()
             os.replace(external_mapping_path, mapping_path)
+            rescued_path = root / "rescued-labels.tif"
 
             with patch(
-                "napari_histo_label_editor._widget.create_worker"
-            ) as create_worker, patch(
+                "napari_histo_label_editor._widget.QFileDialog.getSaveFileName",
+                return_value=(str(rescued_path), ""),
+            ), patch(
                 "napari_histo_label_editor._widget.atomic_write_class_config"
             ) as write_class_config:
                 widget.save_labels()
+                self.wait_for_save(widget)
 
-            create_worker.assert_not_called()
             write_class_config.assert_not_called()
             self.assertEqual(labels_path.read_bytes(), label_bytes_before)
             self.assertEqual(mapping_path.read_bytes(), external_mapping_bytes)
+            self.assertTrue(rescued_path.is_file())
+            self.assertEqual(iio.imread(rescued_path)[1, 1], 0)
+            self.assertIsNotNone(read_embedded_annotations(rescued_path))
+            self.assertEqual(widget.labels_path, rescued_path.resolve())
+            self.assertEqual(widget.label_line.text(), str(rescued_path.resolve()))
             self.assertTrue(widget._class_config_pending_save)
-            self.assertIn("both left untouched", widget.viewer.status)
+            self.assertIn("mapping CSV was not changed", widget.viewer.status)
+            self.assertEqual(widget.save_btn.text(), "Save As… [s]")
 
     def test_external_mapping_change_during_confirmation_is_exact_no_op(self):
         with TemporaryDirectory() as tmp:

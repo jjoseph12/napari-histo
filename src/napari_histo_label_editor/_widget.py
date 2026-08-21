@@ -250,6 +250,7 @@ def _atomic_save_overlap_store(
     output_dtype: np.dtype,
     *,
     expected_identity: Optional[FileIdentity],
+    require_absent: bool = False,
 ) -> SaveResult:
     """Project and embed one UI-locked overlap store in a worker thread."""
     projection = store.projection_view
@@ -261,6 +262,7 @@ def _atomic_save_overlap_store(
         destination,
         output_dtype,
         expected_identity=expected_identity,
+        require_absent=require_absent,
         annotation_payload=payload,
         _copy_snapshot=False,
     )
@@ -309,6 +311,9 @@ class LabelEditorWidget(QWidget):
         self._active_save_path: Optional[Path] = None
         self._active_save_layer = None
         self._active_save_layer_mode = None
+        self._active_save_adopt_destination = False
+        self._active_save_update_class_config = False
+        self._active_save_output_dtype: Optional[np.dtype] = None
         self._browse_buttons = []
         self._syncing_overlap_layer = False
 
@@ -432,15 +437,14 @@ class LabelEditorWidget(QWidget):
         opacity_row.addWidget(self.overlay_opacity_value)
         layout.addLayout(opacity_row)
 
-        self.save_destination_caption = QLabel(
-            "Save destination (locked by Load)"
-        )
+        self.save_destination_caption = QLabel("Current save destination")
         layout.addWidget(self.save_destination_caption)
         self.save_destination_line = QLineEdit()
         self.save_destination_line.setReadOnly(True)
         self.save_destination_line.setPlaceholderText("No label file loaded")
         self.save_destination_line.setToolTip(
-            "Save always overwrites this exact canonical label file."
+            "Save writes here while the loaded file is unchanged. Save As "
+            "creates or replaces a destination you explicitly choose."
         )
         layout.addWidget(self.save_destination_line)
 
@@ -448,6 +452,14 @@ class LabelEditorWidget(QWidget):
         self.save_btn.setEnabled(False)
         self.save_btn.clicked.connect(self.save_labels)
         layout.addWidget(self.save_btn)
+
+        self.save_as_btn = QPushButton("Save As…")
+        self.save_as_btn.setEnabled(False)
+        self.save_as_btn.clicked.connect(self.save_labels_as)
+        self.save_as_btn.setToolTip(
+            "Save all current annotations and overlaps to another PNG or TIFF"
+        )
+        layout.addWidget(self.save_as_btn)
 
         self.undo_btn = QPushButton("Undo [u]")
         self.undo_btn.setEnabled(False)
@@ -578,16 +590,18 @@ class LabelEditorWidget(QWidget):
                 self._mapping_destination_identity,
             )
         )
-        self.save_btn.setEnabled(
-            active_layer
-            and not busy
-            and destination_available
-            and (not self._class_config_pending_save or mapping_available)
+        # The live overlap store is the user's work.  A missing/replaced disk
+        # target must never strand it by disabling Save: save_labels() routes
+        # unsafe destinations through the same guarded Save As flow.
+        self.save_btn.setEnabled(active_layer and not busy)
+        self.save_as_btn.setEnabled(active_layer and not busy)
+        rescue_required = not destination_available or (
+            self._class_config_pending_save and not mapping_available
         )
-        if self._class_config_pending_save:
+        if active_layer and rescue_required:
+            self.save_btn.setText("Save As… [s]")
+        elif self._class_config_pending_save:
             self.save_btn.setText("Save class deletion [s]")
-        elif active_layer and not inputs_match:
-            self.save_btn.setText("Save locked file [s]")
         else:
             self.save_btn.setText("Save [s]")
         self.undo_btn.setEnabled(active_layer and not busy)
@@ -616,9 +630,7 @@ class LabelEditorWidget(QWidget):
 
         if self.labels_path is None:
             self.save_destination_line.clear()
-            self.save_destination_caption.setText(
-                "Save destination (locked by Load)"
-            )
+            self.save_destination_caption.setText("Current save destination")
             self.save_destination_line.setToolTip(
                 "Load a project before saving labels."
             )
@@ -636,11 +648,11 @@ class LabelEditorWidget(QWidget):
             )
         elif not destination_available:
             self.save_destination_caption.setText(
-                "Save disabled — destination is missing or changed"
+                "Original is missing or changed — Save opens Save As"
             )
         elif self._class_config_pending_save and not mapping_available:
             self.save_destination_caption.setText(
-                "Save disabled — class CSV is missing or changed"
+                "Class CSV changed — Save As preserves labels without it"
             )
         elif self._class_config_pending_save:
             self.save_destination_caption.setText(
@@ -651,9 +663,7 @@ class LabelEditorWidget(QWidget):
                 "New paths not loaded — Save still writes to"
             )
         else:
-            self.save_destination_caption.setText(
-                "Save destination (locked by Load)"
-            )
+            self.save_destination_caption.setText("Current save destination")
 
     def _dialog_start_directory(self, *line_edits: QLineEdit) -> str:
         """Start file pickers beside the current project when possible."""
@@ -957,8 +967,8 @@ class LabelEditorWidget(QWidget):
         self._update_project_controls()
 
         self.viewer.status = (
-            "Loaded lossless overlapping annotations. Saves are locked to "
-            f"{self.labels_path}"
+            "Loaded lossless overlapping annotations. Save writes to "
+            f"{self.labels_path}; Save As can create a rescue copy."
         )
 
     @staticmethod
@@ -2046,6 +2056,126 @@ class LabelEditorWidget(QWidget):
         self.viewer.status = "Undo complete."
 
     def save_labels(self):
+        """Save normally, or rescue to Save As when a target is unsafe."""
+        self._begin_label_save(force_save_as=False)
+
+    def save_labels_as(self):
+        """Save the complete live overlap model to a user-chosen image."""
+        self._begin_label_save(force_save_as=True)
+
+    def _choose_save_as_destination(
+        self,
+    ) -> Optional[tuple[Path, Optional[FileIdentity], bool]]:
+        """Return a guarded Save As target, or ``None`` after cancellation."""
+        if self.labels_path is not None:
+            original = self.labels_path
+            initial = original.with_name(
+                f"{original.stem}-copy{original.suffix.lower()}"
+            )
+        else:
+            initial = Path(
+                self._dialog_start_directory(self.label_line, self.image_line)
+            ) / "labels-copy.tif"
+
+        selected, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save annotations as",
+            str(initial),
+            "Label images (*.png *.tif *.tiff)",
+        )
+        if not selected:
+            self.viewer.status = (
+                "Save As cancelled; current annotations remain open and "
+                "unsaved."
+            )
+            return None
+
+        candidate = Path(selected).expanduser()
+        if not candidate.suffix:
+            candidate = candidate.with_suffix(".tif")
+        if candidate.suffix.lower() not in {".png", ".tif", ".tiff"}:
+            raise ValueError(
+                "Save As requires a PNG, TIF, or TIFF label destination."
+            )
+
+        try:
+            parent = candidate.parent.resolve(strict=True)
+        except OSError as error:
+            raise ValueError(
+                f"Save As folder does not exist or cannot be accessed: "
+                f"{candidate.parent}"
+            ) from error
+        if not parent.is_dir():
+            raise ValueError(f"Save As parent is not a folder: {parent}")
+        destination = parent / candidate.name
+
+        if destination.is_symlink() or destination.exists():
+            try:
+                destination = destination.resolve(strict=True)
+            except OSError as error:
+                raise ValueError(
+                    f"Save As destination cannot be accessed: {destination}"
+                ) from error
+            if not destination.is_file():
+                raise ValueError(
+                    f"Save As destination is not a file: {destination}"
+                )
+            expected_identity = file_identity(destination)
+            require_absent = False
+        else:
+            expected_identity = None
+            require_absent = True
+
+        # Compare only canonical destinations, including an existing symlink's
+        # referent.  A Save As alias must never bypass project-file or stale
+        # original protections.
+        if (
+            self.labels_path is not None
+            and destination == self.labels_path
+            and not self._destination_identity_matches(
+                self.labels_path,
+                self._labels_destination_identity,
+            )
+        ):
+            raise ValueError(
+                "The original label destination is missing or changed. "
+                "Choose a different filename so it is not overwritten."
+            )
+        protected_destinations = (
+            (self.image_path, "loaded histology image"),
+            (self.mapping_path, "loaded class mapping CSV"),
+        )
+        for protected_path, description in protected_destinations:
+            if protected_path is not None and destination == protected_path:
+                raise ValueError(
+                    f"Save As cannot overwrite the {description}: "
+                    f"{protected_path}"
+                )
+
+        self._validate_class_ids_for_destination(
+            destination,
+            self.class_map,
+        )
+        return destination, expected_identity, require_absent
+
+    def _save_output_dtype_for_destination(
+        self,
+        destination: Path,
+    ) -> np.dtype:
+        """Choose a lossless disk dtype compatible with the chosen format."""
+        if destination.suffix.lower() == ".png":
+            return self._promoted_dtype_for_classes(
+                np.dtype(np.uint8),
+                self.class_map,
+            )
+        current = (
+            self.overlap_store.projection_dtype
+            if self._labels_output_dtype is None
+            else self._labels_output_dtype
+        )
+        return self._promoted_dtype_for_classes(current, self.class_map)
+
+    def _begin_label_save(self, *, force_save_as: bool) -> None:
         if self._save_worker is not None:
             self.viewer.status = "A label save is already running."
             return
@@ -2061,36 +2191,47 @@ class LabelEditorWidget(QWidget):
             self._update_project_controls()
             return
 
-        destination = self.labels_path
-        if (
-            not destination.is_absolute()
-            or not self._destination_identity_matches(
-                destination,
+        normal_destination_available = (
+            self.labels_path.is_absolute()
+            and self._destination_identity_matches(
+                self.labels_path,
                 self._labels_destination_identity,
             )
-        ):
-            self.viewer.status = (
-                "Save failed: the loaded destination is missing or changed. "
-                "Choose the label file again and click Load."
+        )
+        mapping_available = not self._class_config_pending_save or (
+            self.mapping_path is not None
+            and (
+                self.mapping_path.is_absolute()
+                and self._destination_identity_matches(
+                    self.mapping_path,
+                    self._mapping_destination_identity,
+                )
             )
-            self._update_project_controls()
-            return
-
-        if self._class_config_pending_save and (
-            self.mapping_path is None
-            or not self.mapping_path.is_absolute()
-            or not self._destination_identity_matches(
-                self.mapping_path,
-                self._mapping_destination_identity,
-            )
-        ):
-            self.viewer.status = (
-                "Save failed: the class mapping CSV is missing or changed. "
-                "The label image and CSV were both left untouched. Choose "
-                "the project files again and click Load."
-            )
-            self._update_project_controls()
-            return
+        )
+        # A pending deletion with a missing/replaced mapping is also rescued
+        # to a self-contained label image.  Save As never writes the suspect
+        # CSV; its pending state remains visible for a later explicit retry.
+        use_save_as = (
+            force_save_as
+            or not normal_destination_available
+            or not mapping_available
+        )
+        if use_save_as:
+            try:
+                chosen = self._choose_save_as_destination()
+            except (OSError, TypeError, ValueError, RuntimeError) as error:
+                self.viewer.status = f"Save As failed: {error}"
+                QMessageBox.critical(self, "Save As failed", str(error))
+                self._update_project_controls()
+                return
+            if chosen is None:
+                self._update_project_controls()
+                return
+            destination, expected_identity, require_absent = chosen
+        else:
+            destination = self.labels_path
+            expected_identity = self._labels_destination_identity
+            require_absent = False
 
         if self._class_config_pending_save:
             try:
@@ -2118,15 +2259,21 @@ class LabelEditorWidget(QWidget):
             self.viewer.status = f"Save failed while preparing annotations: {error}"
             QMessageBox.critical(self, "Save failed", str(error))
             return
-        output_dtype = (
-            self.overlap_store.projection_dtype
-            if self._labels_output_dtype is None
-            else self._labels_output_dtype
-        )
+        try:
+            output_dtype = self._save_output_dtype_for_destination(destination)
+        except (TypeError, ValueError) as error:
+            self.viewer.status = f"Save failed: {error}"
+            QMessageBox.critical(self, "Save failed", str(error))
+            return
         saved_layer = self.labels_layer
         self._active_save_path = destination
         self._active_save_layer = saved_layer
         self._active_save_layer_mode = saved_layer.mode
+        self._active_save_adopt_destination = use_save_as
+        self._active_save_update_class_config = (
+            self._class_config_pending_save and not use_save_as
+        )
+        self._active_save_output_dtype = np.dtype(output_dtype)
         # Labels.editable=False resets napari's native Undo queue. Pan/zoom
         # mode blocks drawing during the worker save while preserving sparse
         # binary and visible-top history for a later Undo.
@@ -2140,7 +2287,8 @@ class LabelEditorWidget(QWidget):
                 self.overlap_store,
                 destination,
                 output_dtype,
-                expected_identity=self._labels_destination_identity,
+                expected_identity=expected_identity,
+                require_absent=require_absent,
                 _start_thread=False,
                 _ignore_errors=True,
             )
@@ -2150,6 +2298,9 @@ class LabelEditorWidget(QWidget):
             self._active_save_path = None
             self._active_save_layer = None
             self._active_save_layer_mode = None
+            self._active_save_adopt_destination = False
+            self._active_save_update_class_config = False
+            self._active_save_output_dtype = None
             self._update_project_controls()
             self._on_save_error(error)
             return
@@ -2171,6 +2322,9 @@ class LabelEditorWidget(QWidget):
             self._active_save_path = None
             self._active_save_layer = None
             self._active_save_layer_mode = None
+            self._active_save_adopt_destination = False
+            self._active_save_update_class_config = False
+            self._active_save_output_dtype = None
             self._update_project_controls()
             self._on_save_error(error)
 
@@ -2191,7 +2345,8 @@ class LabelEditorWidget(QWidget):
             saved_path,
             result.identity,
         ):
-            self._labels_destination_identity = None
+            if not self._active_save_adopt_destination:
+                self._labels_destination_identity = None
             self._on_save_error(
                 RuntimeError(
                     "Labels were written, but the saved file could not be "
@@ -2200,7 +2355,16 @@ class LabelEditorWidget(QWidget):
             )
             return
         self._labels_destination_identity = result.identity
-        if self._class_config_pending_save:
+        if self._active_save_adopt_destination:
+            self.labels_path = saved_path
+            if self._active_save_output_dtype is not None:
+                self._labels_output_dtype = self._active_save_output_dtype
+            self.label_line.setText(str(saved_path))
+
+        if (
+            self._class_config_pending_save
+            and self._active_save_update_class_config
+        ):
             try:
                 saved_mapping_path = self._write_pending_class_config()
             except (
@@ -2226,6 +2390,12 @@ class LabelEditorWidget(QWidget):
             self.viewer.status = (
                 f"Saved labels to {saved_path} and class definitions to "
                 f"{saved_mapping_path}"
+            )
+            return
+        if self._class_config_pending_save:
+            self.viewer.status = (
+                f"Saved all labels and overlaps to {saved_path}. The class "
+                "mapping CSV was not changed; its pending update remains."
             )
             return
         self.viewer.status = f"Saved labels to {saved_path}"
@@ -2305,4 +2475,7 @@ class LabelEditorWidget(QWidget):
         self._active_save_path = None
         self._active_save_layer = None
         self._active_save_layer_mode = None
+        self._active_save_adopt_destination = False
+        self._active_save_update_class_config = False
+        self._active_save_output_dtype = None
         self._update_project_controls()

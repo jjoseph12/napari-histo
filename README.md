@@ -321,8 +321,9 @@ Save
 The edited annotations are written back to the exact PNG or TIFF selected by
 the last successful **Load**. Saving runs in the background, temporarily pauses
 editing, and atomically replaces the old file only after the new image is
-complete. Wait for the status bar to say that saving finished before closing
-napari.
+complete. **Save As…** can preserve the complete in-memory annotation state in
+a different PNG or TIFF. Wait for the status bar to say that saving finished
+before closing napari.
 
 The saved file contains two views of the same annotations:
 
@@ -347,13 +348,17 @@ and then updates the class mapping CSV. Until **Save** is pressed, a pending
 deletion changes neither file on disk.
 
 The exact canonical file used by Save is always shown in the read-only
-**Save destination (locked by Load)** field. Browsing to or typing different
-project paths does not redirect a save. Until the new files pass **Load**, the
-canvas and Save action still belong to the previous project, the button reads
-**Save locked file**, and the exact destination remains visible. Loading is
-disabled while a save is running. If the locked destination file is moved,
-deleted, or replaced after loading, the editor refuses to write until it is
-selected and loaded again.
+**Current save destination** field. Browsing to or typing different project
+paths does not silently redirect a save. Until the new files pass **Load**, the
+canvas and Save action still belong to the previous project and the current
+destination remains visible. Loading is disabled while a save is running.
+
+Save is never disabled merely because the original destination was moved,
+deleted, or replaced. In that situation the button changes to **Save As…** and
+lets you preserve every current annotation in a new PNG or TIFF without
+overwriting the changed original. The separate **Save As…** button is also
+available whenever a project is loaded. Canceling its file chooser leaves the
+in-memory annotations untouched.
 
 ---
 

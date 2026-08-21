@@ -70,6 +70,7 @@ def atomic_save_labels(
     output_dtype: np.dtype | type[np.generic] | str,
     *,
     expected_identity: FileIdentity | None = None,
+    require_absent: bool = False,
     annotation_payload: bytes | None = None,
     _copy_snapshot: bool = True,
 ) -> SaveResult:
@@ -91,17 +92,31 @@ def atomic_save_labels(
     exact file represented by that identity both before preparing the snapshot
     and immediately before the atomic replacement.
 
+    ``require_absent=True`` is the Save As new-file contract.  Installation
+    uses an atomic hard link instead of ``os.replace``, so a file created by
+    another process after the save dialog closes is never overwritten.
+
     When ``annotation_payload`` is provided, it is embedded in the same PNG or
     TIFF as private metadata. The public image remains the supplied 2-D label
     projection, while this plugin can restore lossless overlapping labels from
     the embedded payload.
     """
-    # Resolve once, before creating the temporary file.  Besides freezing the
-    # destination against later working-directory changes, this follows an
-    # existing symlink to its referent.  Replacing the referent keeps the
-    # user-selected symlink intact instead of silently replacing the link with
-    # a regular file.
-    target = _canonical_absolute_path(destination, "Label destination")
+    if not isinstance(require_absent, bool):
+        raise TypeError("require_absent must be a boolean")
+    if require_absent and expected_identity is not None:
+        raise ValueError(
+            "require_absent and expected_identity cannot be used together"
+        )
+
+    # Resolve once, before creating the temporary file.  Normal saves follow
+    # an existing final symlink to its referent, preserving the user-selected
+    # link while replacing the loaded file.  A no-clobber Save As must instead
+    # preserve the final path component verbatim: even a dangling symlink is
+    # an occupied destination and must make the atomic hard link fail.
+    target = _canonical_save_destination(
+        destination,
+        preserve_final_component=require_absent,
+    )
     if not target.suffix:
         raise ValueError("Label destination must have an image file extension")
     if annotation_payload is not None:
@@ -113,6 +128,10 @@ def atomic_save_labels(
                 f"label destination. Got: {target.suffix}"
             )
 
+    if require_absent and os.path.lexists(target):
+        raise FileExistsError(
+            f"Save As destination already exists: {target}"
+        )
     if expected_identity is not None:
         _verify_file_identity(target, expected_identity)
 
@@ -192,10 +211,23 @@ def atomic_save_labels(
             temporary_status.st_dev,
             temporary_status.st_ino,
         )
-        if expected_identity is not None:
-            _verify_file_identity(target, expected_identity)
-        os.replace(temporary_path, target)
-        replacement_complete = True
+        if require_absent:
+            try:
+                os.link(temporary_path, target)
+            except FileExistsError as error:
+                raise FileExistsError(
+                    "Save As destination appeared while labels were being "
+                    f"written; it was not overwritten: {target}"
+                ) from error
+            replacement_complete = True
+            # The target and temporary path now name the same completed file.
+            # Removing the temporary name leaves the no-clobber target intact.
+            temporary_path.unlink(missing_ok=True)
+        else:
+            if expected_identity is not None:
+                _verify_file_identity(target, expected_identity)
+            os.replace(temporary_path, target)
+            replacement_complete = True
         _fsync_directory(target.parent)
         try:
             saved_identity = _file_identity_from_status(target.stat())
@@ -241,6 +273,20 @@ def _canonical_absolute_path(path: PathLike, description: str) -> Path:
     target = Path(path).expanduser()
     if not target.is_absolute():
         raise ValueError(f"{description} must be an absolute path")
+    return target.resolve(strict=False)
+
+
+def _canonical_save_destination(
+    path: PathLike,
+    *,
+    preserve_final_component: bool,
+) -> Path:
+    """Freeze an absolute destination while optionally not following its leaf."""
+    target = Path(path).expanduser()
+    if not target.is_absolute():
+        raise ValueError("Label destination must be an absolute path")
+    if preserve_final_component:
+        return target.parent.resolve(strict=False) / target.name
     return target.resolve(strict=False)
 
 
