@@ -205,6 +205,30 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             widget._selection_actions_dock.maximumHeight(),
         )
         self.assertLessEqual(widget._selection_actions_dock.maximumHeight(), 90)
+        self.assertIs(
+            widget._selection_actions_dock.titleBarWidget(),
+            widget.selection_actions_widget,
+        )
+        self.assertIs(
+            widget._selection_actions_dock.widget(),
+            widget._selection_actions_body,
+        )
+        self.assertEqual(widget._selection_actions_body.height(), 0)
+
+        # napari replaces custom title chrome whenever a dock is shown. The
+        # deferred restoration must put the same live buttons back without
+        # changing their action state.
+        widget.delete_region_btn.setEnabled(True)
+        widget._selection_actions_dock.setTitleBarWidget(
+            QWidget(widget._selection_actions_dock)
+        )
+        widget._schedule_selection_actions_title_bar(True)
+        self.app.processEvents()
+        self.assertIs(
+            widget._selection_actions_dock.titleBarWidget(),
+            widget.selection_actions_widget,
+        )
+        self.assertTrue(widget.delete_region_btn.isEnabled())
 
         first_dock = widget._selection_actions_dock
         widget._install_selection_actions_dock()
@@ -221,6 +245,10 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             SELECTION_ACTIONS_DOCK_NAME,
             fake_window.dock_widgets,
         )
+        self.assertIs(widget.selection_actions_widget.parentWidget(), widget)
+        self.assertIs(widget._selection_actions_body.parentWidget(), widget)
+        self.assertEqual(widget.delete_region_btn.text(), "Delete…")
+        self.assertEqual(widget.clear_region_btn.text(), "Clear")
 
     @staticmethod
     def load_small_project(

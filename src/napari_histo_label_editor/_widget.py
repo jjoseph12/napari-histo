@@ -943,6 +943,20 @@ class LabelEditorWidget(QWidget):
         )
         selection_actions.addWidget(self.clear_region_btn)
 
+        # The action strip becomes the companion QDockWidget's title bar.
+        # Keep a separate zero-height body because QMainWindow may compress a
+        # dock body completely when the left column is over-constrained, while
+        # the title bar itself is always kept visible.
+        self._selection_actions_body = QWidget(self)
+        self._selection_actions_body.setObjectName(
+            "histologySelectedRegionActionsBody"
+        )
+        self._selection_actions_body.setFixedHeight(0)
+        self._selection_actions_body.setSizePolicy(
+            QSizePolicy.Preferred,
+            QSizePolicy.Fixed,
+        )
+
         self.save_destination_caption = QLabel("Save destination (editable)")
         layout.addWidget(self.save_destination_caption)
         self.save_destination_line = QLineEdit()
@@ -1032,7 +1046,10 @@ class LabelEditorWidget(QWidget):
             existing = window.dock_widgets.get(SELECTION_ACTIONS_DOCK_NAME)
         except (AttributeError, RuntimeError):
             existing = None
-        if existing is self.selection_actions_widget:
+        if (
+            existing is self._selection_actions_body
+            and self._selection_actions_dock is not None
+        ):
             return
         if existing is not None:
             try:
@@ -1043,32 +1060,31 @@ class LabelEditorWidget(QWidget):
         owner_dock = self._owning_dock_widget()
         try:
             dock = window.add_dock_widget(
-                self.selection_actions_widget,
+                self._selection_actions_body,
                 name=SELECTION_ACTIONS_DOCK_NAME,
                 area="left",
                 allowed_areas=["left"],
                 add_vertical_stretch=False,
             )
         except (AttributeError, RuntimeError, ValueError):
+            self._selection_actions_body.setParent(self)
             self.selection_actions_widget.setParent(self)
             return
 
-        # QMainWindow otherwise gives each newly stacked left dock a generous
-        # share of the column.  Cap this one to its title and one button row so
-        # napari's layer controls/list retain the available height.
-        compact_height = max(
-            64,
-            int(self.selection_actions_widget.sizeHint().height()) + 34,
-        )
-        # napari calls QMainWindow.resizeDocks() while adding this dock.  A
-        # smaller minimum lets that initial resize keep only the custom title
-        # bar and clip the button row, notably with the Cocoa/Retina style.
-        # Pin both bounds to the compact hint so the layer list loses no more
-        # room than intended while the complete controls remain visible.
-        dock.setMinimumHeight(compact_height)
-        dock.setMaximumHeight(compact_height)
-        dock.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        # A normal dock keeps its plugin widget in the compressible body. On
+        # Cocoa a tall layer-controls/list column can therefore place only the
+        # companion title on-screen and clip the Delete/Clear row below it.
+        # Use the row itself as the public QDockWidget title bar and leave the
+        # body empty: even an over-constrained QMainWindow must retain it.
         self._selection_actions_dock = dock
+        self._apply_selection_actions_title_bar()
+        # napari 0.6 rebuilds its QtCustomTitleBar whenever a dock becomes
+        # visible. Our connection runs after napari's and defers one event-loop
+        # turn, then reinstalls the action strip without touching private
+        # viewer/dock registries.
+        dock.visibilityChanged.connect(
+            self._schedule_selection_actions_title_bar
+        )
         dock.destroyed.connect(self._on_selection_actions_dock_destroyed)
 
         self._selection_actions_owner_dock = owner_dock
@@ -1076,6 +1092,36 @@ class LabelEditorWidget(QWidget):
             owner_dock.destroyed.connect(
                 self._remove_selection_actions_dock
             )
+
+    def _schedule_selection_actions_title_bar(self, visible=True) -> None:
+        """Restore the action title after napari rebuilds visible dock chrome."""
+
+        if bool(visible):
+            QTimer.singleShot(0, self._apply_selection_actions_title_bar)
+
+    def _apply_selection_actions_title_bar(self) -> None:
+        """Keep Delete/Clear in the dock's non-compressible title area."""
+
+        dock = self._selection_actions_dock
+        if dock is None:
+            return
+        try:
+            self.selection_actions_widget.ensurePolished()
+            compact_height = max(
+                40,
+                int(self.selection_actions_widget.minimumSizeHint().height()),
+                int(self.selection_actions_widget.sizeHint().height()),
+            )
+            self.selection_actions_widget.setFixedHeight(compact_height)
+            if dock.titleBarWidget() is not self.selection_actions_widget:
+                dock.setTitleBarWidget(self.selection_actions_widget)
+            self.selection_actions_widget.show()
+            dock.setMinimumHeight(compact_height)
+            dock.setMaximumHeight(compact_height)
+            dock.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+            dock.updateGeometry()
+        except RuntimeError:
+            return
 
     def _on_selection_actions_dock_destroyed(self, *args) -> None:
         """Keep the button widget owned if its small dock is closed."""
@@ -1093,7 +1139,17 @@ class LabelEditorWidget(QWidget):
 
         del args
         self._selection_actions_owner_dock = None
+        dock = self._selection_actions_dock
         self._selection_actions_dock = None
+        # Detach the action strip before napari deletes the wrapper dock. Its
+        # public removal helper detaches only the body widget; without this,
+        # Qt would delete our title-bar buttons with the dock.
+        if dock is not None:
+            try:
+                dock.setTitleBarWidget(QWidget(dock))
+                self.selection_actions_widget.setParent(self)
+            except RuntimeError:
+                pass
         window = self._viewer_window()
         if window is not None:
             try:
@@ -1102,12 +1158,14 @@ class LabelEditorWidget(QWidget):
                 )
             except (AttributeError, RuntimeError):
                 existing = None
-            if existing is self.selection_actions_widget:
+            if existing is self._selection_actions_body:
                 try:
                     window.remove_dock_widget(existing)
                 except (AttributeError, LookupError, RuntimeError):
                     pass
         try:
+            if self._selection_actions_body.parentWidget() is None:
+                self._selection_actions_body.setParent(self)
             if self.selection_actions_widget.parentWidget() is None:
                 self.selection_actions_widget.setParent(self)
         except RuntimeError:
