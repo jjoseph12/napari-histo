@@ -1,0 +1,765 @@
+import os
+import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+import imageio.v3 as iio
+import numpy as np
+
+from napari_histo_label_editor._embedded_annotations import (
+    read_embedded_annotations,
+    write_image_with_annotations,
+)
+from napari_histo_label_editor._io import (
+    FileIdentity,
+    SaveResult,
+    atomic_save_labels,
+    build_image_pyramid,
+    file_identity,
+)
+
+
+class AtomicSaveLabelsTest(unittest.TestCase):
+    def test_file_identity_contains_stable_stat_fields(self):
+        with TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "labels.tif"
+            iio.imwrite(destination, np.array([[0, 2]], dtype=np.uint8))
+
+            identity = file_identity(destination)
+            status = destination.stat()
+
+            self.assertIsInstance(identity, FileIdentity)
+            self.assertEqual(identity.device, status.st_dev)
+            self.assertEqual(identity.inode, status.st_ino)
+            self.assertEqual(identity.size, status.st_size)
+            self.assertEqual(identity.mtime_ns, status.st_mtime_ns)
+            self.assertEqual(identity.ctime_ns, status.st_ctime_ns)
+
+    def test_casts_and_preserves_shape_and_values(self):
+        labels = np.array(
+            [[0, 1, 255], [12, 127, 3]],
+            dtype=np.uint8,
+        )
+
+        with TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "labels.tif"
+            result = atomic_save_labels(labels, destination, np.int32)
+            saved = iio.imread(destination)
+            saved_identity = file_identity(destination)
+
+        self.assertIsInstance(result, SaveResult)
+        self.assertEqual(result.path, destination.resolve())
+        self.assertEqual(result.identity, saved_identity)
+        self.assertEqual(saved.shape, labels.shape)
+        self.assertEqual(saved.dtype, np.dtype(np.int32))
+        np.testing.assert_array_equal(saved, labels)
+
+    def test_embedded_payload_roundtrips_in_atomic_png_and_tiff_saves(self):
+        projection = np.array(
+            [[0, 1, 2, 0], [1, 3, 3, 2], [0, 3, 7, 7]],
+            dtype=np.uint16,
+        )
+        payload = bytes(range(256)) * 3 + b"hidden-overlap-state\x00\xff"
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for extension in (".png", ".tif", ".tiff"):
+                with self.subTest(extension=extension):
+                    destination = root / f"labels{extension}"
+                    iio.imwrite(
+                        destination,
+                        np.full(projection.shape, 9, dtype=np.uint16),
+                    )
+                    expected_identity = file_identity(destination)
+
+                    result = atomic_save_labels(
+                        projection,
+                        destination,
+                        np.uint16,
+                        expected_identity=expected_identity,
+                        annotation_payload=payload,
+                    )
+
+                    self.assertEqual(result.path, destination.resolve())
+                    self.assertEqual(result.identity, file_identity(destination))
+                    self.assertEqual(
+                        read_embedded_annotations(destination),
+                        payload,
+                    )
+                    loaded = iio.imread(destination)
+                    self.assertEqual(loaded.ndim, 2)
+                    self.assertEqual(loaded.shape, projection.shape)
+                    self.assertEqual(loaded.dtype, projection.dtype)
+                    np.testing.assert_array_equal(loaded, projection)
+                    self.assertEqual(set(root.iterdir()), {destination})
+
+                    destination.unlink()
+
+    def test_embedded_payload_rejects_unsupported_extension_before_snapshot(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.bmp"
+            original = np.full((2, 3), 7, dtype=np.uint8)
+            iio.imwrite(destination, original)
+            original_bytes = destination.read_bytes()
+
+            with patch(
+                "napari_histo_label_editor._io.np.array"
+            ) as snapshot, patch(
+                "napari_histo_label_editor._io.tempfile.mkstemp"
+            ) as make_temporary:
+                with self.assertRaisesRegex(ValueError, "require a PNG or TIFF"):
+                    atomic_save_labels(
+                        np.zeros((2, 3), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                        annotation_payload=b"overlap state",
+                    )
+
+            snapshot.assert_not_called()
+            make_temporary.assert_not_called()
+            self.assertEqual(destination.read_bytes(), original_bytes)
+            self.assertEqual(set(root.iterdir()), {destination})
+
+    def test_png_rejects_integer_dtype_that_imageio_would_silently_narrow(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.png"
+            original = np.array([[0, 1]], dtype=np.uint8)
+            iio.imwrite(destination, original)
+            original_bytes = destination.read_bytes()
+
+            with patch(
+                "napari_histo_label_editor._io.np.array"
+            ) as snapshot, patch(
+                "napari_histo_label_editor._io.tempfile.mkstemp"
+            ) as make_temporary:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "use a TIFF label image",
+                ):
+                    atomic_save_labels(
+                        original.astype(np.int32),
+                        destination,
+                        np.int32,
+                        annotation_payload=b"overlap state",
+                    )
+
+            snapshot.assert_not_called()
+            make_temporary.assert_not_called()
+            self.assertEqual(destination.read_bytes(), original_bytes)
+            self.assertEqual(set(root.iterdir()), {destination})
+
+    def test_embedded_writer_failure_keeps_original_and_cleans_temporary(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.png"
+            original = np.full((3, 4), 11, dtype=np.uint8)
+            replacement = np.arange(12, dtype=np.uint8).reshape(3, 4)
+            iio.imwrite(destination, original)
+            original_bytes = destination.read_bytes()
+
+            def write_then_fail(path, image, payload):
+                write_image_with_annotations(path, image, payload)
+                raise OSError("simulated embedded writer failure")
+
+            with patch(
+                "napari_histo_label_editor._io.write_image_with_annotations",
+                side_effect=write_then_fail,
+            ):
+                with self.assertRaisesRegex(
+                    OSError,
+                    "simulated embedded writer failure",
+                ):
+                    atomic_save_labels(
+                        replacement,
+                        destination,
+                        np.uint8,
+                        annotation_payload=b"new overlap state",
+                    )
+
+            self.assertEqual(destination.read_bytes(), original_bytes)
+            np.testing.assert_array_equal(iio.imread(destination), original)
+            self.assertEqual(set(root.iterdir()), {destination})
+
+    def test_embedded_save_identity_race_preserves_external_winner(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.tif"
+            external_path = root / "external.tif"
+            original = np.full((2, 3), 5, dtype=np.uint8)
+            external = np.full((2, 3), 73, dtype=np.uint8)
+            external_payload = b"external overlap state"
+            iio.imwrite(destination, original)
+            expected_identity = file_identity(destination)
+            write_image_with_annotations(
+                external_path,
+                external,
+                external_payload,
+            )
+
+            def write_then_replace(path, image, payload):
+                write_image_with_annotations(path, image, payload)
+                os.replace(external_path, destination)
+
+            with patch(
+                "napari_histo_label_editor._io.write_image_with_annotations",
+                side_effect=write_then_replace,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed since"):
+                    atomic_save_labels(
+                        np.zeros((2, 3), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                        expected_identity=expected_identity,
+                        annotation_payload=b"our overlap state",
+                    )
+
+            np.testing.assert_array_equal(iio.imread(destination), external)
+            self.assertEqual(
+                read_embedded_annotations(destination),
+                external_payload,
+            )
+            self.assertEqual(set(root.iterdir()), {destination})
+
+    def test_rejects_relative_destination_before_writing(self):
+        with self.assertRaisesRegex(ValueError, "absolute path"):
+            atomic_save_labels(
+                np.zeros((2, 2), dtype=np.uint8),
+                Path("labels.tif"),
+                np.uint8,
+            )
+
+    def test_expands_user_directory_before_requiring_absolute_path(self):
+        with TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "labels.tif"
+            with patch.dict("os.environ", {"HOME": tmp}):
+                result = atomic_save_labels(
+                    np.array([[0, 4]], dtype=np.uint8),
+                    Path("~/labels.tif"),
+                    np.uint8,
+                )
+
+            self.assertEqual(result.path, destination.resolve())
+            self.assertEqual(result.identity, file_identity(destination))
+            np.testing.assert_array_equal(
+                iio.imread(destination),
+                np.array([[0, 4]], dtype=np.uint8),
+            )
+
+    def test_existing_symlink_is_preserved_and_referent_is_replaced(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels-link.tif"
+            referent = root / "labels-original.tif"
+            original = np.full((2, 3), 7, dtype=np.uint8)
+            replacement = np.arange(6, dtype=np.uint16).reshape(2, 3)
+            iio.imwrite(referent, original)
+            destination.symlink_to(referent)
+
+            result = atomic_save_labels(
+                replacement,
+                destination,
+                np.uint16,
+            )
+
+            self.assertEqual(result.path, referent.resolve())
+            self.assertEqual(result.identity, file_identity(referent))
+            self.assertTrue(destination.is_symlink())
+            np.testing.assert_array_equal(iio.imread(referent), replacement)
+            np.testing.assert_array_equal(
+                iio.imread(destination),
+                replacement,
+            )
+            self.assertEqual(
+                set(root.iterdir()),
+                {destination, referent},
+            )
+
+    def test_require_absent_installs_complete_embedded_file(self):
+        projection = np.array(
+            [[0, 1, 2], [7, 7, 1]],
+            dtype=np.uint16,
+        )
+        payload = b"lossless overlap state\x00\xff"
+
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "saved-as.png"
+
+            result = atomic_save_labels(
+                projection,
+                destination,
+                np.uint16,
+                require_absent=True,
+                annotation_payload=payload,
+            )
+
+            self.assertEqual(result.path, destination.resolve())
+            self.assertEqual(result.identity, file_identity(destination))
+            np.testing.assert_array_equal(iio.imread(destination), projection)
+            self.assertEqual(read_embedded_annotations(destination), payload)
+            self.assertEqual(set(root.iterdir()), {destination})
+
+    def test_require_absent_rejects_existing_file_before_snapshot(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "saved-as.tif"
+            external = np.full((2, 3), 61, dtype=np.uint8)
+            external_payload = b"external overlap state"
+            write_image_with_annotations(
+                destination,
+                external,
+                external_payload,
+            )
+            external_bytes = destination.read_bytes()
+
+            with patch(
+                "napari_histo_label_editor._io.np.array"
+            ) as snapshot, patch(
+                "napari_histo_label_editor._io.tempfile.mkstemp"
+            ) as make_temporary:
+                with self.assertRaisesRegex(
+                    FileExistsError,
+                    "already exists",
+                ):
+                    atomic_save_labels(
+                        np.zeros((2, 3), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                        require_absent=True,
+                        annotation_payload=b"our overlap state",
+                    )
+
+            snapshot.assert_not_called()
+            make_temporary.assert_not_called()
+            self.assertEqual(destination.read_bytes(), external_bytes)
+            np.testing.assert_array_equal(iio.imread(destination), external)
+            self.assertEqual(
+                read_embedded_annotations(destination),
+                external_payload,
+            )
+            self.assertEqual(set(root.iterdir()), {destination})
+
+    def test_require_absent_rejects_dangling_symlink_without_touching_referent(
+        self,
+    ):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "saved-as.tif"
+            missing_referent = root / "must-stay-missing.tif"
+            destination.symlink_to(missing_referent)
+
+            with patch(
+                "napari_histo_label_editor._io.tempfile.mkstemp"
+            ) as make_temporary:
+                with self.assertRaisesRegex(
+                    FileExistsError,
+                    "already exists",
+                ):
+                    atomic_save_labels(
+                        np.zeros((2, 2), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                        require_absent=True,
+                    )
+
+            make_temporary.assert_not_called()
+            self.assertTrue(destination.is_symlink())
+            self.assertFalse(missing_referent.exists())
+            self.assertEqual(set(root.iterdir()), {destination})
+
+    def test_require_absent_rejects_intruder_created_during_write(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "saved-as.tif"
+            projection = np.zeros((2, 3), dtype=np.uint8)
+            external = np.full((2, 3), 73, dtype=np.uint8)
+            external_payload = b"external overlap state"
+            temporary_parents = []
+
+            def write_then_create_intruder(path, image, payload):
+                temporary_parents.append(Path(path).parent)
+                write_image_with_annotations(path, image, payload)
+                write_image_with_annotations(
+                    destination,
+                    external,
+                    external_payload,
+                )
+
+            with patch(
+                "napari_histo_label_editor._io.write_image_with_annotations",
+                side_effect=write_then_create_intruder,
+            ):
+                with self.assertRaisesRegex(
+                    FileExistsError,
+                    "appeared while labels were being written",
+                ):
+                    atomic_save_labels(
+                        projection,
+                        destination,
+                        np.uint8,
+                        require_absent=True,
+                        annotation_payload=b"our overlap state",
+                    )
+
+            self.assertEqual(temporary_parents, [root.resolve()])
+            np.testing.assert_array_equal(iio.imread(destination), external)
+            self.assertEqual(
+                read_embedded_annotations(destination),
+                external_payload,
+            )
+            self.assertEqual(set(root.iterdir()), {destination})
+
+    def test_require_absent_and_expected_identity_are_mutually_exclusive(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "saved-as.tif"
+            iio.imwrite(destination, np.ones((2, 2), dtype=np.uint8))
+            identity = file_identity(destination)
+            original_bytes = destination.read_bytes()
+
+            with patch(
+                "napari_histo_label_editor._io.np.array"
+            ) as snapshot, patch(
+                "napari_histo_label_editor._io.tempfile.mkstemp"
+            ) as make_temporary:
+                with self.assertRaisesRegex(
+                    ValueError,
+                    "cannot be used together",
+                ):
+                    atomic_save_labels(
+                        np.zeros((2, 2), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                        expected_identity=identity,
+                        require_absent=True,
+                    )
+
+            snapshot.assert_not_called()
+            make_temporary.assert_not_called()
+            self.assertEqual(destination.read_bytes(), original_bytes)
+            self.assertEqual(set(root.iterdir()), {destination})
+
+    def test_require_absent_link_failure_cleans_temporary_file(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "saved-as.tif"
+
+            with patch(
+                "napari_histo_label_editor._io.os.link",
+                side_effect=OSError("simulated hard-link failure"),
+            ):
+                with self.assertRaisesRegex(
+                    OSError,
+                    "simulated hard-link failure",
+                ):
+                    atomic_save_labels(
+                        np.zeros((2, 2), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                        require_absent=True,
+                    )
+
+            self.assertFalse(destination.exists())
+            self.assertEqual(set(root.iterdir()), set())
+
+    def test_require_absent_replacement_immediately_after_link_is_reported(
+        self,
+    ):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "saved-as.tif"
+            external = np.full((2, 3), 89, dtype=np.uint8)
+            real_link = os.link
+
+            def link_then_replace(source, target):
+                real_link(source, target)
+                external_path = root / "post-link-race.tif"
+                iio.imwrite(external_path, external)
+                os.replace(external_path, target)
+
+            with patch(
+                "napari_histo_label_editor._io.os.link",
+                side_effect=link_then_replace,
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError,
+                    "immediately after",
+                ):
+                    atomic_save_labels(
+                        np.zeros((2, 3), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                        require_absent=True,
+                    )
+
+            np.testing.assert_array_equal(iio.imread(destination), external)
+            self.assertEqual(set(root.iterdir()), {destination})
+
+    def test_atomically_replaces_existing_file_without_leftover_temp(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.tif"
+            original = np.full((3, 4), 7, dtype=np.uint16)
+            replacement = np.arange(12, dtype=np.uint8).reshape(3, 4)
+            iio.imwrite(destination, original)
+            expected_identity = file_identity(destination)
+
+            atomic_save_labels(
+                replacement,
+                destination,
+                np.uint16,
+                expected_identity=expected_identity,
+            )
+
+            np.testing.assert_array_equal(iio.imread(destination), replacement)
+            self.assertEqual(list(root.iterdir()), [destination])
+
+    def test_stale_expected_identity_refuses_to_touch_replacement(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.tif"
+            replacement_path = root / "replacement.tif"
+            iio.imwrite(destination, np.full((2, 2), 3, dtype=np.uint8))
+            expected_identity = file_identity(destination)
+            external_replacement = np.full((2, 2), 91, dtype=np.uint8)
+            iio.imwrite(replacement_path, external_replacement)
+            os.replace(replacement_path, destination)
+
+            with patch(
+                "napari_histo_label_editor._io.np.array",
+                side_effect=AssertionError("snapshot must not be allocated"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed since"):
+                    atomic_save_labels(
+                        np.zeros((2, 2), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                        expected_identity=expected_identity,
+                    )
+
+            np.testing.assert_array_equal(
+                iio.imread(destination),
+                external_replacement,
+            )
+            self.assertEqual(list(root.iterdir()), [destination])
+
+    def test_replacement_during_write_wins_and_temporary_is_cleaned(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.tif"
+            iio.imwrite(destination, np.full((2, 3), 5, dtype=np.uint8))
+            expected_identity = file_identity(destination)
+            external_replacement = np.full((2, 3), 73, dtype=np.uint8)
+            real_imwrite = iio.imwrite
+
+            def write_then_replace(path, data):
+                real_imwrite(path, data)
+                replacement_path = root / "external-replacement.tif"
+                real_imwrite(replacement_path, external_replacement)
+                os.replace(replacement_path, destination)
+
+            with patch(
+                "napari_histo_label_editor._io.iio.imwrite",
+                side_effect=write_then_replace,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "changed since"):
+                    atomic_save_labels(
+                        np.zeros((2, 3), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                        expected_identity=expected_identity,
+                    )
+
+            np.testing.assert_array_equal(
+                iio.imread(destination),
+                external_replacement,
+            )
+            self.assertEqual(list(root.iterdir()), [destination])
+
+    def test_replacement_immediately_after_atomic_rename_is_reported(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.tif"
+            iio.imwrite(destination, np.full((2, 3), 5, dtype=np.uint8))
+            expected_identity = file_identity(destination)
+            external_replacement = np.full((2, 3), 88, dtype=np.uint8)
+            real_imwrite = iio.imwrite
+            real_replace = os.replace
+
+            def replace_then_race(source, target):
+                real_replace(source, target)
+                replacement_path = root / "post-replace-race.tif"
+                real_imwrite(replacement_path, external_replacement)
+                real_replace(replacement_path, target)
+
+            with patch(
+                "napari_histo_label_editor._io.os.replace",
+                side_effect=replace_then_race,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "immediately after"):
+                    atomic_save_labels(
+                        np.zeros((2, 3), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                        expected_identity=expected_identity,
+                    )
+
+            np.testing.assert_array_equal(
+                iio.imread(destination),
+                external_replacement,
+            )
+            self.assertEqual(list(root.iterdir()), [destination])
+
+    def test_missing_expected_destination_is_not_recreated(self):
+        with TemporaryDirectory() as tmp:
+            destination = Path(tmp) / "labels.tif"
+            iio.imwrite(destination, np.ones((2, 2), dtype=np.uint8))
+            expected_identity = file_identity(destination)
+            destination.unlink()
+
+            with self.assertRaisesRegex(FileNotFoundError, "no longer exists"):
+                atomic_save_labels(
+                    np.zeros((2, 2), dtype=np.uint8),
+                    destination,
+                    np.uint8,
+                    expected_identity=expected_identity,
+                )
+
+            self.assertFalse(destination.exists())
+
+    def test_write_failure_keeps_original_and_cleans_temporary_file(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.tif"
+            original = np.full((2, 2), 9, dtype=np.uint8)
+            iio.imwrite(destination, original)
+
+            with patch(
+                "napari_histo_label_editor._io.iio.imwrite",
+                side_effect=OSError("simulated write failure"),
+            ):
+                with self.assertRaisesRegex(OSError, "simulated write failure"):
+                    atomic_save_labels(
+                        np.zeros((2, 2), dtype=np.uint8),
+                        destination,
+                        np.uint8,
+                    )
+
+            np.testing.assert_array_equal(iio.imread(destination), original)
+            self.assertEqual(list(root.iterdir()), [destination])
+
+    def test_rejects_lossy_integer_conversion_before_touching_destination(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            destination = root / "labels.tif"
+            original = np.full((2, 2), 7, dtype=np.uint8)
+            iio.imwrite(destination, original)
+
+            with self.assertRaisesRegex(ValueError, "without data loss"):
+                atomic_save_labels(
+                    np.array([[0, 300]], dtype=np.uint16),
+                    destination,
+                    np.uint8,
+                )
+
+            np.testing.assert_array_equal(iio.imread(destination), original)
+            self.assertEqual(list(root.iterdir()), [destination])
+
+
+class BuildImagePyramidTest(unittest.TestCase):
+    def test_preserves_level_zero_and_builds_expected_filtered_shapes(self):
+        image = np.arange(17 * 13 * 3, dtype=np.uint16).reshape(17, 13, 3)
+
+        pyramid = build_image_pyramid(
+            image,
+            single_scale_limit=8,
+            overview_limit=5,
+        )
+
+        self.assertIs(pyramid[0], image)
+        self.assertEqual(
+            [level.shape for level in pyramid],
+            [(17, 13, 3), (9, 7, 3), (5, 4, 3)],
+        )
+        for level in pyramid[1:]:
+            self.assertTrue(level.flags.c_contiguous)
+            self.assertTrue(level.flags.owndata)
+            self.assertFalse(np.shares_memory(level, image))
+            self.assertEqual(level.dtype, image.dtype)
+
+    def test_box_filter_prevents_chromatic_stride_aliasing(self):
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+        image[::2, ::2, 1] = 255
+
+        pyramid = build_image_pyramid(
+            image,
+            single_scale_limit=7,
+            overview_limit=4,
+            downsample=2,
+        )
+
+        self.assertEqual(len(pyramid), 2)
+        self.assertTrue(pyramid[1].flags.c_contiguous)
+        self.assertTrue(pyramid[1].flags.owndata)
+        self.assertTrue(np.all((pyramid[1][..., 1] >= 63)))
+        self.assertTrue(np.all((pyramid[1][..., 1] <= 64)))
+        self.assertTrue(np.all(pyramid[1][..., (0, 2)] == 0))
+
+    def test_odd_rgba_levels_have_ceil_shapes_and_preserve_dtype(self):
+        image = np.full((19, 13, 4), 100.5, dtype=np.float32)
+
+        pyramid = build_image_pyramid(
+            image,
+            single_scale_limit=10,
+            overview_limit=3,
+        )
+
+        self.assertEqual(
+            [level.shape for level in pyramid],
+            [(19, 13, 4), (10, 7, 4), (5, 4, 4), (3, 2, 4)],
+        )
+        for level in pyramid[1:]:
+            self.assertEqual(level.dtype, np.dtype(np.float32))
+            self.assertTrue(level.flags.c_contiguous)
+            np.testing.assert_allclose(level, 100.5)
+
+    def test_small_image_returns_only_original_array(self):
+        image = np.zeros((32, 40, 3), dtype=np.uint8)
+
+        pyramid = build_image_pyramid(
+            image,
+            single_scale_limit=40,
+            overview_limit=20,
+        )
+
+        self.assertEqual(len(pyramid), 1)
+        self.assertIs(pyramid[0], image)
+
+    def test_default_keeps_current_8001_pixel_image_single_scale(self):
+        image = np.zeros((1, 8_001, 3), dtype=np.uint8)
+
+        pyramid = build_image_pyramid(image)
+
+        self.assertEqual(pyramid, [image])
+        self.assertIs(pyramid[0], image)
+
+    def test_rejects_non_rgb_image(self):
+        with self.assertRaisesRegex(ValueError, "RGB or RGBA"):
+            build_image_pyramid(np.zeros((32, 40), dtype=np.uint8))
+
+    def test_validates_trigger_and_overview_limits(self):
+        image = np.zeros((8, 8, 3), dtype=np.uint8)
+
+        with self.assertRaisesRegex(ValueError, "smaller"):
+            build_image_pyramid(
+                image,
+                single_scale_limit=8,
+                overview_limit=8,
+            )
+
+
+if __name__ == "__main__":
+    unittest.main()
