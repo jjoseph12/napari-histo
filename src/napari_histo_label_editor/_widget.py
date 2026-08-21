@@ -773,75 +773,7 @@ class LabelEditorWidget(QWidget):
         self._build_ui()
         self._schedule_selection_actions_dock_install()
         self._bind_hotkeys()
-        # napari recreates every layer's polygon overlay when layers are added
-        # or removed. Reinstall our preview callback after that core rebuild.
-        self.viewer.layers.events.inserted.connect(
-            self._restore_fast_rendering_after_layer_change
-        )
-        self.viewer.layers.events.removed.connect(
-            self._restore_fast_rendering_after_layer_change
-        )
-        # Qt layer controls can be registered after the layer-model event or
-        # recreated when layer selection changes. Retry briefly on each active
-        # layer transition so the semantic class/opacity/brush bridges do not
-        # depend on one event-loop turn during initial load.
-        self.viewer.layers.selection.events.active.connect(
-            self._schedule_native_labels_controls_install
-        )
-        # Shapes can reset ``editable`` while napari changes displayed
-        # dimensions.  The selection outline is a read-only preview and must
-        # never become an annotation editing target.
-        self.viewer.dims.events.ndisplay.connect(
-            self._lock_selection_preview_layer
-        )
-
-    def _restore_fast_rendering_after_layer_change(self, event=None):
-        removed = getattr(event, "value", None)
-        removed_selection = (
-            removed is self._selection_layer
-            and not self._selection_layer_is_present()
-        )
-        if removed_selection:
-            self._selection_layer = None
-            self._annotation_selection = None
-        layer = self.labels_layer
-        if layer is None or not any(
-            candidate is layer for candidate in self.viewer.layers
-        ):
-            self._update_project_controls()
-            return
-        enable_fast_rendering(self.viewer, layer)
-        composite = self.composite_layer
-        if composite is not None and any(
-            candidate is composite for candidate in self.viewer.layers
-        ):
-            enable_fast_texture_updates(self.viewer, composite)
-        if removed_selection:
-            self.viewer.layers.selection.active = layer
-        self._schedule_native_labels_controls_install()
-        self._update_project_controls()
-
-    def _schedule_native_labels_controls_install(self, event=None) -> None:
-        """Retry adaptation while napari finishes creating layer controls."""
-
-        del event
-        for delay_ms in (0, 50, 250):
-            QTimer.singleShot(delay_ms, self._install_native_labels_controls)
-
-    def _lock_selection_preview_layer(self, event=None) -> None:
-        """Keep the non-authoritative outline preview read-only."""
-
-        del event
-        if int(self.viewer.dims.ndisplay) != 2:
-            if self._annotation_selection is not None:
-                self._clear_annotation_selection()
-            return
-        if not self._selection_layer_is_present():
-            return
-        try:
-            self._selection_layer.editable = False
-        except (AttributeError, RuntimeError):
-            return
+        self.viewer.mouse_move_callbacks.append(self._show_label_tooltip)
 
     def _build_ui(self):
         layout = QVBoxLayout()
@@ -3350,26 +3282,36 @@ class LabelEditorWidget(QWidget):
             if limits.min <= minimum and maximum <= limits.max:
                 return labels.astype(dtype, copy=False)
 
-        raise ValueError(
-            f"Label values from {minimum} to {maximum} exceed supported integer ranges"
-        )
+    def _show_label_tooltip(self, viewer, event):
+        if self.labels_layer is None:
+            viewer.tooltip.visible = False
+            return
 
-    @staticmethod
-    def _promoted_dtype_for_classes(
-        current_dtype: np.dtype,
-        class_map: Dict[int, str],
-    ) -> np.dtype:
-        """Keep a dtype when possible, otherwise widen it for new classes."""
-        current_dtype = np.dtype(current_dtype)
-        if current_dtype == np.dtype(np.bool_):
-            minimum, maximum = 0, 1
-        elif np.issubdtype(current_dtype, np.integer):
-            limits = np.iinfo(current_dtype)
-            minimum, maximum = int(limits.min), int(limits.max)
+        # Mouse position in layer/data coordinates
+        position = self.labels_layer.world_to_data(event.position)
+
+        y = int(round(position[-2]))
+        x = int(round(position[-1]))
+
+        h, w = self.labels_layer.data.shape
+
+        if not (0 <= y < h and 0 <= x < w):
+            viewer.tooltip.visible = False
+            return
+
+        value = int(self.labels_layer.data[y, x])
+
+        if value == 0:
+            text = "Background"
         else:
-            raise ValueError(
-                f"Label image must have an integer dtype. Got {current_dtype}"
-            )
+            class_name = self.class_map.get(value, "Unknown")
+            text = f"{value}: {class_name}"
+
+        viewer.tooltip.text = text
+        viewer.tooltip.visible = True
+
+    def undo(self):
+        #print(f"undo stack size: {len(self.undo_stack)}")
 
         if class_map:
             minimum = min(minimum, min(int(value) for value in class_map))
