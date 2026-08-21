@@ -19,7 +19,7 @@ import operator
 import re
 import uuid
 from collections.abc import Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import numpy as np
@@ -31,6 +31,8 @@ FORMAT_VERSION = 1
 PACK_BITORDER = "little"
 _SCAN_BYTES = 8 * 1024 * 1024
 _MAX_MOVE_DELTA_BYTES = 64 * 1024 * 1024
+MAX_SELECTED_ERASE_HISTORY_BYTES = 128 * 1024 * 1024
+SELECTED_ERASE_CHUNK_PIXELS = 256 * 1024
 _NORMALIZED_COLOR = re.compile(r"#[0-9a-f]{6}\Z")
 _GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _REQUIRED_PAYLOAD_KEYS = frozenset(
@@ -58,9 +60,11 @@ _BYTE_POPCOUNT = np.unpackbits(
 
 __all__ = [
     "FORMAT_VERSION",
+    "MAX_SELECTED_ERASE_HISTORY_BYTES",
     "OverlapDelta",
     "OverlapMoveResult",
     "OverlapStore",
+    "SelectedEraseDelta",
     "hash_projection",
 ]
 
@@ -79,6 +83,167 @@ class _UniqueSparseIndices(tuple):
 
     def __new__(cls, rows: np.ndarray, columns: np.ndarray):
         return super().__new__(cls, (rows, columns))
+
+
+@dataclass(frozen=True, eq=False)
+class _UniqueRunIndices:
+    """Immutable canonical row runs produced by the component picker.
+
+    Each pixel in run ``i`` is ``(rows[i], column)`` for
+    ``starts[i] <= column < stops[i]``. Runs are sorted in row-major order,
+    nonempty, nonoverlapping, and separated within a row. The compact carrier
+    can expand bounded temporary coordinate chunks for existing packed-store
+    primitives without ever materializing all component coordinates.
+    """
+
+    rows: np.ndarray
+    starts: np.ndarray
+    stops: np.ndarray
+    _pixel_count: int = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        rows = np.asarray(self.rows)
+        starts = np.asarray(self.starts)
+        stops = np.asarray(self.stops)
+        if not (rows.ndim == starts.ndim == stops.ndim == 1):
+            raise ValueError("Run indices must be one-dimensional")
+        if not (rows.size == starts.size == stops.size):
+            raise ValueError("Run index arrays must have equal lengths")
+        if not all(
+            np.issubdtype(array.dtype, np.integer)
+            for array in (rows, starts, stops)
+        ):
+            raise TypeError("Run indices must be integers")
+        if rows.size:
+            if np.any(starts >= stops):
+                raise ValueError("Run stops must be greater than starts")
+            if np.any(rows[1:] < rows[:-1]):
+                raise ValueError("Run rows must be sorted")
+            same_row = rows[1:] == rows[:-1]
+            if np.any(same_row & (starts[1:] <= stops[:-1])):
+                raise ValueError(
+                    "Runs in one row must be sorted and separated"
+                )
+        rows = np.ascontiguousarray(rows)
+        starts = np.ascontiguousarray(starts)
+        stops = np.ascontiguousarray(stops)
+        rows.setflags(write=False)
+        starts.setflags(write=False)
+        stops.setflags(write=False)
+        pixel_count = 0
+        run_chunk = 1024 * 1024
+        for start in range(0, int(rows.size), run_chunk):
+            stop = min(int(rows.size), start + run_chunk)
+            lengths = np.subtract(
+                stops[start:stop],
+                starts[start:stop],
+                dtype=np.int64,
+            )
+            pixel_count += int(np.sum(lengths, dtype=np.int64))
+        object.__setattr__(self, "rows", rows)
+        object.__setattr__(self, "starts", starts)
+        object.__setattr__(self, "stops", stops)
+        object.__setattr__(self, "_pixel_count", pixel_count)
+
+    @property
+    def run_count(self) -> int:
+        return int(self.rows.size)
+
+    @property
+    def pixel_count(self) -> int:
+        return self._pixel_count
+
+    @property
+    def nbytes(self) -> int:
+        return int(self.rows.nbytes + self.starts.nbytes + self.stops.nbytes)
+
+    @property
+    def bounds(self) -> tuple[int, int, int, int]:
+        if not self.run_count:
+            raise ValueError("Run indices cannot be empty")
+        return (
+            int(self.rows[0]),
+            int(self.rows[-1]) + 1,
+            int(self.starts.min()),
+            int(self.stops.max()),
+        )
+
+    def validate_shape(self, shape: tuple[int, int]) -> None:
+        height, width = (int(length) for length in shape)
+        if self.run_count and (
+            int(self.rows[0]) < 0
+            or int(self.rows[-1]) >= height
+            or int(self.starts.min()) < 0
+            or int(self.stops.max()) > width
+        ):
+            raise IndexError("Run indices exceed overlap shape")
+
+    def iter_chunks(
+        self,
+        max_pixels: int = SELECTED_ERASE_CHUNK_PIXELS,
+    ):
+        """Yield bounded row/column arrays in stable row-major order."""
+
+        max_pixels = int(max_pixels)
+        if max_pixels < 1:
+            raise ValueError("max_pixels must be positive")
+        run_index = 0
+        run_offset = 0
+        while run_index < self.run_count:
+            dtype = self.rows.dtype
+            chunk_rows = np.empty(max_pixels, dtype=dtype)
+            chunk_columns = np.empty(max_pixels, dtype=dtype)
+            output = 0
+            while run_index < self.run_count and output < max_pixels:
+                start = int(self.starts[run_index]) + run_offset
+                stop = int(self.stops[run_index])
+                take = min(stop - start, max_pixels - output)
+                chunk_rows[output : output + take] = self.rows[run_index]
+                chunk_columns[output : output + take] = np.arange(
+                    start,
+                    start + take,
+                    dtype=dtype,
+                )
+                output += take
+                if start + take == stop:
+                    run_index += 1
+                    run_offset = 0
+                else:
+                    run_offset += take
+            yield chunk_rows[:output], chunk_columns[:output]
+
+    def set_scalar_2d(
+        self,
+        array: np.ndarray,
+        value: int,
+        *,
+        raw: bool = False,
+    ) -> None:
+        """Set every run to one scalar without coordinate-array allocation.
+
+        ``raw=True`` bypasses ndarray subclass overrides and is reserved for
+        transactional rollback after a failed proxy write.
+        """
+
+        for row, start, stop in zip(self.rows, self.starts, self.stops):
+            key = (int(row), slice(int(start), int(stop)))
+            if raw:
+                np.ndarray.__setitem__(array, key, value)
+            else:
+                array[key] = value
+
+    def translated(
+        self,
+        row_delta: int,
+        column_delta: int,
+    ) -> "_UniqueRunIndices":
+        row_offset = np.asarray(row_delta, dtype=self.rows.dtype)
+        column_offset = np.asarray(column_delta, dtype=self.starts.dtype)
+        return _UniqueRunIndices(
+            np.add(self.rows, row_offset, dtype=self.rows.dtype),
+            np.add(self.starts, column_offset, dtype=self.starts.dtype),
+            np.add(self.stops, column_offset, dtype=self.stops.dtype),
+        )
 
 
 def _read_only_copy(values, *, dtype=None) -> np.ndarray:
@@ -149,6 +314,40 @@ class OverlapDelta:
             self.projection_after,
         )
         return sum(int(array.nbytes) for array in arrays)
+
+
+@dataclass(frozen=True, eq=False)
+class SelectedEraseDelta:
+    """One immutable, compact selected-region Delete history command.
+
+    The run carrier is shared with the live selection and ``top_after`` is
+    the only per-pixel history vector: the erased/top-before value is the
+    scalar ``value``. Applying this token forward removes that membership;
+    applying it backward restores it. Both directions preflight every chunk
+    before the first write and advance the store revision exactly once.
+    """
+
+    store_id: int
+    shape: tuple[int, int]
+    value: int
+    indices: _UniqueRunIndices
+    top_after: np.ndarray
+    revision_before: int
+    revision_after: int
+
+    @property
+    def pixel_count(self) -> int:
+        return self.indices.pixel_count
+
+    @property
+    def bounds(self) -> tuple[int, int, int, int]:
+        return self.indices.bounds
+
+    @property
+    def nbytes(self) -> int:
+        """Bytes retained while this command remains in Undo/Redo history."""
+
+        return int(self.indices.nbytes + self.top_after.nbytes)
 
 
 @dataclass(frozen=True)
@@ -1383,6 +1582,225 @@ class OverlapStore:
             self._revision = revision
             raise
         return int(rows.size), top_after
+
+    def plan_selected_erase_delta(
+        self,
+        indices: _UniqueRunIndices,
+        value: int,
+        *,
+        expected_revision: int,
+        max_history_bytes: int = MAX_SELECTED_ERASE_HISTORY_BYTES,
+    ) -> SelectedEraseDelta:
+        """Preflight one run-backed Delete and allocate all retained history.
+
+        Planning is a strict no-op. The complete varying fallback projection
+        is produced in bounded chunks before a :class:`SelectedEraseDelta`
+        can be enqueued or applied.
+        """
+
+        if not isinstance(indices, _UniqueRunIndices):
+            raise TypeError("Run-backed selected erase requires trusted runs")
+        try:
+            required_revision = operator.index(expected_revision)
+        except TypeError as error:
+            raise TypeError("Expected revision must be an integer") from error
+        if required_revision != self._revision:
+            raise RuntimeError("The selected annotation is stale")
+        value = int(value)
+        self._require_class(value)
+        indices.validate_shape(self._shape)
+        pixel_count = indices.pixel_count
+        if pixel_count < 1:
+            raise ValueError("Selected erase runs cannot be empty")
+
+        max_history_bytes = int(max_history_bytes)
+        if max_history_bytes < 1:
+            raise ValueError("Selected erase history budget must be positive")
+        retained_bytes = (
+            indices.nbytes + pixel_count * self._projection.dtype.itemsize
+        )
+        if retained_bytes > max_history_bytes:
+            raise MemoryError(
+                "Selected annotation needs "
+                f"{retained_bytes:,} bytes of Undo history; the safe limit "
+                f"is {max_history_bytes:,} bytes."
+            )
+
+        top_after = np.empty(pixel_count, dtype=self._projection.dtype)
+        output_start = 0
+        for rows, columns in indices.iter_chunks():
+            output_stop = output_start + int(rows.size)
+            if np.any(self._projection[rows, columns] != value) or np.any(
+                ~self._membership_at_indices(value, rows, columns)
+            ):
+                raise RuntimeError("The selected annotation is stale")
+            fallback = np.zeros(rows.shape, dtype=self._projection.dtype)
+            for fallback_value in self._z_order:
+                if int(fallback_value) == value:
+                    continue
+                membership = self._membership_at_indices(
+                    fallback_value,
+                    rows,
+                    columns,
+                )
+                fallback[membership] = fallback_value
+            top_after[output_start:output_stop] = fallback
+            output_start = output_stop
+        if output_start != pixel_count:
+            raise RuntimeError("Selected erase run count changed while planning")
+        top_after.setflags(write=False)
+        return SelectedEraseDelta(
+            store_id=id(self),
+            shape=self._shape,
+            value=value,
+            indices=indices,
+            top_after=top_after,
+            revision_before=self._revision,
+            revision_after=self._revision + 1,
+        )
+
+    def apply_selected_erase_delta(
+        self,
+        delta: SelectedEraseDelta,
+        *,
+        forward: bool,
+        expected_revision: int | None = None,
+    ) -> int:
+        """Atomically apply or reverse one run-backed selected Delete."""
+
+        if not isinstance(delta, SelectedEraseDelta):
+            raise TypeError("delta must be a SelectedEraseDelta")
+        if not isinstance(forward, (bool, np.bool_)):
+            raise TypeError("forward must be a boolean")
+        if delta.store_id != id(self) or tuple(delta.shape) != self._shape:
+            raise ValueError(
+                "Selected erase delta belongs to a different overlap store"
+            )
+        value = int(delta.value)
+        plane_index = self._require_class(value)
+        indices = delta.indices
+        if not isinstance(indices, _UniqueRunIndices):
+            raise TypeError("Selected erase delta does not contain run indices")
+        indices.validate_shape(self._shape)
+        pixel_count = indices.pixel_count
+        top_after = np.asarray(delta.top_after)
+        if top_after.shape != (pixel_count,):
+            raise ValueError("Selected erase projection history is not aligned")
+        if not (
+            top_after.dtype == np.dtype(np.bool_)
+            or np.issubdtype(top_after.dtype, np.integer)
+        ):
+            raise TypeError("Selected erase projection history must be integer")
+        if delta.nbytes > MAX_SELECTED_ERASE_HISTORY_BYTES:
+            raise MemoryError("Selected erase delta exceeds the history limit")
+        if expected_revision is not None:
+            try:
+                required_revision = operator.index(expected_revision)
+            except TypeError as error:
+                raise TypeError("Expected revision must be an integer") from error
+            if required_revision != self._revision:
+                raise RuntimeError("Selected erase history revision is stale")
+
+        # Validate the complete source side and recompute the planned fallback
+        # from current hidden memberships before taking any rollback snapshot
+        # or changing a packed bit.
+        output_start = 0
+        expected_present = bool(forward)
+        for rows, columns in indices.iter_chunks():
+            output_stop = output_start + int(rows.size)
+            planned_fallback = top_after[output_start:output_stop]
+            membership = self._membership_at_indices(value, rows, columns)
+            if np.any(membership != expected_present):
+                raise RuntimeError(
+                    "Selected erase delta no longer matches memberships"
+                )
+            expected_projection = (
+                value if forward else planned_fallback
+            )
+            if np.any(
+                self._projection[rows, columns] != expected_projection
+            ):
+                raise RuntimeError(
+                    "Selected erase delta no longer matches the projection"
+                )
+
+            fallback = np.zeros(rows.shape, dtype=self._projection.dtype)
+            for class_value in self._z_order:
+                if int(class_value) == value:
+                    continue
+                class_membership = self._membership_at_indices(
+                    class_value,
+                    rows,
+                    columns,
+                )
+                fallback[class_membership] = class_value
+            if np.any(fallback != planned_fallback):
+                raise RuntimeError(
+                    "Selected erase delta no longer matches hidden memberships"
+                )
+            output_start = output_stop
+
+        row_start, row_stop, column_start, column_stop = indices.bounds
+        byte_start = column_start // 8
+        byte_stop = (column_stop + 7) // 8
+        packed_before = np.array(
+            self._packed_masks[
+                plane_index,
+                row_start:row_stop,
+                byte_start:byte_stop,
+            ],
+            copy=True,
+            order="C",
+        )
+        projection_before = np.array(
+            self._projection[
+                row_start:row_stop,
+                column_start:column_stop,
+            ],
+            copy=True,
+            order="C",
+        )
+        projection_sha256 = self._projection_sha256
+        generation = self._generation
+        revision = self._revision
+        desired_present = not forward
+        try:
+            output_start = 0
+            for rows, columns in indices.iter_chunks():
+                output_stop = output_start + int(rows.size)
+                self._set_membership_at_indices(
+                    value,
+                    rows,
+                    columns,
+                    present=desired_present,
+                )
+                desired_projection = (
+                    top_after[output_start:output_stop]
+                    if forward
+                    else value
+                )
+                self._projection[rows, columns] = desired_projection
+                output_start = output_stop
+            self._mark_modified()
+        except BaseException:
+            self._packed_masks[
+                plane_index,
+                row_start:row_stop,
+                byte_start:byte_stop,
+            ] = packed_before
+            np.ndarray.__setitem__(
+                self._projection,
+                (
+                    slice(row_start, row_stop),
+                    slice(column_start, column_stop),
+                ),
+                projection_before,
+            )
+            self._projection_sha256 = projection_sha256
+            self._generation = generation
+            self._revision = revision
+            raise
+        return pixel_count
 
     def restore_erased_indices(
         self,

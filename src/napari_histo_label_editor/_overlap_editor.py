@@ -22,7 +22,11 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
-from ._overlap_store import _UniqueSparseIndices
+from ._overlap_store import (
+    SelectedEraseDelta,
+    _UniqueRunIndices,
+    _UniqueSparseIndices,
+)
 
 if TYPE_CHECKING:
     from ._overlap_store import OverlapDelta, OverlapMoveResult, OverlapStore
@@ -229,9 +233,15 @@ class OverlapEditorController:
             (row_stop - row_start, column_stop - column_start),
         )
 
-    def normalize_indices(self, indices: Any) -> tuple[np.ndarray, np.ndarray]:
+    def normalize_indices(
+        self,
+        indices: Any,
+    ) -> tuple[np.ndarray, np.ndarray] | _UniqueRunIndices:
         """Return validated, unique sparse row/column coordinates."""
 
+        if isinstance(indices, _UniqueRunIndices):
+            indices.validate_shape(self._shape)
+            return indices
         rows, columns = self._coordinate_arrays(indices)
         if isinstance(indices, _UniqueSparseIndices):
             # Connected-selection coordinates were made unique by the flood
@@ -250,9 +260,12 @@ class OverlapEditorController:
     def _unique_selection_indices(
         self,
         indices: Any,
-    ) -> _UniqueSparseIndices:
+    ) -> _UniqueSparseIndices | _UniqueRunIndices:
         """Validate picker-owned unique coordinates without sorting/copying."""
 
+        if isinstance(indices, _UniqueRunIndices):
+            indices.validate_shape(self._shape)
+            return indices
         rows, columns = self._coordinate_arrays(indices)
         return _UniqueSparseIndices(rows, columns)
 
@@ -355,6 +368,80 @@ class OverlapEditorController:
                 )
             raise
         return int(changed), bounds, top_after
+
+    def plan_selected_visible_erase(
+        self,
+        indices: _UniqueRunIndices,
+        value: int,
+        *,
+        expected_revision: int,
+        max_history_bytes: int | None = None,
+    ) -> SelectedEraseDelta:
+        """Plan a large run-backed Delete without changing live arrays."""
+
+        normalized = self.normalize_indices(indices)
+        if not isinstance(normalized, _UniqueRunIndices):
+            raise TypeError("Large selected erase requires trusted runs")
+        kwargs = {}
+        if max_history_bytes is not None:
+            kwargs["max_history_bytes"] = int(max_history_bytes)
+        return self.store.plan_selected_erase_delta(
+            normalized,
+            int(value),
+            expected_revision=int(expected_revision),
+            **kwargs,
+        )
+
+    def apply_selected_erase_delta(
+        self,
+        delta: SelectedEraseDelta,
+        *,
+        forward: bool,
+        expected_revision: int | None = None,
+    ) -> tuple[int, tuple[int, int, int, int]]:
+        """Apply one large Delete/Undo/Redo and synchronize its proxy."""
+
+        if not isinstance(delta, SelectedEraseDelta):
+            raise TypeError("delta must be a SelectedEraseDelta")
+        if not isinstance(forward, (bool, np.bool_)):
+            raise TypeError("forward must be a boolean")
+        indices = delta.indices
+        indices.validate_shape(self._shape)
+        proxy_expected = None
+        if self._active_class == int(delta.value):
+            expected_proxy = int(bool(forward))
+            for rows, columns in indices.iter_chunks():
+                if np.any(self._edit_mask[rows, columns] != expected_proxy):
+                    raise RuntimeError(
+                        "Selected erase delta no longer matches the active "
+                        "edit mask"
+                    )
+            proxy_expected = expected_proxy
+            try:
+                desired_proxy = int(not bool(forward))
+                indices.set_scalar_2d(self._edit_mask, desired_proxy)
+            except BaseException:
+                indices.set_scalar_2d(
+                    self._edit_mask,
+                    expected_proxy,
+                    raw=True,
+                )
+                raise
+        try:
+            changed = self.store.apply_selected_erase_delta(
+                delta,
+                forward=bool(forward),
+                expected_revision=expected_revision,
+            )
+        except BaseException:
+            if proxy_expected is not None:
+                indices.set_scalar_2d(
+                    self._edit_mask,
+                    proxy_expected,
+                    raw=True,
+                )
+            raise
+        return int(changed), indices.bounds
 
     def plan_object_move(
         self,

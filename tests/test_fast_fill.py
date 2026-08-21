@@ -174,6 +174,47 @@ class FastFillTest(unittest.TestCase):
         np.testing.assert_array_equal(actual[0], expected[0])
         np.testing.assert_array_equal(actual[1], expected[1])
 
+    def test_large_component_can_return_bounded_canonical_row_runs(self):
+        labels = np.zeros((5, 9), dtype=np.uint8)
+        labels[1, 1:8] = 4
+        labels[2, 1:3] = 4
+        labels[2, 6:8] = 4
+        labels[3, 1:8] = 4
+
+        runs = bounded_flood_indices(
+            labels,
+            (1, 1),
+            initial_window=3,
+            max_local_pixels=labels.size,
+            max_component_pixels=labels.size,
+            allow_full_fallback=False,
+            index_dtype=np.int32,
+            run_threshold_pixels=2,
+            max_run_bytes=1024,
+        )
+
+        self.assertEqual(len(runs), 3)
+        run_rows, starts, stops = runs
+        np.testing.assert_array_equal(run_rows, np.array([1, 2, 2, 3]))
+        np.testing.assert_array_equal(starts, np.array([1, 1, 6, 1]))
+        np.testing.assert_array_equal(stops, np.array([8, 3, 8, 8]))
+        rebuilt = np.zeros_like(labels, dtype=bool)
+        for row, start, stop in zip(run_rows, starts, stops):
+            rebuilt[int(row), int(start) : int(stop)] = True
+        np.testing.assert_array_equal(rebuilt, labels == 4)
+
+        with self.assertRaisesRegex(ValueError, "run byte limit"):
+            bounded_flood_indices(
+                labels,
+                (1, 1),
+                initial_window=3,
+                max_local_pixels=labels.size,
+                allow_full_fallback=False,
+                index_dtype=np.int32,
+                run_threshold_pixels=2,
+                max_run_bytes=47,
+            )
+
     def test_growth_overshoot_is_clipped_instead_of_rejecting_component(self):
         labels = np.zeros((100, 100), dtype=np.uint8)
         labels[30:70, 30:70] = 5

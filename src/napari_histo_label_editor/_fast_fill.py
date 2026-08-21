@@ -109,7 +109,13 @@ def _mask_indices_with_offset(
     *,
     index_dtype=None,
     max_chunk_pixels: int = 1024 * 1024,
-) -> tuple[np.ndarray, np.ndarray]:
+    run_threshold_pixels: int | None = None,
+    max_run_bytes: int | None = None,
+) -> tuple[np.ndarray, np.ndarray] | tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """Return mask coordinates, optionally into compact chunked outputs.
 
     ``np.nonzero`` always creates two platform-sized arrays.  That is ideal
@@ -118,6 +124,20 @@ def _mask_indices_with_offset(
     The opt-in dtype path fills the final arrays in bounded row chunks so the
     largest temporary coordinate pair is independent of component size.
     """
+
+    count = int(np.count_nonzero(mask))
+    if run_threshold_pixels is not None and count > int(
+        run_threshold_pixels
+    ):
+        if index_dtype is None:
+            index_dtype = np.intp
+        return _mask_runs_with_offset(
+            mask,
+            row_offset,
+            column_offset,
+            index_dtype=index_dtype,
+            max_run_bytes=max_run_bytes,
+        )
 
     if index_dtype is None:
         rows, columns = np.nonzero(mask)
@@ -130,7 +150,6 @@ def _mask_indices_with_offset(
         raise TypeError("index_dtype must be a signed integer dtype")
     if max_chunk_pixels < 1:
         raise ValueError("max_chunk_pixels must be at least 1")
-    count = int(np.count_nonzero(mask))
     rows = np.empty(count, dtype=dtype)
     columns = np.empty(count, dtype=dtype)
     if count == 0:
@@ -164,6 +183,71 @@ def _mask_indices_with_offset(
     return rows, columns
 
 
+def _mask_runs_with_offset(
+    mask: np.ndarray,
+    row_offset: int = 0,
+    column_offset: int = 0,
+    *,
+    index_dtype=np.int32,
+    max_run_bytes: int | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Encode a 2-D boolean mask as canonical row runs without N indices."""
+
+    mask = np.asarray(mask, dtype=bool)
+    if mask.ndim != 2:
+        raise ValueError("Run encoding requires a 2-D mask")
+    dtype = np.dtype(index_dtype)
+    if not np.issubdtype(dtype, np.signedinteger):
+        raise TypeError("index_dtype must be a signed integer dtype")
+
+    run_count = 0
+    width = int(mask.shape[1])
+    if width:
+        for row in mask:
+            run_count += int(bool(row[0]))
+            if width > 1:
+                run_count += int(
+                    np.count_nonzero((~row[:-1]) & row[1:])
+                )
+    run_bytes = run_count * 3 * dtype.itemsize
+    if max_run_bytes is not None and run_bytes > int(max_run_bytes):
+        raise ValueError("connected component exceeds the run byte limit")
+
+    rows = np.empty(run_count, dtype=dtype)
+    starts = np.empty(run_count, dtype=dtype)
+    stops = np.empty(run_count, dtype=dtype)
+    output = 0
+    for local_row, row in enumerate(mask):
+        if width == 0 or not np.any(row):
+            continue
+        changes = np.flatnonzero(row[:-1] != row[1:]) + 1
+        boundary_count = changes.size + int(bool(row[0])) + int(bool(row[-1]))
+        boundaries = np.empty(boundary_count, dtype=dtype)
+        boundary_start = 0
+        if row[0]:
+            boundaries[0] = 0
+            boundary_start = 1
+        boundaries[
+            boundary_start : boundary_start + changes.size
+        ] = changes
+        if row[-1]:
+            boundaries[-1] = width
+        local_starts = boundaries[::2]
+        local_stops = boundaries[1::2]
+        count = int(local_starts.size)
+        rows[output : output + count] = int(row_offset) + local_row
+        starts[output : output + count] = (
+            local_starts + int(column_offset)
+        )
+        stops[output : output + count] = (
+            local_stops + int(column_offset)
+        )
+        output += count
+    if output != run_count:
+        raise RuntimeError("Run count changed while encoding flood mask")
+    return rows, starts, stops
+
+
 def bounded_flood_indices(
     labels: np.ndarray,
     seed: tuple[int, int],
@@ -173,7 +257,13 @@ def bounded_flood_indices(
     max_component_pixels: int | None = None,
     allow_full_fallback: bool = True,
     index_dtype=None,
-) -> tuple[np.ndarray, np.ndarray]:
+    run_threshold_pixels: int | None = None,
+    max_run_bytes: int | None = None,
+) -> tuple[np.ndarray, np.ndarray] | tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """Return a 4-connected component without starting at full-slide size.
 
     The search begins in a window around ``seed``. It expands only when a
@@ -195,6 +285,10 @@ def bounded_flood_indices(
         raise ValueError("max_local_pixels must be at least 1")
     if max_component_pixels is not None and max_component_pixels < 1:
         raise ValueError("max_component_pixels must be at least 1")
+    if run_threshold_pixels is not None and run_threshold_pixels < 0:
+        raise ValueError("run_threshold_pixels cannot be negative")
+    if max_run_bytes is not None and max_run_bytes < 1:
+        raise ValueError("max_run_bytes must be at least 1")
 
     height, width = labels.shape
     seed_row, seed_column = (int(seed[0]), int(seed[1]))
@@ -260,6 +354,8 @@ def bounded_flood_indices(
                 row_start,
                 column_start,
                 index_dtype=index_dtype,
+                run_threshold_pixels=run_threshold_pixels,
+                max_run_bytes=max_run_bytes,
             )
 
         current_height = row_stop - row_start
@@ -390,6 +486,8 @@ def bounded_flood_indices(
                 return _mask_indices_with_offset(
                     full_matches,
                     index_dtype=index_dtype,
+                    run_threshold_pixels=run_threshold_pixels,
+                    max_run_bytes=max_run_bytes,
                 )
 
         # Do not keep the prior flood mask alive while the next, larger one

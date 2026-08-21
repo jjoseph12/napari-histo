@@ -6,7 +6,10 @@ import numpy as np
 from napari_histo_label_editor._overlap_editor import (
     OverlapEditorController,
 )
-from napari_histo_label_editor._overlap_store import OverlapStore
+from napari_histo_label_editor._overlap_store import (
+    OverlapStore,
+    _UniqueRunIndices,
+)
 
 
 class _FailAfterProxyWrite(np.ndarray):
@@ -368,6 +371,135 @@ class OverlapEditorControllerTest(unittest.TestCase):
             with self.assertRaisesRegex(MemoryError, "forced store"):
                 controller.apply_overlap_delta(delta, forward=True)
 
+        np.testing.assert_array_equal(controller.edit_mask, proxy_before)
+
+    def test_run_selected_delete_undo_redo_survives_active_class_switch(self):
+        labels = np.full((3, 7), 2, dtype=np.uint8)
+        store = OverlapStore.from_legacy(
+            labels,
+            {0: "Background", 1: "Selected", 2: "Hidden"},
+            z_order=(1, 2),
+        )
+        store.update_patch(1, (1, 1), np.ones((2, 5), dtype=np.uint8))
+        controller = OverlapEditorController(store, 1)
+        runs = _UniqueRunIndices(
+            np.array([1, 2], dtype=np.int32),
+            np.array([1, 1], dtype=np.int32),
+            np.array([6, 6], dtype=np.int32),
+        )
+        delta = controller.plan_selected_visible_erase(
+            runs,
+            1,
+            expected_revision=controller.revision,
+        )
+
+        changed, bounds = controller.apply_selected_erase_delta(
+            delta,
+            forward=True,
+            expected_revision=controller.revision,
+        )
+        self.assertEqual(changed, 10)
+        self.assertEqual(bounds, (1, 3, 1, 6))
+        self.assertFalse(np.any(controller.edit_mask[1:3, 1:6]))
+        self.assertTrue(np.all(controller.composite[1:3, 1:6] == 2))
+
+        controller.select_class(2)
+        active_two = controller.edit_mask.copy()
+        controller.apply_selected_erase_delta(
+            delta,
+            forward=False,
+            expected_revision=controller.revision,
+        )
+        np.testing.assert_array_equal(controller.edit_mask, active_two)
+        self.assertTrue(np.all(controller.composite[1:3, 1:6] == 1))
+
+        controller.apply_selected_erase_delta(
+            delta,
+            forward=True,
+            expected_revision=controller.revision,
+        )
+        np.testing.assert_array_equal(controller.edit_mask, active_two)
+        self.assertTrue(np.all(controller.composite[1:3, 1:6] == 2))
+        controller.select_class(1)
+        self.assertFalse(np.any(controller.edit_mask[1:3, 1:6]))
+
+    def test_run_selected_delete_store_failure_restores_active_proxy(self):
+        labels = np.ones((3, 7), dtype=np.uint8)
+        store = OverlapStore.from_legacy(
+            labels,
+            {0: "Background", 1: "Selected"},
+        )
+        controller = OverlapEditorController(store, 1)
+        runs = _UniqueRunIndices(
+            np.arange(3, dtype=np.int32),
+            np.zeros(3, dtype=np.int32),
+            np.full(3, 7, dtype=np.int32),
+        )
+        delta = controller.plan_selected_visible_erase(
+            runs,
+            1,
+            expected_revision=controller.revision,
+        )
+        proxy_before = controller.edit_mask.copy()
+        projection_before = controller.composite.copy()
+        revision_before = controller.revision
+
+        with patch.object(
+            store,
+            "apply_selected_erase_delta",
+            side_effect=MemoryError("forced selected store failure"),
+        ):
+            with self.assertRaisesRegex(MemoryError, "selected store"):
+                controller.apply_selected_erase_delta(
+                    delta,
+                    forward=True,
+                )
+
+        np.testing.assert_array_equal(controller.edit_mask, proxy_before)
+        np.testing.assert_array_equal(controller.composite, projection_before)
+        self.assertEqual(controller.revision, revision_before)
+
+    def test_run_selected_delete_rollback_needs_no_new_coordinate_chunks(self):
+        labels = np.ones((3, 7), dtype=np.uint8)
+        store = OverlapStore.from_legacy(
+            labels,
+            {0: "Background", 1: "Selected"},
+        )
+        controller = OverlapEditorController(store, 1)
+        runs = _UniqueRunIndices(
+            np.arange(3, dtype=np.int32),
+            np.zeros(3, dtype=np.int32),
+            np.full(3, 7, dtype=np.int32),
+        )
+        delta = controller.plan_selected_visible_erase(
+            runs,
+            1,
+            expected_revision=controller.revision,
+        )
+        proxy_before = controller.edit_mask.copy()
+        native_iter_chunks = _UniqueRunIndices.iter_chunks
+        iterator_calls = 0
+
+        def only_first_chunk_iteration(indices, *args, **kwargs):
+            nonlocal iterator_calls
+            iterator_calls += 1
+            if iterator_calls > 1:
+                raise MemoryError("no memory for rollback coordinates")
+            return native_iter_chunks(indices, *args, **kwargs)
+
+        with patch.object(
+            _UniqueRunIndices,
+            "iter_chunks",
+            new=only_first_chunk_iteration,
+        ), patch.object(
+            store,
+            "apply_selected_erase_delta",
+            side_effect=MemoryError("forced selected store failure"),
+        ):
+            with self.assertRaisesRegex(MemoryError, "selected store"):
+                controller.apply_selected_erase_delta(delta, forward=True)
+
+        self.assertEqual(iterator_calls, 1)
         np.testing.assert_array_equal(controller.edit_mask, proxy_before)
 
     def test_class_switch_keeps_array_identities_and_independent_masks(self):

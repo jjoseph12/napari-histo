@@ -122,6 +122,40 @@ class ObjectSelectionTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "max_pixels"):
             tuple(selected.iter_indices(0))
 
+    def test_very_large_path_uses_immutable_runs_and_keeps_delete_indices(self):
+        projection = np.ones((6, 10), dtype=np.uint8)
+
+        selected = select_visible_component(
+            projection,
+            (3, 5),
+            max_selection_pixels=projection.size,
+            max_search_pixels=projection.size,
+            max_sparse_pixels=8,
+            max_run_bytes=1024,
+        )
+
+        self.assertIsNotNone(selected.runs)
+        self.assertIs(selected.indices, selected.runs)
+        self.assertEqual(selected.pixel_count, projection.size)
+        self.assertEqual(selected.bounds, (0, 6, 0, 10))
+        self.assertEqual(selected.rows.size, 0)
+        self.assertEqual(selected.columns.size, 0)
+        self.assertFalse(selected.runs.rows.flags.writeable)
+        self.assertFalse(selected.runs.starts.flags.writeable)
+        self.assertFalse(selected.runs.stops.flags.writeable)
+        chunks = tuple(selected.iter_indices(max_pixels=13))
+        self.assertTrue(all(rows.size <= 13 for rows, _ in chunks))
+        coordinates = set()
+        for rows, columns in chunks:
+            coordinates.update(zip(rows.tolist(), columns.tolist()))
+        self.assertEqual(
+            coordinates,
+            set(zip(*np.nonzero(projection))),
+        )
+        self.assertTrue(selected.simplified_preview)
+        with self.assertRaisesRegex(ValueError, "very large run-backed"):
+            selected.translated(1, 0, projection.shape)
+
     def test_search_window_limit_has_distinct_bounded_error(self):
         projection = np.zeros((2, 4096), dtype=np.uint8)
         projection[0] = 3

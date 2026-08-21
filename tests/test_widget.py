@@ -23,10 +23,15 @@ from napari_histo_label_editor._embedded_annotations import (
 from napari_histo_label_editor._fast_fill import overlap_fill
 from napari_histo_label_editor._fast_polygon import fast_paint_polygon
 from napari_histo_label_editor._class_config import read_class_config
-from napari_histo_label_editor._overlap_store import OverlapStore
+from napari_histo_label_editor._object_selection import select_visible_component
+from napari_histo_label_editor._overlap_store import (
+    OverlapStore,
+    SelectedEraseDelta,
+)
 from napari_histo_label_editor._widget import (
     LabelEditorWidget,
     SELECTION_ACTIONS_DOCK_NAME,
+    _displayed_sample_coordinate,
 )
 
 
@@ -1497,7 +1502,8 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(
                 widget.labels_layer._get_tooltip_text((1, 1)),
-                "Top: 2 — Stroma | Memberships: 1 — Tumor, 2 — Stroma",
+                "Hovered top: 2 — Stroma | Memberships: 1 — Tumor, "
+                "2 — Stroma",
             )
             self.assertEqual(
                 widget.labels_layer._get_tooltip_text(
@@ -1506,7 +1512,8 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                     dims_displayed=[0, 1],
                     world=True,
                 ),
-                "Top: 2 — Stroma | Memberships: 1 — Tumor, 2 — Stroma",
+                "Hovered top: 2 — Stroma | Memberships: 1 — Tumor, "
+                "2 — Stroma",
             )
 
             widget._upsert_class(2, "Fibrosis", "red")
@@ -1518,7 +1525,8 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual((rows["value"] == 2).sum(), 1)
             self.assertEqual(
                 widget.labels_layer._get_tooltip_text((1, 1)),
-                "Top: 2 — Fibrosis | Memberships: 1 — Tumor, 2 — Fibrosis",
+                "Hovered top: 2 — Fibrosis | Memberships: 1 — Tumor, "
+                "2 — Fibrosis",
             )
             np.testing.assert_allclose(
                 widget.composite_layer.get_color(2),
@@ -1539,11 +1547,12 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(widget.composite_layer.data[1, 1], 2)
             self.assertEqual(
                 widget.labels_layer._get_tooltip_text((1, 1)),
-                "Top: 2 — Stroma | Memberships: 1 — Tumor, 2 — Stroma",
+                "Hovered top: 2 — Stroma | Memberships: 1 — Tumor, "
+                "2 — Stroma",
             )
             self.assertEqual(
                 widget.labels_layer._get_tooltip_text((0, 0)),
-                "Label: 0 — background",
+                "Hovered label: 0 — background",
             )
             self.assertEqual(
                 widget.labels_layer._get_tooltip_text((-1, -1)),
@@ -1557,7 +1566,45 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             )
             self.assertEqual(
                 widget.labels_layer._get_tooltip_text((2, 3)),
-                "Label: 300 — Review",
+                "Hovered label: 300 — Review",
+            )
+
+    def test_pick_and_hover_follow_the_texel_visible_after_downsampling(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            widget._upsert_class(2, "Visible", "#abcdef")
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([2])),
+                1,
+            )
+            widget._select_label(1)
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+
+            transform = widget.composite_layer._transforms["tile2data"]
+            transform.scale = np.array([1.0, 2.0])
+            # The displayed texel at columns 2–3 comes from raw column 2.
+            self.assertEqual(
+                widget.labels_layer._get_tooltip_text((2, 3)),
+                "Hovered label: 2 — Visible",
+            )
+            selected = self.pick_connected_region(widget, (2, 3))
+            self.assertEqual(selected.value, 2)
+            self.assertEqual(selected.pixel_count, 1)
+            marker = np.asarray(widget._selection_layer.data[-1])
+            np.testing.assert_allclose((marker[0] + marker[2]) / 2, (2, 2))
+            self.assertIn("yellow diamond", widget.viewer.status)
+
+            transform.scale = np.array([2.0, 3.0])
+            transform.translate = np.array([0.0, 1.0])
+            np.testing.assert_array_equal(
+                _displayed_sample_coordinate(
+                    widget.composite_layer,
+                    (3.0, 5.0),
+                ),
+                np.array([2, 4], dtype=np.intp),
             )
 
     def test_native_labels_controls_bridge_opacity_and_large_brush_range(self):
@@ -2468,6 +2515,117 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 self.assertEqual(len(widget.labels_layer._undo_history), 1)
                 self.assertEqual(len(tracker.undo_items), 1)
                 self.assertEqual(labels_path.read_bytes(), file_before)
+
+    def test_run_backed_delete_is_one_exact_bounded_undo_action(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            rows = np.array([2, 2, 3], dtype=np.intp)
+            columns = np.array([2, 3, 2], dtype=np.intp)
+            widget._select_label(1)
+            widget.labels_layer.data_setitem((rows, columns), 1)
+            widget._upsert_class(2, "Visible", "#123456")
+            widget.labels_layer.data_setitem((rows, columns), 1)
+            widget._limit_undo_history(widget.labels_layer)
+            projection_before = np.array(
+                widget.overlap_editor.composite,
+                copy=True,
+            )
+            packed_before = np.array(
+                widget.overlap_store._packed_masks,
+                copy=True,
+            )
+
+            selection = select_visible_component(
+                widget.overlap_editor.composite,
+                (2, 2),
+                max_sparse_pixels=0,
+                store_revision=widget.overlap_store.revision,
+            )
+            self.assertIsNotNone(selection.runs)
+            self.assertEqual(selection.pixel_count, 3)
+            self.assertEqual(selection.rows.size, 0)
+            widget._set_annotation_selection(selection, anchor=(2, 2))
+            tracker = widget.labels_layer._napari_histo_edit_tracker
+
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.Yes,
+            ), patch.object(
+                widget.overlap_editor,
+                "full_sync",
+                side_effect=AssertionError(
+                    "run-backed history scanned the full slide"
+                ),
+            ):
+                widget._delete_selected_annotation()
+                self.assertIsNone(widget._annotation_selection)
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite[rows, columns],
+                    np.ones(3, dtype=np.uint8),
+                )
+                self.assertEqual(len(tracker.undo_items), 1)
+                delta = tracker.undo_items[-1][0]
+                self.assertIsInstance(delta, SelectedEraseDelta)
+                self.assertEqual(delta.pixel_count, 3)
+
+                widget.undo()
+                np.testing.assert_array_equal(
+                    widget.overlap_store._packed_masks,
+                    packed_before,
+                )
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite,
+                    projection_before,
+                )
+
+                widget.labels_layer.redo()
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite[rows, columns],
+                    np.ones(3, dtype=np.uint8),
+                )
+
+    def test_run_backed_delete_failures_are_exact_noops(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            selection = select_visible_component(
+                widget.overlap_editor.composite,
+                (1, 1),
+                max_sparse_pixels=0,
+                store_revision=widget.overlap_store.revision,
+            )
+            self.assertIsNotNone(selection.runs)
+            widget._set_annotation_selection(selection, anchor=(1, 1))
+            tracker = widget.labels_layer._napari_histo_edit_tracker
+            state_before = self.connected_runtime_state(widget)
+
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.Yes,
+            ), patch.object(
+                widget.overlap_editor,
+                "apply_selected_erase_delta",
+                side_effect=MemoryError("forced compact Delete failure"),
+            ):
+                widget._delete_selected_annotation()
+            self.assertEqual(self.connected_runtime_state(widget), state_before)
+            self.assertIs(widget._annotation_selection, selection)
+            self.assertIn("Could not delete", widget.viewer.status)
+
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.Yes,
+            ), patch.object(
+                tracker,
+                "_selected_erase_history_bytes",
+                return_value=128 * 1024 * 1024,
+            ):
+                widget._delete_selected_annotation()
+            self.assertEqual(self.connected_runtime_state(widget), state_before)
+            self.assertIs(widget._annotation_selection, selection)
+            self.assertIn("safe memory limit", widget.viewer.status)
 
     def test_selected_delete_failure_is_exact_noop_and_keeps_selection(self):
         with TemporaryDirectory() as tmp:

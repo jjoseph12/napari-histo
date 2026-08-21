@@ -180,7 +180,8 @@ The napari layer list uses four purpose-based names:
   overlap model;
 * **Histology** is the tissue image underneath; and
 * **Selected annotation outline (preview)** is a locked, lightweight yellow
-  outline. It stays hidden until a visible region is selected.
+  outline with a diamond marking the clicked pixel. It stays hidden until a
+  visible region is selected.
 
 The editor deliberately reuses one **Annotation tools** working layer instead
 of creating another full-size napari layer for every overlap. On whole-slide
@@ -195,8 +196,8 @@ redirects that slider to the visible overlay while the editing proxy stays
 transparent.
 
 Hover over the label overlay to see the label value and class name at the
-cursor (for example, `Label: 3 — Tumor`). The overlay can remain visible while
-using this readout.
+cursor (for example, `Hovered label: 3 — Tumor`). This is a live hover readout,
+not the identity of an earlier yellow-outlined selection.
 
 ---
 
@@ -290,18 +291,21 @@ memory until **Save** is pressed.
 ## Selecting, outlining, or deleting a visible region
 
 Choose napari's **Pick** tool and click a visible annotation. The editor draws
-a yellow outline and reports its class and pixel count in napari's status bar.
+a yellow outline, marks the clicked pixel with a yellow diamond, and reports
+the class and pixel count in napari's status bar.
 Selection follows 4-connected visible pixels. Because a semantic pixel mask
 does not retain the identity of every polygon that originally drew it,
 touching regions of the same visible class are one connected region.
 
-The selected pixels are exact. For a very complicated boundary, only the
-yellow preview may be simplified; Delete still uses the exact selected
-pixels. Connected regions up to 16,777,216 pixels can be selected; the picker
-uses compact coordinates and a bounded search window so it does not allocate
-another full-slide Labels layer. Regions above the safe limit are refused
-without changing data. Picking a region also makes its semantic class the
-active paint class.
+The selected pixels are exact. For a very large or complicated boundary, only
+the yellow preview may be simplified or extend outside the current view;
+Delete still uses the exact selected pixels. Connected regions up to
+67,108,864 pixels can be selected. Ordinary regions use compact coordinates;
+regions above 16,777,216 pixels automatically switch to compact row runs.
+Delete and one-step Undo/Redo retain that bounded representation instead of
+allocating a coordinate pair for every pixel. Exceptionally fragmented regions
+that exceed the run/history memory budgets are refused without changing data.
+Picking a region also makes its semantic class the active paint class.
 
 Available actions are:
 

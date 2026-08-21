@@ -14,12 +14,13 @@ import numpy as np
 from skimage.measure import approximate_polygon, find_contours
 
 from ._fast_fill import bounded_flood_indices
+from ._overlap_store import _UniqueRunIndices
 
 
-# A selected component keeps two compact coordinate arrays.  Sixteen million
-# pixels therefore occupy at most 128 MiB while the selection is armed.  The
-# prior 500,000-pixel ceiling rejected ordinary broad tissue annotations.
-MAX_SELECTION_PIXELS = 16 * 1024 * 1024
+# Ordinary components keep two compact coordinate arrays. Beyond sixteen
+# million pixels, the picker switches to immutable row runs so broad tissue
+# regions do not retain 8 bytes of coordinates per pixel.
+MAX_SPARSE_SELECTION_PIXELS = 16 * 1024 * 1024
 
 # Component discovery is allowed to inspect a larger bounded rectangle than
 # the component itself occupies.  This is deliberately independent of the
@@ -28,6 +29,16 @@ MAX_SELECTION_PIXELS = 16 * 1024 * 1024
 # covers the 7,048 x 8,001 annotation canvases this editor commonly opens and
 # bounds the largest temporary flood mask to 64 MiB.
 MAX_SELECTION_SEARCH_PIXELS = 64 * 1024 * 1024
+
+# A pathological connected comb can have nearly one run per pixel. Bound the
+# three signed run arrays independently even though dense real tissue usually
+# needs only one or a few runs per image row.
+MAX_SELECTION_RUN_BYTES = 64 * 1024 * 1024
+
+# A component cannot contain more pixels than the bounded search rectangle.
+# Keeping these limits equal lets every region on the editor's common
+# 7,048 x 8,001 canvases reach the compact run encoder.
+MAX_SELECTION_PIXELS = MAX_SELECTION_SEARCH_PIXELS
 
 # ``find_contours`` uses float work arrays that are substantially larger than
 # the uint8 local mask.  Above four MiPixels, retain the exact sparse object
@@ -59,6 +70,7 @@ class AnnotationObjectSelection:
     outlines: tuple[np.ndarray, ...]
     simplified_preview: bool = False
     store_revision: int | None = None
+    runs: _UniqueRunIndices | None = None
 
     @property
     def outline(self) -> np.ndarray:
@@ -70,12 +82,26 @@ class AnnotationObjectSelection:
 
     @property
     def pixel_count(self) -> int:
+        if self.runs is not None:
+            return self.runs.pixel_count
         return int(self.rows.size)
+
+    @property
+    def indices(
+        self,
+    ) -> tuple[np.ndarray, np.ndarray] | _UniqueRunIndices:
+        """Return the trusted sparse or compact-run selection carrier."""
+
+        if self.runs is not None:
+            return self.runs
+        return self.rows, self.columns
 
     @property
     def bounds(self) -> tuple[int, int, int, int]:
         if not self.pixel_count:
             raise ValueError("An annotation selection cannot be empty")
+        if self.runs is not None:
+            return self.runs.bounds
         return (
             int(self.rows.min()),
             int(self.rows.max()) + 1,
@@ -97,6 +123,9 @@ class AnnotationObjectSelection:
         max_pixels = int(max_pixels)
         if max_pixels < 1:
             raise ValueError("max_pixels must be positive")
+        if self.runs is not None:
+            yield from self.runs.iter_chunks(max_pixels)
+            return
         for start in range(0, self.pixel_count, max_pixels):
             stop = min(self.pixel_count, start + max_pixels)
             yield self.rows[start:stop], self.columns[start:stop]
@@ -112,10 +141,15 @@ class AnnotationObjectSelection:
         shape = tuple(shape)
         if len(shape) != 2:
             raise ValueError("Annotation movement requires a 2-D shape")
+        if self.runs is not None:
+            raise ValueError(
+                "Moving a very large run-backed selection is not supported; "
+                "Delete remains available."
+            )
         height, width = (int(size) for size in shape)
         row_delta = int(row_delta)
         column_delta = int(column_delta)
-        if self.rows.size:
+        if self.pixel_count:
             row_start, row_stop, column_start, column_stop = self.bounds
             if (
                 row_start + row_delta < 0
@@ -126,7 +160,7 @@ class AnnotationObjectSelection:
                 raise ValueError(
                     "The selected annotation cannot move outside the image"
                 )
-        # Keep ordinary slide selections compact after a translation.  The
+        # Keep ordinary slide selections compact after a translation. The
         # bounds check above makes the same-width signed addition safe.
         row_offset = np.asarray(row_delta, dtype=self.rows.dtype)
         column_offset = np.asarray(column_delta, dtype=self.columns.dtype)
@@ -151,6 +185,7 @@ class AnnotationObjectSelection:
             ),
             simplified_preview=self.simplified_preview,
             store_revision=self.store_revision,
+            runs=None,
         )
 
 
@@ -267,6 +302,8 @@ def select_visible_component(
     *,
     max_selection_pixels: int = MAX_SELECTION_PIXELS,
     max_search_pixels: int = MAX_SELECTION_SEARCH_PIXELS,
+    max_sparse_pixels: int = MAX_SPARSE_SELECTION_PIXELS,
+    max_run_bytes: int = MAX_SELECTION_RUN_BYTES,
     max_exact_outline_pixels: int = MAX_EXACT_OUTLINE_PIXELS,
     max_outline_vertices: int = MAX_OUTLINE_VERTICES,
     store_revision: int | None = None,
@@ -287,6 +324,10 @@ def select_visible_component(
         raise ValueError("max_selection_pixels must be positive")
     if max_search_pixels < 1:
         raise ValueError("max_search_pixels must be positive")
+    if max_sparse_pixels < 0:
+        raise ValueError("max_sparse_pixels cannot be negative")
+    if max_run_bytes < 1:
+        raise ValueError("max_run_bytes must be positive")
     if max_outline_vertices < 4:
         raise ValueError("max_outline_vertices must be at least 4")
     seed = tuple(seed)
@@ -300,13 +341,15 @@ def select_visible_component(
         return None
     index_dtype = _selection_index_dtype(projection.shape)
     try:
-        rows, columns = bounded_flood_indices(
+        component_indices = bounded_flood_indices(
             projection,
             (row, column),
             max_local_pixels=max_search_pixels,
             max_component_pixels=max_selection_pixels,
             allow_full_fallback=False,
             index_dtype=index_dtype,
+            run_threshold_pixels=max_sparse_pixels,
+            max_run_bytes=max_run_bytes,
         )
     except ValueError as error:
         message = str(error)
@@ -322,23 +365,54 @@ def select_visible_component(
                 "spans more than the "
                 f"{int(max_search_pixels):,}-pixel search window."
             ) from error
+        if "run byte limit" in message:
+            raise SelectionTooLargeError(
+                "This connected region is too fragmented to select safely; "
+                "its compact run index exceeds the "
+                f"{int(max_run_bytes):,}-byte selection limit."
+            ) from error
         raise
-    # np.nonzero (used by the compiled flood path) returns platform-sized
-    # indices.  A 32-bit signed coordinate is sufficient for normal slide
-    # dimensions and halves persistent selection memory on 64-bit systems.
-    rows = np.ascontiguousarray(rows, dtype=index_dtype)
-    columns = np.ascontiguousarray(columns, dtype=index_dtype)
-    # Delete history deliberately retains these compact arrays without a
-    # second N-pixel copy. Freeze them once the flood is final so stale UI or
-    # external references cannot redirect a later Undo/Redo target.
-    rows.setflags(write=False)
-    columns.setflags(write=False)
-    outlines, full_outline = _component_outlines(
-        rows,
-        columns,
-        max_exact_pixels=int(max_exact_outline_pixels),
-        max_vertices=int(max_outline_vertices),
-    )
+
+    if len(component_indices) == 3:
+        run_rows, run_starts, run_stops = component_indices
+        runs = _UniqueRunIndices(
+            np.ascontiguousarray(run_rows, dtype=index_dtype),
+            np.ascontiguousarray(run_starts, dtype=index_dtype),
+            np.ascontiguousarray(run_stops, dtype=index_dtype),
+        )
+        rows = np.empty(0, dtype=index_dtype)
+        columns = np.empty(0, dtype=index_dtype)
+        rows.setflags(write=False)
+        columns.setflags(write=False)
+        row_start, row_stop, column_start, column_stop = runs.bounds
+        outlines = (
+            _bounding_outline(
+                row_start,
+                row_stop,
+                column_start,
+                column_stop,
+            ),
+        )
+        full_outline = False
+    else:
+        rows, columns = component_indices
+        runs = None
+        # np.nonzero (used by the compiled flood path) returns platform-sized
+        # indices. A 32-bit signed coordinate is sufficient for normal slide
+        # dimensions and halves persistent selection memory on 64-bit systems.
+        rows = np.ascontiguousarray(rows, dtype=index_dtype)
+        columns = np.ascontiguousarray(columns, dtype=index_dtype)
+        # Delete history deliberately retains these compact arrays without a
+        # second N-pixel copy. Freeze them once the flood is final so stale UI
+        # references cannot redirect a later Undo/Redo target.
+        rows.setflags(write=False)
+        columns.setflags(write=False)
+        outlines, full_outline = _component_outlines(
+            rows,
+            columns,
+            max_exact_pixels=int(max_exact_outline_pixels),
+            max_vertices=int(max_outline_vertices),
+        )
     return AnnotationObjectSelection(
         value=value,
         rows=rows,
@@ -348,6 +422,7 @@ def select_visible_component(
         store_revision=(
             None if store_revision is None else int(store_revision)
         ),
+        runs=runs,
     )
 
 
@@ -355,6 +430,8 @@ __all__ = [
     "AnnotationObjectSelection",
     "MAX_EXACT_OUTLINE_PIXELS",
     "MAX_OUTLINE_VERTICES",
+    "MAX_SELECTION_RUN_BYTES",
+    "MAX_SPARSE_SELECTION_PIXELS",
     "MAX_SELECTION_PIXELS",
     "MAX_SELECTION_SEARCH_PIXELS",
     "SelectionTooLargeError",

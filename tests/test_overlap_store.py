@@ -7,6 +7,8 @@ import numpy as np
 from napari_histo_label_editor._overlap_store import (
     FORMAT_VERSION,
     OverlapStore,
+    SelectedEraseDelta,
+    _UniqueRunIndices,
     hash_projection,
 )
 
@@ -368,6 +370,126 @@ class OverlapStoreTest(unittest.TestCase):
         with patch.object(store, "_mark_modified", side_effect=failing_mark):
             with self.assertRaisesRegex(MemoryError, "forced move mark"):
                 store.apply_delta(delta, forward=True)
+
+        self.assert_store_matches_snapshot(store, before)
+
+    def test_run_selected_erase_replays_locally_raised_top_exactly(self):
+        labels = np.full((3, 7), 2, dtype=np.uint8)
+        store = OverlapStore.from_legacy(
+            labels,
+            {0: "Background", 1: "Selected", 2: "Hidden"},
+            z_order=(1, 2),
+        )
+        store.update_patch(1, (0, 0), np.ones(labels.shape, dtype=np.uint8))
+        self.assertTrue(np.all(store.projection_view == 1))
+        self.assertEqual(store.z_order, (1, 2))
+        runs = _UniqueRunIndices(
+            np.arange(3, dtype=np.int32),
+            np.zeros(3, dtype=np.int32),
+            np.full(3, 7, dtype=np.int32),
+        )
+        revision = store.revision
+
+        delta = store.plan_selected_erase_delta(
+            runs,
+            1,
+            expected_revision=revision,
+        )
+
+        self.assertIsInstance(delta, SelectedEraseDelta)
+        self.assertIs(delta.indices, runs)
+        self.assertEqual(delta.pixel_count, labels.size)
+        self.assertEqual(delta.bounds, (0, 3, 0, 7))
+        self.assertFalse(delta.top_after.flags.writeable)
+        np.testing.assert_array_equal(delta.top_after, np.full(labels.size, 2))
+        self.assertEqual(store.revision, revision)
+
+        changed = store.apply_selected_erase_delta(
+            delta,
+            forward=True,
+            expected_revision=revision,
+        )
+        self.assertEqual(changed, labels.size)
+        self.assertEqual(store.revision, revision + 1)
+        self.assertFalse(np.any(store.select_plane(1)))
+        np.testing.assert_array_equal(store.projection_view, labels)
+
+        store.apply_selected_erase_delta(
+            delta,
+            forward=False,
+            expected_revision=store.revision,
+        )
+        self.assertTrue(np.all(store.select_plane(1)))
+        self.assertTrue(np.all(store.projection_view == 1))
+
+        store.apply_selected_erase_delta(
+            delta,
+            forward=True,
+            expected_revision=store.revision,
+        )
+        np.testing.assert_array_equal(store.projection_view, labels)
+
+    def test_run_selected_erase_failure_in_later_chunk_is_exact_noop(self):
+        labels = np.full((2, 160_000), 2, dtype=np.uint8)
+        store = OverlapStore.from_legacy(
+            labels,
+            {0: "Background", 1: "Selected", 2: "Hidden"},
+            z_order=(1, 2),
+        )
+        store.update_patch(1, (0, 0), np.ones(labels.shape, dtype=np.uint8))
+        runs = _UniqueRunIndices(
+            np.array([0, 1], dtype=np.int32),
+            np.array([0, 0], dtype=np.int32),
+            np.array([160_000, 160_000], dtype=np.int32),
+        )
+        delta = store.plan_selected_erase_delta(
+            runs,
+            1,
+            expected_revision=store.revision,
+        )
+        before = self.store_snapshot(store)
+        native_setter = store._set_membership_at_indices
+        calls = 0
+
+        def fail_after_second_chunk(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            result = native_setter(*args, **kwargs)
+            if calls == 2:
+                raise MemoryError("forced selected erase chunk failure")
+            return result
+
+        with patch.object(
+            store,
+            "_set_membership_at_indices",
+            side_effect=fail_after_second_chunk,
+        ):
+            with self.assertRaisesRegex(MemoryError, "chunk failure"):
+                store.apply_selected_erase_delta(delta, forward=True)
+
+        self.assertEqual(calls, 2)
+        self.assert_store_matches_snapshot(store, before)
+
+    def test_run_selected_erase_history_budget_rejects_before_mutation(self):
+        labels = np.full((2, 5), 1, dtype=np.uint8)
+        store = OverlapStore.from_legacy(
+            labels,
+            {0: "Background", 1: "Selected"},
+        )
+        runs = _UniqueRunIndices(
+            np.array([0, 1], dtype=np.int32),
+            np.array([0, 0], dtype=np.int32),
+            np.array([5, 5], dtype=np.int32),
+        )
+        before = self.store_snapshot(store)
+
+        with self.assertRaisesRegex(MemoryError, "Undo history"):
+            store.plan_selected_erase_delta(
+                runs,
+                1,
+                expected_revision=store.revision,
+                max_history_bytes=runs.nbytes + labels.size - 1,
+            )
 
         self.assert_store_matches_snapshot(store, before)
 

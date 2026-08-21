@@ -51,7 +51,12 @@ from ._io import (
 )
 from ._native_labels_controls import adapt_native_labels_tool_controls
 from ._overlap_editor import OverlapEditorController
-from ._overlap_store import OverlapDelta, OverlapStore
+from ._overlap_store import (
+    MAX_SELECTED_ERASE_HISTORY_BYTES,
+    OverlapDelta,
+    OverlapStore,
+    SelectedEraseDelta,
+)
 from ._object_selection import (
     AnnotationObjectSelection,
     SelectionTooLargeError,
@@ -66,6 +71,50 @@ MAX_OBJECT_MOVE_HISTORY_BYTES = 256 * 1024 * 1024
 DEFAULT_ANNOTATION_OPACITY = 0.45
 NATIVE_BRUSH_SIZE_MAX = 512
 SELECTION_ACTIONS_DOCK_NAME = "Histology selected region"
+
+
+def _displayed_sample_coordinate(layer, coordinate):
+    """Return the raw pixel represented by a displayed Labels texel.
+
+    napari downsamples oversized, single-scale Labels layers with ``data[::n]``
+    before uploading them to the GPU. Mouse coordinates remain full resolution,
+    so sampling them directly can pick a different class from the one visible on
+    screen. Snap each displayed axis to the source pixel used by that texel.
+    """
+
+    coordinate = np.asarray(coordinate, dtype=float)
+    if coordinate.shape != (2,) or not np.all(np.isfinite(coordinate)):
+        return None
+    snapped = np.round(coordinate).astype(np.intp)
+    try:
+        displayed = tuple(layer._slice_input.displayed)
+        transform = layer._transforms["tile2data"]
+        scale = np.asarray(transform.scale, dtype=float)[list(displayed)]
+        translate = np.asarray(transform.translate, dtype=float)[list(displayed)]
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return snapped
+    if (
+        len(displayed) != 2
+        or scale.shape != (2,)
+        or translate.shape != (2,)
+        or not np.all(np.isfinite(scale))
+        or not np.all(np.isfinite(translate))
+        or np.any(scale <= 0)
+    ):
+        return snapped
+
+    integer_scale = np.rint(scale).astype(np.intp)
+    if not np.allclose(scale, integer_scale):
+        return snapped
+    for axis, factor in enumerate(integer_scale):
+        if factor <= 1:
+            continue
+        origin = translate[axis]
+        sample = origin + factor * np.floor(
+            (coordinate[axis] + 0.5 - origin) / factor
+        )
+        snapped[axis] = int(np.rint(sample))
+    return snapped
 
 
 def _tracked_overlap_data_setitem(layer, indices, value, refresh=True):
@@ -378,6 +427,8 @@ class _OverlapEditTracker:
             raise RuntimeError("The selected annotation has no store revision")
 
         controller = self.widget.overlap_editor
+        if selection.runs is not None:
+            return self._erase_run_backed_selection(selection, controller)
         # Picker output is frozen at construction, but retain this invariant
         # for selections supplied by older sessions or focused callers before
         # history begins sharing the arrays without copying them.
@@ -440,6 +491,86 @@ class _OverlapEditTracker:
             # Memberships, projection, proxy, and paired history have already
             # committed. A display upload failure must not be reported as a
             # failed Delete or leave stale destructive controls armed.
+            return error
+        return None
+
+    def _selected_erase_history_bytes(self, *, undo_only=False) -> int:
+        """Return retained bytes owned by compact large-region histories."""
+
+        queues = (self.undo_items,) if undo_only else (
+            self.undo_items,
+            self.redo_items,
+        )
+        return sum(
+            atom.nbytes
+            for queue in queues
+            for history in queue
+            for atom in history
+            if isinstance(atom, SelectedEraseDelta)
+        )
+
+    def _erase_run_backed_selection(self, selection, controller):
+        """Delete one very large selection as one compact history command."""
+
+        estimated_bytes = int(
+            selection.runs.nbytes
+            + selection.pixel_count * controller.composite.dtype.itemsize
+        )
+        retained_bytes = self._selected_erase_history_bytes(undo_only=True)
+        if (
+            retained_bytes + estimated_bytes
+            > MAX_SELECTED_ERASE_HISTORY_BYTES
+        ):
+            raise MemoryError(
+                "Large-region Undo history reached its safe memory limit. "
+                "Save and reload before deleting another very large region."
+            )
+        delta = controller.plan_selected_visible_erase(
+            selection.indices,
+            selection.value,
+            expected_revision=int(selection.store_revision),
+        )
+        if (
+            retained_bytes + delta.nbytes
+            > MAX_SELECTED_ERASE_HISTORY_BYTES
+        ):
+            raise MemoryError(
+                "Large-region Undo history reached its safe memory limit. "
+                "Save and reload before deleting another very large region."
+            )
+
+        history_item = [delta]
+        native_undo_before = tuple(self.layer._undo_history)
+        native_redo_before = tuple(self.layer._redo_history)
+        native_staged_before = tuple(self.layer._staged_history)
+        custom_undo_before = tuple(self.undo_items)
+        custom_redo_before = tuple(self.redo_items)
+        try:
+            # The controller updates the currently active binary proxy in
+            # bounded chunks. Native history therefore needs alignment only.
+            self._add_empty_native_history_atom()
+            self.redo_items.clear()
+            self.undo_items.append(history_item)
+            _changed, bounds = controller.apply_selected_erase_delta(
+                delta,
+                forward=True,
+                expected_revision=int(selection.store_revision),
+            )
+        except BaseException:
+            self.layer._undo_history.clear()
+            self.layer._undo_history.extend(native_undo_before)
+            self.layer._redo_history.clear()
+            self.layer._redo_history.extend(native_redo_before)
+            self.layer._staged_history[:] = native_staged_before
+            self.undo_items.clear()
+            self.undo_items.extend(custom_undo_before)
+            self.redo_items.clear()
+            self.redo_items.extend(custom_redo_before)
+            raise
+
+        try:
+            self.widget._refresh_composite_bounds(bounds)
+        except Exception as error:
             return error
         return None
 
@@ -1882,10 +2013,17 @@ class LabelEditorWidget(QWidget):
         if bounds is None:
             return
         row_start, row_stop, column_start, column_stop = bounds
-        self._refresh_composite_patch(
-            (row_start, column_start),
-            (row_stop - row_start, column_stop - column_start),
-        )
+        width = max(1, column_stop - column_start)
+        # Keep encoded display patches bounded even when a selected component
+        # spans most of a whole-slide canvas. This does not change the number
+        # of pixels redrawn; it prevents one giant temporary allocation.
+        rows_per_patch = max(1, (4 * 1024 * 1024) // width)
+        for patch_row_start in range(row_start, row_stop, rows_per_patch):
+            patch_row_stop = min(row_stop, patch_row_start + rows_per_patch)
+            self._refresh_composite_patch(
+                (patch_row_start, column_start),
+                (patch_row_stop - patch_row_start, width),
+            )
 
     def _enable_overlap_edit_tracking(self) -> None:
         layer = self.labels_layer
@@ -1898,6 +2036,31 @@ class LabelEditorWidget(QWidget):
         """Restore membership and per-pixel visible tops for one action."""
         self._syncing_overlap_layer = True
         try:
+            selected_erase_atoms = [
+                atom
+                for atom in history
+                if isinstance(atom, SelectedEraseDelta)
+            ]
+            if selected_erase_atoms:
+                if len(history) != 1 or len(selected_erase_atoms) != 1:
+                    raise RuntimeError(
+                        "Large selected Delete history must contain one "
+                        "compact command."
+                    )
+                _changed, bounds = (
+                    self.overlap_editor.apply_selected_erase_delta(
+                        selected_erase_atoms[0],
+                        forward=not undoing,
+                    )
+                )
+                try:
+                    self._refresh_composite_bounds(bounds)
+                except Exception:
+                    self.viewer.status = (
+                        "Annotation history was applied, but the display "
+                        "could not refresh. Pan or zoom to redraw."
+                    )
+                return
             move_atoms = [
                 atom for atom in history if isinstance(atom, OverlapDelta)
             ]
@@ -2027,8 +2190,11 @@ class LabelEditorWidget(QWidget):
         if coordinate is None:
             self._clear_annotation_selection()
             return
-        coordinate = np.round(np.asarray(coordinate)).astype(np.intp)
-        if coordinate.size != 2:
+        coordinate = _displayed_sample_coordinate(
+            self.composite_layer,
+            coordinate,
+        )
+        if coordinate is None:
             self._clear_annotation_selection()
             self.viewer.status = (
                 "Annotation selection is available only in 2-D."
@@ -2053,7 +2219,6 @@ class LabelEditorWidget(QWidget):
             self.viewer.status = "No annotation at that location."
             return
         try:
-            self._set_annotation_selection(selected)
             # Pick retains the connected-region outline for deletion and
             # also makes the clicked semantic class the active paint class.
             # Avoid rebuilding the same binary membership plane when it is
@@ -2064,6 +2229,9 @@ class LabelEditorWidget(QWidget):
                 or int(self.labels_layer.selected_label) != 1
             ):
                 self._select_label(selected.value)
+            # Install the preview last so its selection confirmation is not
+            # immediately replaced by _select_label's active-class status.
+            self._set_annotation_selection(selected, anchor=coordinate)
         except Exception as error:
             # The user clicked a new object, so the previous sparse selection
             # must never remain armed when its replacement outline fails.
@@ -2104,9 +2272,33 @@ class LabelEditorWidget(QWidget):
             paths.append(np.ascontiguousarray(outline, dtype=float))
         return paths
 
+    @staticmethod
+    def _selection_anchor_path(anchor, camera_zoom: float) -> np.ndarray:
+        """Return a screen-sized yellow diamond around the picked pixel."""
+
+        anchor = np.asarray(anchor, dtype=float)
+        if anchor.shape != (2,) or not np.all(np.isfinite(anchor)):
+            raise ValueError("A selection marker requires one 2-D coordinate")
+        radius = float(
+            np.clip(8.0 / max(float(camera_zoom), 1e-6), 2.0, 512.0)
+        )
+        row, column = anchor
+        return np.ascontiguousarray(
+            [
+                [row - radius, column],
+                [row, column + radius],
+                [row + radius, column],
+                [row, column - radius],
+                [row - radius, column],
+            ],
+            dtype=float,
+        )
+
     def _set_annotation_selection(
         self,
         selection: AnnotationObjectSelection,
+        *,
+        anchor=None,
     ) -> None:
         """Show a lightweight Shapes outline for an exact sparse selection."""
 
@@ -2122,6 +2314,8 @@ class LabelEditorWidget(QWidget):
             camera_zoom = float(self.viewer.camera.zoom)
         except (AttributeError, TypeError, ValueError):
             camera_zoom = 1.0
+        if anchor is not None:
+            paths.append(self._selection_anchor_path(anchor, camera_zoom))
         edge_width = float(
             np.clip(3.0 / max(camera_zoom, 1e-6), 1.0, 256.0)
         )
@@ -2165,10 +2359,15 @@ class LabelEditorWidget(QWidget):
         layer.visible = True
         self._annotation_selection = selection
         self.viewer.layers.selection.active = self.labels_layer
-        self.viewer.status = (
-            f"Selected visible region: class {selection.value}, "
-            f"{selection.pixel_count:,} pixels."
+        class_name = self.class_map.get(selection.value, selection.value)
+        status = (
+            f"Selected visible region: class {selection.value} — {class_name}, "
+            f"{selection.pixel_count:,} pixels. The yellow diamond marks "
+            "where you clicked."
         )
+        if selection.simplified_preview:
+            status += " Its full boundary extends beyond this preview."
+        self.viewer.status = status
         self._update_project_controls()
 
     def _on_selection_layer_visibility_change(self, event=None) -> None:
@@ -2207,15 +2406,13 @@ class LabelEditorWidget(QWidget):
             # comparing a multi-million-pixel projection twice around the
             # confirmation dialog.
             return int(selection.store_revision) == int(revision)
-        return bool(
-            np.all(
-                self.overlap_editor.composite[
-                    selection.rows,
-                    selection.columns,
-                ]
+        for rows, columns in selection.iter_indices():
+            if not np.all(
+                self.overlap_editor.composite[rows, columns]
                 == selection.value
-            )
-        )
+            ):
+                return False
+        return True
 
     def _use_selected_annotation_class(self) -> None:
         selection = self._annotation_selection
@@ -2407,23 +2604,10 @@ class LabelEditorWidget(QWidget):
         world=False,
     ) -> str:
         composite = self.composite_layer
-        value = composite.get_value(
-            position,
-            view_direction=view_direction,
-            dims_displayed=dims_displayed,
-            world=world,
-        )
-        if value is None:
-            return ""
-        top = int(value)
-        top_text = f"{top} — {self.class_map.get(top, top)}"
-        if top == 0:
-            return f"Label: {top_text}"
-
+        del view_direction, dims_displayed
         coordinate = np.asarray(position)
         if world:
             coordinate = np.asarray(composite.world_to_data(coordinate))
-        coordinate = np.round(coordinate).astype(int)
         displayed = tuple(composite._slice_input.displayed)
         if composite.ndim < len(coordinate):
             offset = len(coordinate) - composite.ndim
@@ -2432,19 +2616,24 @@ class LabelEditorWidget(QWidget):
             ]
         else:
             coordinate = coordinate[list(displayed)]
-        if len(coordinate) != 2 or np.any(coordinate < 0) or np.any(
+        coordinate = _displayed_sample_coordinate(composite, coordinate)
+        if coordinate is None or np.any(coordinate < 0) or np.any(
             coordinate >= np.asarray(self.overlap_store.shape)
         ):
-            return f"Label: {top_text}"
+            return ""
 
+        top = int(self.overlap_editor.composite[tuple(coordinate)])
+        top_text = f"{top} — {self.class_map.get(top, top)}"
+        if top == 0:
+            return f"Hovered label: {top_text}"
         memberships = self.overlap_store.memberships_at(*coordinate)
         if len(memberships) <= 1:
-            return f"Label: {top_text}"
+            return f"Hovered label: {top_text}"
         membership_text = ", ".join(
             f"{member} — {self.class_map.get(member, member)}"
             for member in memberships
         )
-        return f"Top: {top_text} | Memberships: {membership_text}"
+        return f"Hovered top: {top_text} | Memberships: {membership_text}"
 
     def _find_native_labels_controls(self):
         """Return napari's controls for the transparent edit layer, if ready."""
