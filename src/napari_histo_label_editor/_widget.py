@@ -90,6 +90,9 @@ class _OverlapEditTracker:
         self.redo_items = deque(maxlen=limit)
         self.staged = []
         self.block_depth = 0
+        self.semantic_erase_seen: set[int] = set()
+        self.semantic_erase_compact_done = False
+        self.semantic_erase_dedup_exhausted = False
 
     def install(self) -> None:
         layer = self.layer
@@ -106,6 +109,9 @@ class _OverlapEditTracker:
         self.undo_items.clear()
         self.redo_items.clear()
         self.staged.clear()
+        self.semantic_erase_seen.clear()
+        self.semantic_erase_compact_done = False
+        self.semantic_erase_dedup_exhausted = False
 
     def _native_history_marker(self):
         history = (
@@ -136,6 +142,15 @@ class _OverlapEditTracker:
             return None
         controller = self.widget.overlap_editor
         normalized = controller.normalize_indices(indices)
+        value_array = np.asarray(value)
+        if (
+            value_array.ndim == 0
+            and int(value_array) == 0
+            and not self.widget._syncing_overlap_layer
+            and self.widget._labels_layer_is_active()
+            and controller.active_class is not None
+        ):
+            return self._erase_visible_semantics(normalized, refresh)
         rows, columns = normalized
         binary_before = np.array(
             self.layer.data[rows, columns],
@@ -161,7 +176,6 @@ class _OverlapEditTracker:
 
         membership_changed = controller.process_indices(normalized)
         top_changed = 0
-        value_array = np.asarray(value)
         if value_array.ndim == 0 and int(value_array) == 1:
             top_changed, _ = controller.raise_active_indices(normalized)
 
@@ -191,6 +205,139 @@ class _OverlapEditTracker:
             self.widget._refresh_composite_bounds(bounds)
         return result
 
+    def _erase_visible_semantics(self, normalized, refresh=True):
+        """Erase one visible class per touched pixel, independent of active."""
+
+        rows, columns = normalized
+        if rows.size == 0:
+            return None
+        new_linear = np.empty(0, dtype=np.intp)
+        compact_region = self.layer._block_history and self.layer.mode in {
+            Mode.FILL,
+            Mode.POLYGON,
+        }
+        if self.layer._block_history:
+            if self.semantic_erase_dedup_exhausted:
+                return None
+            if compact_region:
+                # Napari gives each Fill click and completed Polygon its own
+                # history block. Accept exactly one complete region in that
+                # block: after revealing an underlying class, recomputing the
+                # component can produce a different superset, so a digest of
+                # the first region alone cannot prevent a second-level peel.
+                # A boolean is also O(1) for a multi-million-pixel Fill.
+                if self.semantic_erase_compact_done:
+                    return None
+            else:
+                linear = rows * self.layer.data.shape[1] + columns
+                unseen = np.fromiter(
+                    (
+                        int(index) not in self.semantic_erase_seen
+                        for index in linear
+                    ),
+                    dtype=bool,
+                    count=linear.size,
+                )
+                if not np.any(unseen):
+                    return None
+                rows = rows[unseen]
+                columns = columns[unseen]
+                normalized = (rows, columns)
+                new_linear = linear[unseen]
+
+        controller = self.widget.overlap_editor
+        binary_before = np.array(
+            self.layer.data[rows, columns],
+            copy=True,
+        )
+        top_before = np.array(
+            controller.composite[rows, columns],
+            copy=True,
+        )
+        active = int(controller.active_class)
+        active_top = top_before == active
+        undo_before = tuple(self.layer._undo_history)
+        redo_before = tuple(self.layer._redo_history)
+        staged_before = tuple(self.layer._staged_history)
+        updated_slice_before = self.layer._updated_slice
+        history_before = self._native_history_marker()
+        result = None
+        try:
+            if np.any(active_top):
+                # Native Labels emits labels_update synchronously. Suppress
+                # the ordinary active-plane adapter until the semantic store
+                # removes each pixel's captured visible class; otherwise the
+                # active subset could be projected twice before mixed-class
+                # erasing completes.
+                self.widget._syncing_overlap_layer = True
+                try:
+                    result = self.native_data_setitem(
+                        (rows[active_top], columns[active_top]),
+                        0,
+                        refresh,
+                    )
+                finally:
+                    self.widget._syncing_overlap_layer = False
+            changed, bounds, erased_values, top_after = (
+                controller.erase_visible_indices(normalized)
+            )
+        except BaseException:
+            # A sparse store allocation can still fail on a memory-constrained
+            # slide. Restore the binary proxy and napari queues exactly so a
+            # reported failure never creates a half-native, half-semantic edit.
+            self.layer.data[rows, columns] = binary_before
+            self.layer._undo_history.clear()
+            self.layer._undo_history.extend(undo_before)
+            self.layer._redo_history.clear()
+            self.layer._redo_history.extend(redo_before)
+            self.layer._staged_history[:] = staged_before
+            try:
+                self.layer.refresh()
+            except Exception:
+                pass
+            finally:
+                self.layer._updated_slice = updated_slice_before
+            raise
+        history_after = self._native_history_marker()
+        native_recorded = history_after != history_before
+        if changed:
+            # Store-owned snapshots are already independent arrays. Retain the
+            # complete sparse request (including harmless background points)
+            # to avoid several large post-commit filtered allocations for a
+            # bucket fill.
+            atom = (
+                (rows, columns),
+                erased_values,
+                top_after,
+                erased_values,
+            )
+            if not native_recorded:
+                self._add_empty_native_history_atom()
+            self._record(atom)
+        # Grow stroke-dedup state only after aligned native/custom history is
+        # durable. If this bookkeeping allocation fails, the successful
+        # partial stroke remains immediately undoable.
+        try:
+            if compact_region:
+                self.semantic_erase_compact_done = True
+            elif new_linear.size:
+                self.semantic_erase_seen.update(
+                    int(index) for index in new_linear
+                )
+        except MemoryError:
+            # The edit and its paired history are already durable. Stop the
+            # remainder of this mouse stroke rather than risk peeling pixels
+            # whose compact dedup state could not be retained.
+            self.semantic_erase_seen.clear()
+            self.semantic_erase_dedup_exhausted = True
+            self.widget.viewer.status = (
+                "This erase stroke reached the memory limit. Release the "
+                "mouse and start a new stroke to continue."
+            )
+        if changed:
+            self.widget._refresh_composite_bounds(bounds)
+        return result
+
     def _record(self, atom) -> None:
         self.redo_items.clear()
         if self.layer._block_history:
@@ -200,6 +347,10 @@ class _OverlapEditTracker:
 
     @contextmanager
     def block_history(self):
+        if self.block_depth == 0:
+            self.semantic_erase_seen.clear()
+            self.semantic_erase_compact_done = False
+            self.semantic_erase_dedup_exhausted = False
         self.block_depth += 1
         completed = False
         try:
@@ -209,9 +360,21 @@ class _OverlapEditTracker:
         finally:
             self.block_depth -= 1
             if self.block_depth == 0:
-                if completed and self.staged:
+                if not completed and self.layer._staged_history:
+                    # Napari intentionally commits staged atoms only on a
+                    # normal context exit. If a later callback fails, keep the
+                    # earlier successful native and semantic atoms aligned as
+                    # one immediately undoable partial stroke before the
+                    # original exception propagates.
+                    native_staged = self.layer._staged_history
+                    self.layer._staged_history = []
+                    self.layer._append_to_undo_history(native_staged)
+                if self.staged:
                     self.undo_items.append(self.staged)
                 self.staged = []
+                self.semantic_erase_seen.clear()
+                self.semantic_erase_compact_done = False
+                self.semantic_erase_dedup_exhausted = False
 
     def undo(self):
         if self.widget._save_worker is not None:
@@ -221,11 +384,20 @@ class _OverlapEditTracker:
             return None
         if not self.layer._undo_history:
             return None
-        history = self.undo_items.pop() if self.undo_items else None
-        result = self.native_undo()
-        if history is not None:
+        history = self.undo_items[-1] if self.undo_items else None
+        if history is None:
+            return self.native_undo()
+        snapshot = self._snapshot_native_history_call(
+            self.layer._undo_history[-1]
+        )
+        try:
+            result = self.native_undo()
             self.widget._restore_overlap_history(history, undoing=True)
-            self.redo_items.append(history)
+        except BaseException:
+            self._restore_native_history_call(snapshot)
+            raise
+        self.undo_items.pop()
+        self.redo_items.append(history)
         return result
 
     def redo(self):
@@ -236,12 +408,54 @@ class _OverlapEditTracker:
             return None
         if not self.layer._redo_history:
             return None
-        history = self.redo_items.pop() if self.redo_items else None
-        result = self.native_redo()
-        if history is not None:
+        history = self.redo_items[-1] if self.redo_items else None
+        if history is None:
+            return self.native_redo()
+        snapshot = self._snapshot_native_history_call(
+            self.layer._redo_history[-1]
+        )
+        try:
+            result = self.native_redo()
             self.widget._restore_overlap_history(history, undoing=False)
-            self.undo_items.append(history)
+        except BaseException:
+            self._restore_native_history_call(snapshot)
+            raise
+        self.redo_items.pop()
+        self.undo_items.append(history)
         return result
+
+    def _snapshot_native_history_call(self, native_item):
+        """Capture sparse binary data and queue references before Undo/Redo."""
+
+        data = [
+            (indices, np.array(self.layer.data[indices], copy=True))
+            for indices, _before, _after in native_item
+        ]
+        return (
+            data,
+            tuple(self.layer._undo_history),
+            tuple(self.layer._redo_history),
+            tuple(self.layer._staged_history),
+            self.layer._updated_slice,
+        )
+
+    def _restore_native_history_call(self, snapshot) -> None:
+        """Roll back a failed paired semantic history transition."""
+
+        data, undo, redo, staged, updated_slice = snapshot
+        for indices, values in data:
+            self.layer.data[indices] = values
+        self.layer._undo_history.clear()
+        self.layer._undo_history.extend(undo)
+        self.layer._redo_history.clear()
+        self.layer._redo_history.extend(redo)
+        self.layer._staged_history[:] = staged
+        try:
+            self.layer.refresh()
+        except Exception:
+            pass
+        finally:
+            self.layer._updated_slice = updated_slice
 
 
 def _atomic_save_overlap_store(
@@ -299,6 +513,10 @@ class LabelEditorWidget(QWidget):
 
         self.image_path: Optional[Path] = None
         self.labels_path: Optional[Path] = None
+        # ``labels_path`` is the currently adopted save target.  Keep the
+        # successfully loaded label input separately so editing the save-path
+        # draft never changes what the Load controls refer to.
+        self._loaded_labels_path: Optional[Path] = None
         self.mapping_path: Optional[Path] = None
         self._labels_output_dtype: Optional[np.dtype] = None
         self._labels_destination_identity: Optional[FileIdentity] = None
@@ -365,7 +583,7 @@ class LabelEditorWidget(QWidget):
         layout.addWidget(QLabel("Histology image"))
         layout.addLayout(self._file_row(self.image_line, self._choose_image))
 
-        layout.addWidget(QLabel("Label image"))
+        layout.addWidget(QLabel("Label image to load"))
         layout.addLayout(self._file_row(self.label_line, self._choose_labels))
 
         layout.addWidget(QLabel("Class mapping CSV"))
@@ -374,6 +592,24 @@ class LabelEditorWidget(QWidget):
         self.load_btn = QPushButton("Load")
         self.load_btn.clicked.connect(self.load_data)
         layout.addWidget(self.load_btn)
+
+        self.overlay_opacity_layout = QHBoxLayout()
+        self.overlay_opacity_label = QLabel("Annotation opacity")
+        self.overlay_opacity_layout.addWidget(self.overlay_opacity_label)
+        self.overlay_opacity_slider = QSlider(Qt.Horizontal)
+        self.overlay_opacity_slider.setRange(0, 100)
+        self.overlay_opacity_slider.setValue(45)
+        self.overlay_opacity_slider.setEnabled(False)
+        self.overlay_opacity_slider.setToolTip(
+            "Adjust the visible annotation opacity"
+        )
+        self.overlay_opacity_slider.valueChanged.connect(
+            self._set_overlay_opacity
+        )
+        self.overlay_opacity_layout.addWidget(self.overlay_opacity_slider)
+        self.overlay_opacity_value = QLabel("45%")
+        self.overlay_opacity_layout.addWidget(self.overlay_opacity_value)
+        layout.addLayout(self.overlay_opacity_layout)
 
         layout.addWidget(QLabel("Classes"))
 
@@ -420,31 +656,14 @@ class LabelEditorWidget(QWidget):
 
         layout.addWidget(self.class_button_scroll)
 
-        opacity_row = QHBoxLayout()
-        opacity_row.addWidget(QLabel("Overlay opacity"))
-        self.overlay_opacity_slider = QSlider(Qt.Horizontal)
-        self.overlay_opacity_slider.setRange(0, 100)
-        self.overlay_opacity_slider.setValue(45)
-        self.overlay_opacity_slider.setEnabled(False)
-        self.overlay_opacity_slider.setToolTip(
-            "Adjust the visible semantic annotation overlay"
-        )
-        self.overlay_opacity_slider.valueChanged.connect(
-            self._set_overlay_opacity
-        )
-        opacity_row.addWidget(self.overlay_opacity_slider)
-        self.overlay_opacity_value = QLabel("45%")
-        opacity_row.addWidget(self.overlay_opacity_value)
-        layout.addLayout(opacity_row)
-
-        self.save_destination_caption = QLabel("Current save destination")
+        self.save_destination_caption = QLabel("Save destination (editable)")
         layout.addWidget(self.save_destination_caption)
         self.save_destination_line = QLineEdit()
-        self.save_destination_line.setReadOnly(True)
+        self.save_destination_line.setEnabled(False)
         self.save_destination_line.setPlaceholderText("No label file loaded")
         self.save_destination_line.setToolTip(
-            "Save writes here while the loaded file is unchanged. Save As "
-            "creates or replaces a destination you explicitly choose."
+            "Edit this path, then press Save to use guarded Save As. Existing "
+            "files require confirmation and are verified before replacement."
         )
         layout.addWidget(self.save_destination_line)
 
@@ -481,6 +700,7 @@ class LabelEditorWidget(QWidget):
             self.image_line,
             self.label_line,
             self.mapping_line,
+            self.save_destination_line,
         ):
             line_edit.textChanged.connect(self._update_project_controls)
         self._update_project_controls()
@@ -531,14 +751,23 @@ class LabelEditorWidget(QWidget):
     def _project_inputs_match_loaded(self) -> bool:
         if (
             self.image_path is None
-            or self.labels_path is None
+            or self._loaded_labels_path is None
             or self.mapping_path is None
         ):
             return False
         return (
             self.image_line.text().strip() == str(self.image_path)
-            and self.label_line.text().strip() == str(self.labels_path)
+            and self.label_line.text().strip()
+            == str(self._loaded_labels_path)
             and self.mapping_line.text().strip() == str(self.mapping_path)
+        )
+
+    def _save_destination_draft_changed(self) -> bool:
+        """Return whether the editable field requests guarded Save As."""
+        return bool(
+            self.labels_path is not None
+            and self.save_destination_line.text().strip()
+            != str(self.labels_path)
         )
 
     @staticmethod
@@ -572,6 +801,7 @@ class LabelEditorWidget(QWidget):
             line_edit.setEnabled(not busy)
         for browse_button in self._browse_buttons:
             browse_button.setEnabled(not busy)
+        self.save_destination_line.setEnabled(active_layer and not busy)
 
         project_actions_enabled = active_layer and inputs_match and not busy
         destination_available = (
@@ -595,10 +825,13 @@ class LabelEditorWidget(QWidget):
         # unsafe destinations through the same guarded Save As flow.
         self.save_btn.setEnabled(active_layer and not busy)
         self.save_as_btn.setEnabled(active_layer and not busy)
+        typed_save_as = self._save_destination_draft_changed()
         rescue_required = not destination_available or (
             self._class_config_pending_save and not mapping_available
         )
-        if active_layer and rescue_required:
+        if active_layer and typed_save_as:
+            self.save_btn.setText("Save As [s]")
+        elif active_layer and rescue_required:
             self.save_btn.setText("Save As… [s]")
         elif self._class_config_pending_save:
             self.save_btn.setText("Save class deletion [s]")
@@ -630,25 +863,30 @@ class LabelEditorWidget(QWidget):
 
         if self.labels_path is None:
             self.save_destination_line.clear()
-            self.save_destination_caption.setText("Current save destination")
+            self.save_destination_caption.setText("Save destination (editable)")
             self.save_destination_line.setToolTip(
                 "Load a project before saving labels."
             )
             return
 
         destination = str(self.labels_path)
-        self.save_destination_line.setText(destination)
-        self.save_destination_line.setCursorPosition(0)
-        self.save_destination_line.setToolTip(destination)
+        self.save_destination_line.setToolTip(
+            "Current adopted target: "
+            f"{destination}\nEdit the field and press Save for guarded Save As."
+        )
         if busy:
             self.save_destination_caption.setText("Saving labels to")
         elif not active_layer:
             self.save_destination_caption.setText(
                 "Save disabled — loaded Labels layer was removed"
             )
+        elif typed_save_as:
+            self.save_destination_caption.setText(
+                "New save destination — press Save to adopt after success"
+            )
         elif not destination_available:
             self.save_destination_caption.setText(
-                "Original is missing or changed — Save opens Save As"
+                "Current target changed — edit path or use Save As"
             )
         elif self._class_config_pending_save and not mapping_available:
             self.save_destination_caption.setText(
@@ -663,7 +901,7 @@ class LabelEditorWidget(QWidget):
                 "New paths not loaded — Save still writes to"
             )
         else:
-            self.save_destination_caption.setText("Current save destination")
+            self.save_destination_caption.setText("Save destination (editable)")
 
     def _dialog_start_directory(self, *line_edits: QLineEdit) -> str:
         """Start file pickers beside the current project when possible."""
@@ -856,14 +1094,14 @@ class LabelEditorWidget(QWidget):
 
             image_layer = self.viewer.add_image(
                 image_data,
-                name="histology",
+                name="Histology",
                 rgb=is_rgb,
                 multiscale=len(image_pyramid) > 1,
                 interpolation2d="linear",
             )
             composite_layer = self.viewer.add_labels(
                 overlap_editor.composite,
-                name="labels — all classes",
+                name="Annotations",
                 opacity=self.overlay_opacity_slider.value() / 100.0,
                 features=self._label_features(class_map),
             )
@@ -931,6 +1169,7 @@ class LabelEditorWidget(QWidget):
 
         self.image_path = image_path
         self.labels_path = labels_path
+        self._loaded_labels_path = labels_path
         self.mapping_path = mapping_path
         self.class_map = class_map
         self.class_colors = class_colors
@@ -963,6 +1202,8 @@ class LabelEditorWidget(QWidget):
         self.image_line.setText(str(image_path))
         self.label_line.setText(str(labels_path))
         self.mapping_line.setText(str(mapping_path))
+        self.save_destination_line.setText(str(labels_path))
+        self.save_destination_line.setCursorPosition(0)
         self._populate_class_buttons()
         self._update_project_controls()
 
@@ -977,8 +1218,8 @@ class LabelEditorWidget(QWidget):
         class_map: Dict[int, str],
     ) -> str:
         if value is None:
-            return "active class — none"
-        return f"active class — {value}: {class_map.get(value, value)}"
+            return "Annotation tools — none"
+        return f"Annotation tools — {value}: {class_map.get(value, value)}"
 
     @staticmethod
     def _active_edit_features(
@@ -993,7 +1234,7 @@ class LabelEditorWidget(QWidget):
         return pd.DataFrame(
             {
                 "index": [0, 1],
-                "Label": ["Erase active class", active_name],
+                "Label": ["Erase visible/top annotation", active_name],
             }
         )
 
@@ -1153,27 +1394,89 @@ class LabelEditorWidget(QWidget):
         """Restore membership and per-pixel visible tops for one action."""
         self._syncing_overlap_layer = True
         try:
-            self.overlap_editor.full_sync()
+            semantic_erase_only = bool(history) and all(
+                len(atom) == 4 for atom in history
+            )
+            erased_transaction = (
+                self.overlap_editor.snapshot_erased_transaction(history)
+                if semantic_erase_only
+                else None
+            )
+            if not semantic_erase_only:
+                self.overlap_editor.full_sync()
             atoms = reversed(history) if undoing else history
             combined = None
-            for indices, top_before, top_after in atoms:
-                values = top_before if undoing else top_after
-                _changed, bounds = self.overlap_editor.restore_projection_indices(
-                    indices,
-                    values,
-                )
-                if bounds is None:
-                    continue
-                if combined is None:
-                    combined = bounds
-                else:
-                    combined = (
-                        min(combined[0], bounds[0]),
-                        max(combined[1], bounds[1]),
-                        min(combined[2], bounds[2]),
-                        max(combined[3], bounds[3]),
+            applied_semantic = []
+            try:
+                for atom in atoms:
+                    if len(atom) == 4:
+                        indices, top_before, top_after, erased_values = atom
+                        values = top_before if undoing else top_after
+                        _changed, bounds = (
+                            self.overlap_editor.restore_erased_indices(
+                                indices,
+                                erased_values,
+                                values,
+                                present=undoing,
+                            )
+                        )
+                        applied_semantic.append(atom)
+                    else:
+                        indices, top_before, top_after = atom
+                        values = top_before if undoing else top_after
+                        _changed, bounds = (
+                            self.overlap_editor.restore_projection_indices(
+                                indices,
+                                values,
+                            )
+                        )
+                    if bounds is None:
+                        continue
+                    if combined is None:
+                        combined = bounds
+                    else:
+                        combined = (
+                            min(combined[0], bounds[0]),
+                            max(combined[1], bounds[1]),
+                            min(combined[2], bounds[2]),
+                            max(combined[3], bounds[3]),
+                        )
+            except BaseException:
+                if erased_transaction is not None:
+                    # Restore raw affected bytes/projection values captured
+                    # before the first atom. This remains reliable even when
+                    # the allocator keeps failing after a later atom.
+                    self.overlap_editor.restore_erased_transaction(
+                        erased_transaction
                     )
-            self._refresh_composite_bounds(combined)
+                else:
+                    # Mixed legacy history is not emitted by one semantic
+                    # erase stroke, but retain its prior inverse fallback.
+                    for atom in reversed(applied_semantic):
+                        indices, top_before, top_after, erased_values = atom
+                        rollback_values = (
+                            top_after if undoing else top_before
+                        )
+                        self.overlap_editor.restore_erased_indices(
+                            indices,
+                            erased_values,
+                            rollback_values,
+                            present=not undoing,
+                        )
+                raise
+            try:
+                self._refresh_composite_bounds(combined)
+            except Exception:
+                # Memberships, projection, binary proxy, and paired histories
+                # have already transitioned atomically. A display upload
+                # failure must not make the tracker roll native state back
+                # while leaving the store on the new side of Undo/Redo; a
+                # later pan/zoom or layer refresh will redraw authoritative
+                # data.
+                self.viewer.status = (
+                    "Annotation history was applied, but the display could "
+                    "not refresh. Pan or zoom to redraw."
+                )
         finally:
             self._syncing_overlap_layer = False
 
@@ -1278,7 +1581,7 @@ class LabelEditorWidget(QWidget):
             return
         self.labels_layer.opacity = 0.0
         self.viewer.status = (
-            "Use the plugin's Overlay opacity slider for visible annotations."
+            "Use the plugin's Annotation opacity slider for visible annotations."
         )
 
     def _populate_class_buttons(self):
@@ -1309,7 +1612,9 @@ class LabelEditorWidget(QWidget):
         bg_btn.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Fixed)
         bg_btn.setMinimumWidth(0)
         bg_btn.setMaximumWidth(10_000)
-        bg_btn.setToolTip("Select Background for erasing")
+        bg_btn.setToolTip(
+            "Erase the visible/top annotation and reveal underlying overlaps"
+        )
 
         self.class_button_layout.addWidget(bg_btn, row, col)
 
@@ -1371,12 +1676,10 @@ class LabelEditorWidget(QWidget):
         value = int(value)
         if value == 0:
             self.labels_layer.selected_label = 0
-            active = self.overlap_editor.active_class
             self.viewer.layers.selection.active = self.labels_layer
             self.viewer.status = (
-                "Erase active class"
-                if active is None
-                else f"Erase {active}: {self.class_map.get(active, active)}"
+                "Erase visible/top annotations; underlying overlaps will be "
+                "revealed."
             )
             self._update_project_controls()
             return
@@ -2067,7 +2370,10 @@ class LabelEditorWidget(QWidget):
         self,
     ) -> Optional[tuple[Path, Optional[FileIdentity], bool]]:
         """Return a guarded Save As target, or ``None`` after cancellation."""
-        if self.labels_path is not None:
+        draft = self.save_destination_line.text().strip()
+        if draft and self._save_destination_draft_changed():
+            initial = Path(draft).expanduser()
+        elif self.labels_path is not None:
             original = self.labels_path
             initial = original.with_name(
                 f"{original.stem}-copy{original.suffix.lower()}"
@@ -2089,6 +2395,24 @@ class LabelEditorWidget(QWidget):
                 "unsaved."
             )
             return None
+
+        # The native save dialog confirms an existing-file replacement. The
+        # identity is still captured below and rechecked by the atomic writer.
+        return self._prepare_save_as_destination(
+            selected,
+            confirm_existing=False,
+        )
+
+    def _prepare_save_as_destination(
+        self,
+        selected: str,
+        *,
+        confirm_existing: bool,
+    ) -> Optional[tuple[Path, Optional[FileIdentity], bool]]:
+        """Validate one typed/dialog Save As target without adopting it."""
+        selected = str(selected).strip()
+        if not selected:
+            raise ValueError("Enter a PNG or TIFF save destination.")
 
         candidate = Path(selected).expanduser()
         if not candidate.suffix:
@@ -2131,7 +2455,7 @@ class LabelEditorWidget(QWidget):
         # original protections.
         if (
             self.labels_path is not None
-            and destination == self.labels_path
+            and self._paths_are_same_file(destination, self.labels_path)
             and not self._destination_identity_matches(
                 self.labels_path,
                 self._labels_destination_identity,
@@ -2146,17 +2470,56 @@ class LabelEditorWidget(QWidget):
             (self.mapping_path, "loaded class mapping CSV"),
         )
         for protected_path, description in protected_destinations:
-            if protected_path is not None and destination == protected_path:
+            if protected_path is not None and self._paths_are_same_file(
+                destination,
+                protected_path,
+            ):
                 raise ValueError(
                     f"Save As cannot overwrite the {description}: "
                     f"{protected_path}"
                 )
 
+        # Recheck after resolving a final symlink. A path named ``copy.tif``
+        # must not smuggle an unsupported referent into the image writer.
+        if destination.suffix.lower() not in {".png", ".tif", ".tiff"}:
+            raise ValueError(
+                "Save As requires a PNG, TIF, or TIFF label destination."
+            )
+
         self._validate_class_ids_for_destination(
             destination,
             self.class_map,
         )
+        if expected_identity is not None and confirm_existing:
+            buttons = getattr(QMessageBox, "StandardButton", QMessageBox)
+            yes_button = getattr(buttons, "Yes")
+            no_button = getattr(buttons, "No")
+            answer = QMessageBox.question(
+                self,
+                "Replace existing label file?",
+                "The save destination already exists:\n\n"
+                f"{destination}\n\nReplace this verified file with the "
+                "current annotations?",
+                yes_button | no_button,
+                no_button,
+            )
+            if answer != yes_button:
+                self.viewer.status = (
+                    "Save As cancelled; the existing file and current "
+                    "annotations were left unchanged."
+                )
+                return None
         return destination, expected_identity, require_absent
+
+    @staticmethod
+    def _paths_are_same_file(first: Path, second: Path) -> bool:
+        """Compare path aliases conservatively without requiring existence."""
+        if first == second:
+            return True
+        try:
+            return first.samefile(second)
+        except OSError:
+            return False
 
     def _save_output_dtype_for_destination(
         self,
@@ -2211,14 +2574,22 @@ class LabelEditorWidget(QWidget):
         # A pending deletion with a missing/replaced mapping is also rescued
         # to a self-contained label image.  Save As never writes the suspect
         # CSV; its pending state remains visible for a later explicit retry.
+        typed_save_as = self._save_destination_draft_changed()
         use_save_as = (
             force_save_as
+            or typed_save_as
             or not normal_destination_available
             or not mapping_available
         )
         if use_save_as:
             try:
-                chosen = self._choose_save_as_destination()
+                if typed_save_as and not force_save_as:
+                    chosen = self._prepare_save_as_destination(
+                        self.save_destination_line.text(),
+                        confirm_existing=True,
+                    )
+                else:
+                    chosen = self._choose_save_as_destination()
             except (OSError, TypeError, ValueError, RuntimeError) as error:
                 self.viewer.status = f"Save As failed: {error}"
                 QMessageBox.critical(self, "Save As failed", str(error))
@@ -2228,6 +2599,11 @@ class LabelEditorWidget(QWidget):
                 self._update_project_controls()
                 return
             destination, expected_identity, require_absent = chosen
+            # This is only the editable draft. The authoritative save target,
+            # identity, and dtype are adopted in _on_save_complete after the
+            # worker result is independently verified.
+            self.save_destination_line.setText(str(destination))
+            self.save_destination_line.setCursorPosition(0)
         else:
             destination = self.labels_path
             expected_identity = self._labels_destination_identity
@@ -2359,7 +2735,8 @@ class LabelEditorWidget(QWidget):
             self.labels_path = saved_path
             if self._active_save_output_dtype is not None:
                 self._labels_output_dtype = self._active_save_output_dtype
-            self.label_line.setText(str(saved_path))
+            self.save_destination_line.setText(str(saved_path))
+            self.save_destination_line.setCursorPosition(0)
 
         if (
             self._class_config_pending_save

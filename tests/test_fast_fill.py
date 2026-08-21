@@ -274,8 +274,16 @@ class FastFillTest(unittest.TestCase):
         np.testing.assert_array_equal(layer.data, expected)
         self.assertIs(layer.fill.__func__, overlap_fill)
 
-    def test_overlap_erase_removes_only_clicked_active_component(self):
-        composite = np.full((4, 6), 2, dtype=np.uint8)
+    def test_overlap_erase_follows_clicked_visible_semantic_component(self):
+        composite = np.array(
+            [
+                [2, 2, 0, 0, 3, 3],
+                [2, 0, 0, 0, 3, 0],
+                [0, 0, 0, 0, 0, 0],
+                [4, 4, 0, 0, 0, 0],
+            ],
+            dtype=np.uint8,
+        )
         active = np.array(
             [
                 [1, 1, 0, 0, 1, 1],

@@ -36,7 +36,7 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * Automatic multiscale display for large RGB images
 * Non-blocking, atomic saves that keep the interface responsive
 * Save the ordinary 2-D projection and lossless overlap data together inside
-  the original PNG or TIFF—no sidecar files
+  the chosen PNG or TIFF—no sidecar files
 
 ---
 
@@ -54,11 +54,11 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * Same width and height as the histology image
 * Label value `0` is reserved for background
 
-Existing ordinary 2-D masks load normally. Once **Save** is pressed, the same
-imported PNG or TIFF still contains an ordinary 2-D top-class projection, so
-standard image readers can open it as before. The plugin also embeds every
-class membership, the currently visible class at each pixel, and the class
-metadata inside that one file. It does not create a sidecar file.
+Existing ordinary 2-D masks load normally. Once **Save** is pressed, the
+chosen PNG or TIFF contains an ordinary 2-D top-class projection, so standard
+image readers can open it as before. The plugin also embeds every class
+membership, the currently visible class at each pixel, and the class metadata
+inside that one file. It does not create a sidecar file.
 
 PNG label images support class IDs through `65535`. Use TIFF when class IDs
 need to be larger than `65535`.
@@ -171,6 +171,18 @@ The plugin will display:
 * one shortcut button for every class
 * a shortcut button for **Background**
 
+The napari layer list uses three purpose-based names:
+
+* **Annotation tools — value: name** is the transparent working layer that
+  keeps napari's Paint, Fill, Erase, Polygon, Pick, and Undo tools available;
+* **Annotations** is the visible top-class result generated from the lossless
+  overlap model; and
+* **Histology** is the tissue image underneath.
+
+Keep **Annotation tools** selected while drawing. Its transparency is
+intentional; use the plugin's **Annotation opacity** control directly below
+**Load** to change how strongly the visible **Annotations** layer is shown.
+
 Hover over the label overlay to see the label value and class name at the
 cursor (for example, `Label: 3 — Tumor`). The overlay can remain visible while
 using this readout.
@@ -191,11 +203,14 @@ Example:
 
 The selected class becomes the active annotation class.
 
-To erase the active class membership, click
+The native **Erase** tool always removes the visible/top annotation, regardless
+of which class is active. You can also click
 
 ```
 0: Background
 ```
+
+and use Paint or Fill to erase.
 
 ## Adding, editing, or deleting a class
 
@@ -240,12 +255,14 @@ top class only at pixels touched by that edit. Repainting a class that is
 already present brings it back to the top at the touched pixels without
 creating a duplicate membership.
 
-Erase removes only the active class membership. If another class is present at
-the same pixel, it is revealed instead of being deleted. When several hidden
-memberships remain, the revealed class follows a stable saved fallback order.
-The format preserves every membership and the current visible top class, but it
-does not store a complete chronological stack of every past paint operation at
-each pixel.
+Erase removes the currently visible/top class at every touched pixel,
+regardless of which class button is active. If another class is present
+underneath, it is revealed instead of being deleted. One brush stroke removes
+at most one overlapping level from each pixel, even if napari reports the same
+pixel more than once while dragging. When several hidden memberships remain,
+the revealed class follows a stable saved fallback order. The format preserves
+every membership and the current visible top class, but it does not store a
+complete chronological stack of every past paint operation at each pixel.
 
 The Pick tool uses the visible semantic projection: picking a displayed class
 selects that semantic class rather than the internal binary edit value.
@@ -282,8 +299,9 @@ Either
 * choose the **Erase** tool, or
 * select **Background** and use the Fill tool.
 
-Only the active class membership is removed; a hidden class underneath it is
-revealed.
+The visible/top membership is removed regardless of the active class. A hidden
+class underneath it is revealed. Background Fill applies the same rule to the
+clicked visible component.
 
 ---
 
@@ -294,9 +312,10 @@ Classes already present in the polygon remain stored underneath it.
 
 ---
 
-# Adjusting Overlay Visibility
+# Adjusting Annotation Visibility
 
-Use the plugin's **Overlay opacity** slider to adjust the visible annotations.
+Use the plugin's **Annotation opacity** slider directly below **Load** to
+adjust the visible annotations.
 The napari Labels controls operate on a transparent editing proxy; its opacity
 is forced to zero so it cannot cover the semantic composite.
 
@@ -318,12 +337,14 @@ or click
 Save
 ```
 
-The edited annotations are written back to the exact PNG or TIFF selected by
-the last successful **Load**. Saving runs in the background, temporarily pauses
-editing, and atomically replaces the old file only after the new image is
-complete. **Save As…** can preserve the complete in-memory annotation state in
-a different PNG or TIFF. Wait for the status bar to say that saving finished
-before closing napari.
+The editable **Save destination** field is prefilled with the PNG or TIFF from
+the last successful **Load**. Leave it unchanged for a normal Save, or type a
+different PNG/TIFF path and press **Save** to perform a guarded Save As. A new
+path is adopted only after the complete file has been written and verified;
+an existing file requires confirmation and is checked again before it is
+replaced. The separate **Save As…** button opens the same safe workflow in a
+file chooser. Wait for the status bar to say that saving finished before
+closing napari.
 
 The saved file contains two views of the same annotations:
 
@@ -333,7 +354,7 @@ The saved file contains two views of the same annotations:
   top class, saved fallback order, names, and colors needed for an exact plugin
   reload.
 
-Both views stay inside the original file. No `.npz`, auxiliary mask, or other
+Both views stay inside the chosen file. No `.npz`, auxiliary mask, or other
 sidecar is created. Paint, Polygon, Fill, Erase, and overlap-order changes do
 not alter this file until **Save** is pressed.
 
@@ -347,11 +368,11 @@ If a class deletion is pending, **Save** first commits the lossless label image
 and then updates the class mapping CSV. Until **Save** is pressed, a pending
 deletion changes neither file on disk.
 
-The exact canonical file used by Save is always shown in the read-only
-**Current save destination** field. Browsing to or typing different project
-paths does not silently redirect a save. Until the new files pass **Load**, the
-canvas and Save action still belong to the previous project and the current
-destination remains visible. Loading is disabled while a save is running.
+The label path under **Label image to load** remains the input project file.
+Editing **Save destination** changes only the requested output path; it never
+changes the loaded canvas or silently redirects a write. If a typed Save As is
+cancelled or fails, the original target and all in-memory annotations remain
+available. Loading and editing are paused only while a save is running.
 
 Save is never disabled merely because the original destination was moved,
 deleted, or replaced. In that situation the button changes to **Save As…** and
@@ -410,8 +431,8 @@ napari workflow.
 * Zoom in before editing fine structures.
 * Use **Fill** for correcting entire objects.
 * Use **Background + Fill** to quickly remove incorrectly labeled objects.
-* Reduce overlay opacity when tracing difficult boundaries.
-* Keep the Histology layer below the Labels layer for the clearest visualization.
+* Reduce **Annotation opacity** when tracing difficult boundaries.
+* Keep **Histology** below **Annotations** for the clearest visualization.
 
 ---
 

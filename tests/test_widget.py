@@ -12,7 +12,7 @@ import pandas as pd
 from napari.components import ViewerModel
 from napari.layers import Labels
 from napari.layers.labels._labels_constants import Mode
-from qtpy.QtWidgets import QApplication
+from qtpy.QtWidgets import QApplication, QMessageBox
 
 from napari_histo_label_editor._embedded_annotations import (
     read_embedded_annotations,
@@ -191,9 +191,9 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(
                 [layer.name for layer in viewer.layers],
                 [
-                    "histology",
-                    "labels — all classes",
-                    "active class — 1: tumor",
+                    "Histology",
+                    "Annotations",
+                    "Annotation tools — 1: tumor",
                 ],
             )
             self.assertFalse(viewer.layers[0].multiscale)
@@ -493,6 +493,271 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertTrue(widget.save_btn.isEnabled())
             self.assertEqual(widget.save_btn.text(), "Save As… [s]")
 
+    def test_editable_destination_saves_directly_without_changing_load_input(
+        self,
+    ):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            source_bytes = labels_path.read_bytes()
+            source_input = widget.label_line.text()
+            typed_destination = root / "typed-copy.tif"
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+
+            self.assertFalse(widget.save_destination_line.isReadOnly())
+            self.assertTrue(widget.save_destination_line.isEnabled())
+            self.assertEqual(
+                widget.save_destination_line.text(),
+                str(labels_path.resolve()),
+            )
+
+            widget.save_destination_line.setText(str(typed_destination))
+
+            self.assertEqual(widget.save_btn.text(), "Save As [s]")
+            self.assertEqual(widget.label_line.text(), source_input)
+            self.assertTrue(widget.class_button_container.isEnabled())
+            with patch(
+                "napari_histo_label_editor._widget.QFileDialog.getSaveFileName"
+            ) as save_as_dialog:
+                widget.save_labels()
+                self.wait_for_save(widget)
+
+            save_as_dialog.assert_not_called()
+            self.assertEqual(labels_path.read_bytes(), source_bytes)
+            self.assertEqual(widget.labels_path, typed_destination.resolve())
+            self.assertEqual(widget._loaded_labels_path, labels_path.resolve())
+            self.assertEqual(widget.label_line.text(), source_input)
+            self.assertEqual(
+                widget.save_destination_line.text(),
+                str(typed_destination.resolve()),
+            )
+            self.assertEqual(widget.save_btn.text(), "Save [s]")
+            projection = iio.imread(typed_destination)
+            self.assertEqual(projection[2, 3], 1)
+            self.assertIsNotNone(read_embedded_annotations(typed_destination))
+
+            widget.labels_layer.data_setitem(
+                (np.array([3]), np.array([4])),
+                1,
+            )
+            with patch(
+                "napari_histo_label_editor._widget.QFileDialog.getSaveFileName"
+            ) as save_as_dialog:
+                widget.save_labels()
+                self.wait_for_save(widget)
+            save_as_dialog.assert_not_called()
+            self.assertEqual(iio.imread(typed_destination)[3, 4], 1)
+
+    def test_typed_existing_destination_requires_confirmation_and_cancel_is_safe(
+        self,
+    ):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            existing = root / "existing.tif"
+            external = np.full((8, 10), 47, dtype=np.uint8)
+            iio.imwrite(existing, external)
+            external_bytes = existing.read_bytes()
+            adopted_path = widget.labels_path
+            adopted_identity = widget._labels_destination_identity
+            adopted_dtype = widget._labels_output_dtype
+            source_input = widget.label_line.text()
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+            widget.save_destination_line.setText(str(existing))
+
+            buttons = getattr(QMessageBox, "StandardButton", QMessageBox)
+            with patch(
+                "napari_histo_label_editor._widget.QMessageBox.question",
+                return_value=getattr(buttons, "No"),
+            ) as confirmation, patch(
+                "napari_histo_label_editor._widget.create_worker"
+            ) as create_worker:
+                widget.save_labels()
+
+            confirmation.assert_called_once()
+            create_worker.assert_not_called()
+            self.assertEqual(existing.read_bytes(), external_bytes)
+            np.testing.assert_array_equal(iio.imread(existing), external)
+            self.assertEqual(widget.labels_path, adopted_path)
+            self.assertEqual(
+                widget._labels_destination_identity,
+                adopted_identity,
+            )
+            self.assertEqual(widget._labels_output_dtype, adopted_dtype)
+            self.assertEqual(widget.label_line.text(), source_input)
+            self.assertEqual(
+                widget.save_destination_line.text(),
+                str(existing),
+            )
+            self.assertEqual(widget.labels_layer.data[2, 3], 1)
+            self.assertEqual(labels_path.resolve(), adopted_path)
+
+    def test_confirmed_typed_existing_destination_is_verified_and_adopted(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            existing = root / "existing.tif"
+            iio.imwrite(existing, np.full((8, 10), 52, dtype=np.uint8))
+            source_bytes = labels_path.read_bytes()
+            source_input = widget.label_line.text()
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+            widget.save_destination_line.setText(str(existing))
+            buttons = getattr(QMessageBox, "StandardButton", QMessageBox)
+
+            with patch(
+                "napari_histo_label_editor._widget.QMessageBox.question",
+                return_value=getattr(buttons, "Yes"),
+            ) as confirmation:
+                widget.save_labels()
+                self.wait_for_save(widget)
+
+            confirmation.assert_called_once()
+            self.assertEqual(labels_path.read_bytes(), source_bytes)
+            self.assertEqual(widget.labels_path, existing.resolve())
+            self.assertEqual(widget.label_line.text(), source_input)
+            self.assertEqual(widget._loaded_labels_path, labels_path.resolve())
+            self.assertEqual(
+                widget.save_destination_line.text(),
+                str(existing.resolve()),
+            )
+            projection = iio.imread(existing)
+            self.assertEqual(projection[2, 3], 1)
+            self.assertIsNotNone(read_embedded_annotations(existing))
+
+    def test_typed_existing_destination_race_preserves_external_winner(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            existing = root / "existing.tif"
+            iio.imwrite(existing, np.full((8, 10), 7, dtype=np.uint8))
+            external_winner = np.full((8, 10), 83, dtype=np.uint8)
+            adopted_path = widget.labels_path
+            adopted_identity = widget._labels_destination_identity
+            source_bytes = labels_path.read_bytes()
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+            widget.save_destination_line.setText(str(existing))
+            buttons = getattr(QMessageBox, "StandardButton", QMessageBox)
+
+            def replace_during_confirmation(*args):
+                del args
+                replacement = root / "external-winner.tif"
+                iio.imwrite(replacement, external_winner)
+                os.replace(replacement, existing)
+                return getattr(buttons, "Yes")
+
+            with patch(
+                "napari_histo_label_editor._widget.QMessageBox.question",
+                side_effect=replace_during_confirmation,
+            ), patch(
+                "napari_histo_label_editor._widget.QMessageBox.critical"
+            ):
+                widget.save_labels()
+                self.wait_for_save(widget)
+
+            np.testing.assert_array_equal(iio.imread(existing), external_winner)
+            self.assertEqual(labels_path.read_bytes(), source_bytes)
+            self.assertEqual(widget.labels_path, adopted_path)
+            self.assertEqual(
+                widget._labels_destination_identity,
+                adopted_identity,
+            )
+            self.assertEqual(
+                widget.save_destination_line.text(),
+                str(existing.resolve()),
+            )
+            self.assertEqual(widget.labels_layer.data[2, 3], 1)
+            self.assertIn("changed since", widget.viewer.status)
+
+    def test_typed_new_destination_race_never_overwrites_intruder(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            destination = root / "new-target.tif"
+            external_winner = np.full((8, 10), 91, dtype=np.uint8)
+            adopted_path = widget.labels_path
+            adopted_identity = widget._labels_destination_identity
+            source_bytes = labels_path.read_bytes()
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+            widget.save_destination_line.setText(str(destination))
+            real_link = os.link
+
+            def create_intruder_then_link(source, target):
+                iio.imwrite(target, external_winner)
+                return real_link(source, target)
+
+            with patch(
+                "napari_histo_label_editor._io.os.link",
+                side_effect=create_intruder_then_link,
+            ), patch(
+                "napari_histo_label_editor._widget.QMessageBox.critical"
+            ):
+                widget.save_labels()
+                self.wait_for_save(widget)
+
+            np.testing.assert_array_equal(
+                iio.imread(destination),
+                external_winner,
+            )
+            self.assertEqual(labels_path.read_bytes(), source_bytes)
+            self.assertEqual(widget.labels_path, adopted_path)
+            self.assertEqual(
+                widget._labels_destination_identity,
+                adopted_identity,
+            )
+            self.assertEqual(
+                widget.save_destination_line.text(),
+                str(destination.resolve()),
+            )
+            self.assertEqual(widget.labels_layer.data[2, 3], 1)
+            self.assertIn("appeared while", widget.viewer.status)
+
+    def test_typed_png_destination_adopts_lossless_promoted_dtype(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(
+                root,
+                labels_dtype=np.int32,
+            )
+            source_input = widget.label_line.text()
+            widget._upsert_class(300, "Large class", "#123456")
+            widget._select_label(300)
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                1,
+            )
+            destination = root / "typed-copy.png"
+            widget.save_destination_line.setText(str(destination))
+
+            widget.save_labels()
+            self.wait_for_save(widget)
+
+            projection = iio.imread(destination)
+            self.assertEqual(projection.dtype, np.dtype(np.uint16))
+            self.assertEqual(projection[2, 3], 300)
+            self.assertEqual(widget._labels_output_dtype, np.dtype(np.uint16))
+            self.assertEqual(widget.labels_path, destination.resolve())
+            self.assertEqual(widget._loaded_labels_path, labels_path.resolve())
+            self.assertEqual(widget.label_line.text(), source_input)
+            payload = read_embedded_annotations(destination)
+            self.assertIsNotNone(payload)
+            restored = OverlapStore.from_payload(payload, projection=projection)
+            self.assertEqual(restored.memberships_at(2, 3), (300,))
+
     def test_save_as_rescues_all_overlaps_and_becomes_next_save_target(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -524,7 +789,8 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertFalse(labels_path.exists())
             self.assertEqual(moved_path.read_bytes(), moved_bytes)
             self.assertEqual(widget.labels_path, rescued_path.resolve())
-            self.assertEqual(widget.label_line.text(), str(rescued_path.resolve()))
+            self.assertEqual(widget.label_line.text(), str(labels_path.resolve()))
+            self.assertEqual(widget._loaded_labels_path, labels_path.resolve())
             self.assertEqual(
                 widget.save_destination_line.text(),
                 str(rescued_path.resolve()),
@@ -840,6 +1106,10 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 (np.array([4]), np.array([5])),
                 1,
             )
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([3])),
+                0,
+            )
             # Native Cmd-Z/Cmd-Shift-Z dispatch directly to these layer
             # methods, so both must obey the same worker ownership lock.
             widget.labels_layer.undo()
@@ -1138,6 +1408,20 @@ class LoadSaveIntegrationTest(unittest.TestCase):
         viewer = ViewerModel()
         empty_widget = LabelEditorWidget(viewer)
         self.assertFalse(empty_widget.overlay_opacity_slider.isEnabled())
+        self.assertEqual(
+            empty_widget.overlay_opacity_label.text(),
+            "Annotation opacity",
+        )
+        layout = empty_widget.layout()
+        load_index = layout.indexOf(empty_widget.load_btn)
+        self.assertIs(
+            layout.itemAt(load_index + 1).layout(),
+            empty_widget.overlay_opacity_layout,
+        )
+        self.assertEqual(
+            layout.itemAt(load_index + 2).widget().text(),
+            "Classes",
+        )
 
         with TemporaryDirectory() as tmp:
             _, widget, _, _ = self.load_small_project(Path(tmp))
@@ -1238,13 +1522,17 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 np.ones((2, 2), dtype=widget.composite_layer.data.dtype),
             )
 
-            # Erasing a hidden A leaves B visible; Undo must not accidentally
-            # promote A when it restores the membership.
+            # The semantic eraser removes visible B even while A is selected,
+            # revealing A without deleting its hidden membership.
             widget.labels_layer.data_setitem(
                 (np.array([6]), np.array([8])),
                 0,
             )
-            self.assertEqual(widget.composite_layer.data[6, 8], 2)
+            self.assertEqual(widget.composite_layer.data[6, 8], 1)
+            self.assertEqual(
+                widget.overlap_store.memberships_at(6, 8),
+                (1,),
+            )
             widget.labels_layer.undo()
             self.assertIn(1, widget.overlap_store.memberships_at(6, 8))
             self.assertIn(2, widget.overlap_store.memberships_at(6, 8))
@@ -1261,6 +1549,499 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(restored.memberships_at(6, 8), (1, 2))
             saved_map, _ = read_class_config(mapping_path)
             self.assertIn(2, saved_map)
+
+    def test_semantic_eraser_mixed_stroke_is_sparse_and_undo_redo_exact(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            base = (np.array([1, 1, 1, 1]), np.array([1, 2, 3, 4]))
+            widget.labels_layer.data_setitem(base, 1)
+            widget._upsert_class(2, "B", "#123456")
+            widget.labels_layer.data_setitem(
+                (np.array([1, 1]), np.array([1, 2])),
+                1,
+            )
+            widget._upsert_class(3, "C", "#abcdef")
+            widget.labels_layer.data_setitem(
+                (np.array([1, 1]), np.array([2, 3])),
+                1,
+            )
+            # Class 25 is intentionally unrelated to every touched semantic
+            # pixel, reproducing the user's active-class mismatch.
+            widget._upsert_class(25, "Unrelated", "#654321")
+            self.assertEqual(widget.overlap_editor.active_class, 25)
+            self.assertFalse(np.any(widget.labels_layer.data))
+            widget._select_label(0)
+            self.assertIn("visible/top", widget.viewer.status)
+            self.assertEqual(
+                widget.labels_layer.features.iloc[0]["Label"],
+                "Erase visible/top annotation",
+            )
+
+            store = widget.overlap_store
+            packed_before = np.array(store.packed_masks, copy=True)
+            projection_before = np.array(store.projection_view, copy=True)
+            edit_before = np.array(widget.labels_layer.data, copy=True)
+            rows = np.array([1, 1, 1, 1, 0, 1])
+            columns = np.array([1, 2, 3, 4, 0, 1])
+
+            with patch.object(
+                store,
+                "select_plane",
+                side_effect=AssertionError("eraser unpacked a full plane"),
+            ), patch.object(
+                store,
+                "project",
+                side_effect=AssertionError("eraser projected the full slide"),
+            ), patch.object(
+                widget.overlap_editor,
+                "full_sync",
+                side_effect=AssertionError("eraser performed a full sync"),
+            ), patch.object(
+                widget,
+                "_refresh_composite_bounds",
+                wraps=widget._refresh_composite_bounds,
+            ) as refresh_bounds:
+                with widget.labels_layer.block_history():
+                    widget.labels_layer.data_setitem((rows, columns), 0)
+                    # A repeated drag callback in the same stroke must not
+                    # peel the newly revealed underlying class.
+                    widget.labels_layer.data_setitem((rows, columns), 0)
+
+            refresh_bounds.assert_called_once_with((0, 2, 0, 5))
+            expected_top = np.array([1, 2, 1, 0], dtype=np.uint8)
+            np.testing.assert_array_equal(
+                widget.composite_layer.data[1, 1:5],
+                expected_top,
+            )
+            self.assertEqual(store.memberships_at(1, 1), (1,))
+            self.assertEqual(store.memberships_at(1, 2), (1, 2))
+            self.assertEqual(store.memberships_at(1, 3), (1,))
+            self.assertEqual(store.memberships_at(1, 4), ())
+            self.assertEqual(store.memberships_at(0, 0), ())
+            np.testing.assert_array_equal(widget.labels_layer.data, edit_before)
+
+            tracker = widget.labels_layer._napari_histo_edit_tracker
+            self.assertEqual(len(widget.labels_layer._undo_history), 1)
+            self.assertEqual(len(tracker.undo_items), 1)
+            packed_after = np.array(store.packed_masks, copy=True)
+            projection_after = np.array(store.projection_view, copy=True)
+
+            widget.labels_layer.undo()
+            np.testing.assert_array_equal(store.packed_masks, packed_before)
+            np.testing.assert_array_equal(
+                store.projection_view,
+                projection_before,
+            )
+            np.testing.assert_array_equal(widget.labels_layer.data, edit_before)
+            self.assertEqual(len(tracker.redo_items), 1)
+
+            widget.labels_layer.redo()
+            np.testing.assert_array_equal(store.packed_masks, packed_after)
+            np.testing.assert_array_equal(
+                store.projection_view,
+                projection_after,
+            )
+            np.testing.assert_array_equal(widget.labels_layer.data, edit_before)
+            self.assertEqual(len(tracker.undo_items), 1)
+
+    def test_semantic_eraser_pairs_active_and_other_tops_with_native_history(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            widget.labels_layer.data_setitem(
+                (np.array([1]), np.array([2])),
+                1,
+            )
+            widget._upsert_class(2, "B", "#123456")
+            widget.labels_layer.data_setitem(
+                (np.array([1]), np.array([2])),
+                1,
+            )
+            widget._select_label(1)
+            store = widget.overlap_store
+            packed_before = np.array(store.packed_masks, copy=True)
+            projection_before = np.array(store.projection_view, copy=True)
+            edit_before = np.array(widget.labels_layer.data, copy=True)
+
+            widget.labels_layer.data_setitem(
+                (np.array([1, 1]), np.array([1, 2])),
+                0,
+            )
+
+            np.testing.assert_array_equal(
+                widget.composite_layer.data[1, 1:3],
+                np.array([0, 1], dtype=np.uint8),
+            )
+            self.assertEqual(store.memberships_at(1, 1), ())
+            self.assertEqual(store.memberships_at(1, 2), (1,))
+            self.assertEqual(widget.labels_layer.data[1, 1], 0)
+            self.assertEqual(widget.labels_layer.data[1, 2], 1)
+            self.assertEqual(len(widget.labels_layer._undo_history), 1)
+
+            packed_after = np.array(store.packed_masks, copy=True)
+            projection_after = np.array(store.projection_view, copy=True)
+            edit_after = np.array(widget.labels_layer.data, copy=True)
+            widget.labels_layer.undo()
+            np.testing.assert_array_equal(store.packed_masks, packed_before)
+            np.testing.assert_array_equal(
+                store.projection_view,
+                projection_before,
+            )
+            np.testing.assert_array_equal(widget.labels_layer.data, edit_before)
+
+            widget.labels_layer.redo()
+            np.testing.assert_array_equal(store.packed_masks, packed_after)
+            np.testing.assert_array_equal(
+                store.projection_view,
+                projection_after,
+            )
+            np.testing.assert_array_equal(widget.labels_layer.data, edit_after)
+
+    def test_semantic_eraser_controller_failure_rolls_back_native_state(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            layer = widget.labels_layer
+            tracker = layer._napari_histo_edit_tracker
+            store = widget.overlap_store
+            layer._reset_history()
+            tracker.clear()
+            binary_before = np.array(layer.data, copy=True)
+            packed_before = np.array(store.packed_masks, copy=True)
+            projection_before = np.array(store.projection_view, copy=True)
+            hash_before = store.projection_sha256
+            generation_before = store.generation
+            native_before = (
+                tuple(map(id, layer._undo_history)),
+                tuple(map(id, layer._redo_history)),
+                tuple(map(id, layer._staged_history)),
+            )
+            custom_before = (
+                tuple(map(id, tracker.undo_items)),
+                tuple(map(id, tracker.redo_items)),
+                tuple(map(id, tracker.staged)),
+            )
+
+            with patch.object(
+                widget.overlap_editor,
+                "erase_visible_indices",
+                side_effect=MemoryError("forced controller failure"),
+            ):
+                with self.assertRaisesRegex(MemoryError, "forced controller"):
+                    layer.data_setitem(
+                        (np.array([1]), np.array([1])),
+                        0,
+                    )
+
+            np.testing.assert_array_equal(layer.data, binary_before)
+            np.testing.assert_array_equal(store.packed_masks, packed_before)
+            np.testing.assert_array_equal(
+                store.projection_view,
+                projection_before,
+            )
+            self.assertEqual(store.projection_sha256, hash_before)
+            self.assertEqual(store.generation, generation_before)
+            self.assertEqual(
+                (
+                    tuple(map(id, layer._undo_history)),
+                    tuple(map(id, layer._redo_history)),
+                    tuple(map(id, layer._staged_history)),
+                ),
+                native_before,
+            )
+            self.assertEqual(
+                (
+                    tuple(map(id, tracker.undo_items)),
+                    tuple(map(id, tracker.redo_items)),
+                    tuple(map(id, tracker.staged)),
+                ),
+                custom_before,
+            )
+
+    def test_failed_later_erase_callback_commits_prior_staged_action(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            layer = widget.labels_layer
+            tracker = layer._napari_histo_edit_tracker
+            layer.data_setitem(
+                (np.array([1]), np.array([2])),
+                1,
+            )
+            layer._reset_history()
+            tracker.clear()
+            native_erase = widget.overlap_editor.erase_visible_indices
+            calls = 0
+
+            def fail_second(indices):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    raise MemoryError("forced second callback failure")
+                return native_erase(indices)
+
+            with patch.object(
+                widget.overlap_editor,
+                "erase_visible_indices",
+                side_effect=fail_second,
+            ):
+                with self.assertRaisesRegex(MemoryError, "second callback"):
+                    with layer.block_history():
+                        layer.data_setitem(
+                            (np.array([1]), np.array([1])),
+                            0,
+                        )
+                        layer.data_setitem(
+                            (np.array([1]), np.array([2])),
+                            0,
+                        )
+
+            self.assertEqual(widget.composite_layer.data[1, 1], 0)
+            self.assertEqual(widget.composite_layer.data[1, 2], 1)
+            self.assertEqual(layer.data[1, 1], 0)
+            self.assertEqual(layer.data[1, 2], 1)
+            self.assertFalse(layer._staged_history)
+            self.assertFalse(tracker.staged)
+            self.assertEqual(len(layer._undo_history), 1)
+            self.assertEqual(len(tracker.undo_items), 1)
+
+            layer.undo()
+            self.assertEqual(widget.composite_layer.data[1, 1], 1)
+            self.assertEqual(widget.composite_layer.data[1, 2], 1)
+            self.assertEqual(layer.data[1, 1], 1)
+            self.assertEqual(layer.data[1, 2], 1)
+
+    def test_erase_seen_memory_failure_keeps_aligned_undoable_action(self):
+        class FailingSet(set):
+            def update(self, *args, **kwargs):
+                raise MemoryError("forced seen-set failure")
+
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            layer = widget.labels_layer
+            tracker = layer._napari_histo_edit_tracker
+            layer.data_setitem(
+                (np.array([1]), np.array([2])),
+                1,
+            )
+            layer._reset_history()
+            tracker.clear()
+            tracker.semantic_erase_seen = FailingSet()
+            layer.mode = Mode.ERASE
+
+            with layer.block_history():
+                layer.data_setitem(
+                    (np.array([1]), np.array([1])),
+                    0,
+                )
+                self.assertTrue(tracker.semantic_erase_dedup_exhausted)
+                # The safe fallback ends this stroke instead of risking a
+                # second-level peel without retained dedup coordinates.
+                layer.data_setitem(
+                    (np.array([1]), np.array([2])),
+                    0,
+                )
+
+            self.assertEqual(widget.composite_layer.data[1, 1], 0)
+            self.assertEqual(widget.composite_layer.data[1, 2], 1)
+            self.assertEqual(len(layer._undo_history), 1)
+            self.assertEqual(len(tracker.undo_items), 1)
+            layer.undo()
+            self.assertEqual(widget.composite_layer.data[1, 1], 1)
+            self.assertEqual(layer.data[1, 1], 1)
+
+    def test_history_refresh_failure_completes_semantic_transition(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            layer = widget.labels_layer
+            tracker = layer._napari_histo_edit_tracker
+            store = widget.overlap_store
+            layer.data_setitem(
+                (np.array([1]), np.array([1])),
+                0,
+            )
+
+            with patch.object(
+                widget,
+                "_refresh_composite_bounds",
+                side_effect=MemoryError("forced display failure"),
+            ):
+                layer.undo()
+            self.assertEqual(layer.data[1, 1], 1)
+            self.assertEqual(store.memberships_at(1, 1), (1,))
+            self.assertEqual(store.projection_view[1, 1], 1)
+            self.assertEqual(len(layer._undo_history), 0)
+            self.assertEqual(len(layer._redo_history), 1)
+            self.assertEqual(len(tracker.undo_items), 0)
+            self.assertEqual(len(tracker.redo_items), 1)
+            self.assertIn("display could not refresh", widget.viewer.status)
+
+            with patch.object(
+                widget,
+                "_refresh_composite_bounds",
+                side_effect=MemoryError("forced display failure"),
+            ):
+                layer.redo()
+            self.assertEqual(layer.data[1, 1], 0)
+            self.assertEqual(store.memberships_at(1, 1), ())
+            self.assertEqual(store.projection_view[1, 1], 0)
+            self.assertEqual(len(layer._undo_history), 1)
+            self.assertEqual(len(layer._redo_history), 0)
+            self.assertEqual(len(tracker.undo_items), 1)
+            self.assertEqual(len(tracker.redo_items), 0)
+
+    def test_semantic_undo_redo_failure_is_an_exact_no_op(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            layer = widget.labels_layer
+            tracker = layer._napari_histo_edit_tracker
+            store = widget.overlap_store
+            layer.data_setitem(
+                (np.array([1]), np.array([2])),
+                1,
+            )
+            layer._reset_history()
+            tracker.clear()
+            with layer.block_history():
+                layer.data_setitem(
+                    (np.array([1]), np.array([1])),
+                    0,
+                )
+                layer.data_setitem(
+                    (np.array([1]), np.array([2])),
+                    0,
+                )
+
+            def snapshot():
+                return {
+                    "binary": np.array(layer.data, copy=True),
+                    "packed": np.array(store.packed_masks, copy=True),
+                    "projection": np.array(store.projection_view, copy=True),
+                    "hash": store.projection_sha256,
+                    "generation": store.generation,
+                    "native_undo": tuple(map(id, layer._undo_history)),
+                    "native_redo": tuple(map(id, layer._redo_history)),
+                    "custom_undo": tuple(map(id, tracker.undo_items)),
+                    "custom_redo": tuple(map(id, tracker.redo_items)),
+                }
+
+            def assert_snapshot(expected):
+                np.testing.assert_array_equal(layer.data, expected["binary"])
+                np.testing.assert_array_equal(
+                    store.packed_masks,
+                    expected["packed"],
+                )
+                np.testing.assert_array_equal(
+                    store.projection_view,
+                    expected["projection"],
+                )
+                self.assertEqual(store.projection_sha256, expected["hash"])
+                self.assertEqual(store.generation, expected["generation"])
+                self.assertEqual(
+                    tuple(map(id, layer._undo_history)),
+                    expected["native_undo"],
+                )
+                self.assertEqual(
+                    tuple(map(id, layer._redo_history)),
+                    expected["native_redo"],
+                )
+                self.assertEqual(
+                    tuple(map(id, tracker.undo_items)),
+                    expected["custom_undo"],
+                )
+                self.assertEqual(
+                    tuple(map(id, tracker.redo_items)),
+                    expected["custom_redo"],
+                )
+
+            def fail_second_restore(native_restore):
+                calls = 0
+
+                def restore(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls >= 2:
+                        raise MemoryError("forced persistent history failure")
+                    return native_restore(*args, **kwargs)
+
+                return restore
+
+            erased = snapshot()
+            native_restore = widget.overlap_editor.restore_erased_indices
+            with patch.object(
+                widget.overlap_editor,
+                "restore_erased_indices",
+                side_effect=fail_second_restore(native_restore),
+            ), self.assertRaisesRegex(MemoryError, "persistent history"):
+                layer.undo()
+            assert_snapshot(erased)
+
+            layer.undo()
+            restored = snapshot()
+            with patch.object(
+                widget.overlap_editor,
+                "restore_erased_indices",
+                side_effect=fail_second_restore(native_restore),
+            ), self.assertRaisesRegex(MemoryError, "persistent history"):
+                layer.redo()
+            assert_snapshot(restored)
+
+            layer.redo()
+            np.testing.assert_array_equal(store.packed_masks, erased["packed"])
+            np.testing.assert_array_equal(
+                store.projection_view,
+                erased["projection"],
+            )
+
+    def test_fill_erase_removes_visible_component_with_unrelated_active_class(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            rows, columns = np.indices((3, 3))
+            class_one = (rows.reshape(-1) + 1, columns.reshape(-1) + 1)
+            center = (np.array([2]), np.array([2]))
+            widget.labels_layer.data_setitem(class_one, 1)
+            widget._upsert_class(2, "B", "#123456")
+            widget.labels_layer.data_setitem(center, 1)
+            widget._upsert_class(25, "Unrelated", "#654321")
+            self.assertFalse(np.any(widget.labels_layer.data))
+            tracker = widget.labels_layer._napari_histo_edit_tracker
+            widget.labels_layer.mode = Mode.FILL
+
+            with widget.labels_layer.block_history():
+                widget.labels_layer.fill((2, 2), 0)
+                self.assertFalse(tracker.semantic_erase_seen)
+                self.assertTrue(tracker.semantic_erase_compact_done)
+                # After B is removed, the clicked A component expands from
+                # one pixel to 3x3. A second callback in the same Fill action
+                # must not peel that newly revealed underlying component.
+                widget.labels_layer.fill((2, 2), 0)
+                self.assertFalse(tracker.semantic_erase_seen)
+                self.assertTrue(tracker.semantic_erase_compact_done)
+
+            np.testing.assert_array_equal(
+                widget.composite_layer.data[1:4, 1:4],
+                np.ones((3, 3), dtype=np.uint8),
+            )
+            self.assertEqual(
+                widget.overlap_store.memberships_at(2, 2),
+                (1,),
+            )
+            with patch.object(
+                widget.overlap_editor,
+                "full_sync",
+                side_effect=AssertionError(
+                    "semantic Fill history scanned the full slide"
+                ),
+            ):
+                widget.labels_layer.undo()
+                self.assertEqual(widget.composite_layer.data[2, 2], 2)
+                self.assertEqual(
+                    widget.overlap_store.memberships_at(2, 2),
+                    (1, 2),
+                )
+                self.assertEqual(widget.composite_layer.data[1, 1], 1)
+                widget.labels_layer.redo()
+                np.testing.assert_array_equal(
+                    widget.composite_layer.data[1:4, 1:4],
+                    np.ones((3, 3), dtype=np.uint8),
+                )
 
     def test_pick_uses_visible_semantic_class_without_binary_id_leak(self):
         with TemporaryDirectory() as tmp:
@@ -1691,16 +2472,17 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             external_mapping_bytes = external_mapping_path.read_bytes()
             os.replace(external_mapping_path, mapping_path)
             rescued_path = root / "rescued-labels.tif"
+            widget.save_destination_line.setText(str(rescued_path))
 
             with patch(
                 "napari_histo_label_editor._widget.QFileDialog.getSaveFileName",
-                return_value=(str(rescued_path), ""),
-            ), patch(
+            ) as save_as_dialog, patch(
                 "napari_histo_label_editor._widget.atomic_write_class_config"
             ) as write_class_config:
                 widget.save_labels()
                 self.wait_for_save(widget)
 
+            save_as_dialog.assert_not_called()
             write_class_config.assert_not_called()
             self.assertEqual(labels_path.read_bytes(), label_bytes_before)
             self.assertEqual(mapping_path.read_bytes(), external_mapping_bytes)
@@ -1708,7 +2490,8 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(iio.imread(rescued_path)[1, 1], 0)
             self.assertIsNotNone(read_embedded_annotations(rescued_path))
             self.assertEqual(widget.labels_path, rescued_path.resolve())
-            self.assertEqual(widget.label_line.text(), str(rescued_path.resolve()))
+            self.assertEqual(widget.label_line.text(), str(labels_path.resolve()))
+            self.assertEqual(widget._loaded_labels_path, labels_path.resolve())
             self.assertTrue(widget._class_config_pending_save)
             self.assertIn("mapping CSV was not changed", widget.viewer.status)
             self.assertEqual(widget.save_btn.text(), "Save As… [s]")

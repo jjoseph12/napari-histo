@@ -246,6 +246,87 @@ class OverlapEditorController:
         changed = self.store.raise_projection_indices(active, normalized)
         return int(changed), bounds
 
+    def erase_visible_indices(
+        self,
+        indices: Any,
+    ) -> tuple[
+        int,
+        tuple[int, int, int, int] | None,
+        np.ndarray,
+        np.ndarray,
+    ]:
+        """Remove each touched pixel's visible semantic membership.
+
+        The selected class does not constrain erasing. Hidden memberships are
+        retained and become visible through the store's stable fallback order.
+        Returned top arrays are sparse history snapshots for exact Undo/Redo.
+        """
+
+        normalized = self.normalize_indices(indices)
+        bounds = self._bounds_for_coordinates(*normalized)
+        rows, columns = normalized
+        removed_active_rows = np.empty(0, dtype=np.intp)
+        removed_active_columns = np.empty(0, dtype=np.intp)
+        if self._active_class is not None and rows.size:
+            removed_active = (
+                self._composite[rows, columns] == self._active_class
+            )
+            removed_active_rows = rows[removed_active]
+            removed_active_columns = columns[removed_active]
+        changed, top_before, top_after = self.store.erase_visible_indices(
+            normalized
+        )
+        if removed_active_rows.size:
+            self._edit_mask[
+                removed_active_rows,
+                removed_active_columns,
+            ] = 0
+        return int(changed), bounds, top_before, top_after
+
+    def restore_erased_indices(
+        self,
+        indices: Any,
+        erased_values: npt.ArrayLike,
+        projection_values: npt.ArrayLike,
+        *,
+        present: bool,
+    ) -> tuple[int, tuple[int, int, int, int] | None]:
+        """Undo or redo one sparse visible-semantic eraser atom."""
+
+        normalized = self.normalize_indices(indices)
+        bounds = self._bounds_for_coordinates(*normalized)
+        erased = np.asarray(erased_values)
+        rows, columns = normalized
+        active_rows = np.empty(0, dtype=np.intp)
+        active_columns = np.empty(0, dtype=np.intp)
+        if self._active_class is not None and erased.size:
+            active = (
+                np.broadcast_to(erased, rows.shape) == self._active_class
+            )
+            active_rows = rows[active]
+            active_columns = columns[active]
+        changed = self.store.restore_erased_indices(
+            normalized,
+            erased,
+            projection_values,
+            present=present,
+        )
+        if active_rows.size:
+            self._edit_mask[active_rows, active_columns] = int(present)
+        return int(changed), bounds
+
+    def snapshot_erased_transaction(self, history):
+        """Capture raw sparse store state before a semantic Undo/Redo."""
+
+        return self.store.snapshot_erased_transaction(
+            (atom[0], atom[3]) for atom in history
+        )
+
+    def restore_erased_transaction(self, snapshot) -> None:
+        """Restore a failed semantic Undo/Redo without fallible validation."""
+
+        self.store.restore_erased_transaction(snapshot)
+
     def projection_values(self, indices: Any) -> np.ndarray:
         """Copy authoritative top values at unique sparse coordinates."""
 

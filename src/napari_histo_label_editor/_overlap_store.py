@@ -753,6 +753,233 @@ class OverlapStore:
         self._mark_modified()
         return count
 
+    def erase_visible_indices(
+        self,
+        indices,
+    ) -> tuple[int, np.ndarray, np.ndarray]:
+        """Remove the currently visible membership at sparse coordinates.
+
+        Each non-background pixel may have a different visible class.  Only
+        that top membership is removed; hidden memberships are preserved and
+        the stable class order supplies the newly revealed top. Coordinates
+        must be unique; the controller collapses duplicates so one callback
+        cannot drill through multiple memberships at the same pixel.
+
+        Returns
+        -------
+        changed : int
+            Number of visible memberships removed.
+        top_before, top_after : numpy.ndarray
+            Sparse projection values aligned with ``indices``.
+        """
+
+        rows, columns = self._sparse_indices(indices)
+        if rows.size:
+            linear = rows.astype(np.intp, copy=False) * self._shape[1]
+            linear = linear + columns.astype(np.intp, copy=False)
+            if np.unique(linear).size != linear.size:
+                raise ValueError("Semantic eraser indices must be unique")
+        top_before = np.array(
+            self._projection[rows, columns],
+            copy=True,
+        )
+        top_after = top_before.copy()
+        erase = top_before != 0
+        if not np.any(erase):
+            return 0, top_before, top_after
+
+        top_after[erase] = 0
+        # z_order is bottom-to-top, so later present memberships overwrite
+        # earlier ones and become the stable revealed fallback. Compute the
+        # complete candidate before mutating packed bits so an allocation
+        # failure cannot leave memberships and projection inconsistent.
+        for value in self._z_order:
+            membership = self._membership_at_indices(value, rows, columns)
+            membership &= ~(erase & (top_before == value))
+            top_after[erase & membership] = value
+        affected_values = np.unique(top_before[erase])
+        packed_snapshot = self._snapshot_membership_bytes(
+            affected_values,
+            rows,
+            columns,
+            selector_values=top_before,
+        )
+        projection_sha256 = self._projection_sha256
+        generation = self._generation
+        try:
+            for raw_value in affected_values:
+                value = int(raw_value)
+                selected = erase & (top_before == value)
+                self._set_membership_at_indices(
+                    value,
+                    rows[selected],
+                    columns[selected],
+                    present=False,
+                )
+            self._projection[rows[erase], columns[erase]] = top_after[erase]
+            self._mark_modified()
+        except BaseException:
+            self._restore_membership_bytes(packed_snapshot)
+            self._projection[rows, columns] = top_before
+            self._projection_sha256 = projection_sha256
+            self._generation = generation
+            raise
+        return int(np.count_nonzero(erase)), top_before, top_after
+
+    def restore_erased_indices(
+        self,
+        indices,
+        erased_values,
+        projection_values,
+        *,
+        present: bool,
+    ) -> int:
+        """Restore or replay sparse semantic eraser history exactly.
+
+        ``present=True`` re-adds the erased memberships for Undo;
+        ``present=False`` removes them for Redo.  The requested projection is
+        validated against the resulting memberships before any packed bits or
+        visible values are changed.
+        """
+
+        if not isinstance(present, (bool, np.bool_)):
+            raise TypeError("present must be a boolean")
+        rows, columns = self._sparse_indices(indices)
+        if rows.size:
+            linear = rows.astype(np.intp, copy=False) * self._shape[1]
+            linear = linear + columns.astype(np.intp, copy=False)
+            if np.unique(linear).size != linear.size:
+                raise ValueError("Semantic eraser history indices must be unique")
+
+        erased = self._sparse_history_values(
+            erased_values,
+            rows.shape,
+            "Erased membership values",
+        )
+        requested = self._sparse_history_values(
+            projection_values,
+            rows.shape,
+            "Projection history values",
+        )
+        for raw_value in np.unique(erased):
+            value = int(raw_value)
+            if value != 0:
+                self._require_class(value)
+        if rows.size == 0:
+            return 0
+
+        occupied = np.zeros(rows.shape, dtype=bool)
+        valid_top = np.zeros(rows.shape, dtype=bool)
+        membership_changed = np.zeros(rows.shape, dtype=bool)
+        for value in self._class_values:
+            membership = self._membership_at_indices(
+                value,
+                rows,
+                columns,
+            )
+            affected = erased == value
+            if np.any(affected):
+                membership_changed[affected] = (
+                    membership[affected] != bool(present)
+                )
+                membership = membership.copy()
+                membership[affected] = bool(present)
+            occupied |= membership
+            valid_top |= membership & (requested == value)
+        if np.any((requested == 0) != ~occupied) or np.any(
+            (requested != 0) & ~valid_top
+        ):
+            raise ValueError(
+                "Semantic eraser history projection does not match "
+                "memberships"
+            )
+
+        affected_values = np.unique(erased[erased != 0])
+        packed_snapshot = self._snapshot_membership_bytes(
+            affected_values,
+            rows,
+            columns,
+            selector_values=erased,
+        )
+        projection_before = np.array(
+            self._projection[rows, columns],
+            copy=True,
+        )
+        projection_sha256 = self._projection_sha256
+        generation = self._generation
+        try:
+            for raw_value in affected_values:
+                value = int(raw_value)
+                selected = erased == value
+                self._set_membership_at_indices(
+                    value,
+                    rows[selected],
+                    columns[selected],
+                    present=bool(present),
+                )
+            projection_changed = projection_before != requested
+            self._projection[rows, columns] = requested
+            changed = membership_changed | projection_changed
+            if np.any(changed):
+                self._mark_modified()
+        except BaseException:
+            self._restore_membership_bytes(packed_snapshot)
+            self._projection[rows, columns] = projection_before
+            self._projection_sha256 = projection_sha256
+            self._generation = generation
+            raise
+        return int(np.count_nonzero(changed))
+
+    def snapshot_erased_transaction(self, changes):
+        """Capture sparse raw state for an atomic multi-atom history action.
+
+        ``changes`` contains ``(indices, erased_values)`` pairs. The opaque
+        return value owns only affected packed bytes and projection pixels;
+        allocation completes before any Undo/Redo atom mutates the store.
+        """
+
+        packed_snapshot = []
+        projection_snapshot = []
+        for indices, erased_values in changes:
+            rows, columns = self._sparse_indices(indices)
+            erased = self._sparse_history_values(
+                erased_values,
+                rows.shape,
+                "Erased membership values",
+            )
+            affected_values = np.unique(erased[erased != 0])
+            packed_snapshot.extend(
+                self._snapshot_membership_bytes(
+                    affected_values,
+                    rows,
+                    columns,
+                    selector_values=erased,
+                )
+            )
+            projection_snapshot.append(
+                (
+                    rows,
+                    columns,
+                    np.array(self._projection[rows, columns], copy=True),
+                )
+            )
+        return (
+            packed_snapshot,
+            projection_snapshot,
+            self._projection_sha256,
+            self._generation,
+        )
+
+    def restore_erased_transaction(self, snapshot) -> None:
+        """Restore an opaque multi-atom snapshot without new allocations."""
+
+        packed, projection, projection_sha256, generation = snapshot
+        self._restore_membership_bytes(packed)
+        for rows, columns, values in projection:
+            self._projection[rows, columns] = values
+        self._projection_sha256 = projection_sha256
+        self._generation = generation
+
     def restore_projection_indices(self, indices, values) -> int:
         """Restore sparse authoritative tops after membership Undo/Redo.
 
@@ -842,6 +1069,102 @@ class OverlapStore:
         ]
         bits = np.left_shift(np.uint8(1), (columns % 8).astype(np.uint8))
         return (packed & bits) != 0
+
+    def _set_membership_at_indices(
+        self,
+        value: int,
+        rows: np.ndarray,
+        columns: np.ndarray,
+        *,
+        present: bool,
+    ) -> None:
+        """Set sparse packed membership bits, accumulating shared bytes."""
+
+        if rows.size == 0:
+            return
+        plane = self._packed_masks[self._require_class(value)]
+        byte_columns = columns // 8
+        bits = np.left_shift(np.uint8(1), (columns % 8).astype(np.uint8))
+        if present:
+            np.bitwise_or.at(plane, (rows, byte_columns), bits)
+        else:
+            np.bitwise_and.at(
+                plane,
+                (rows, byte_columns),
+                np.bitwise_not(bits),
+            )
+
+    def _snapshot_membership_bytes(
+        self,
+        values,
+        rows: np.ndarray,
+        columns: np.ndarray,
+        *,
+        selector_values: np.ndarray,
+    ) -> list[tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
+        """Copy only packed bytes touched by a sparse multi-class change."""
+
+        snapshot = []
+        packed_width = self._packed_masks.shape[2]
+        for raw_value in values:
+            value = int(raw_value)
+            selected = selector_values == value
+            selected_rows = rows[selected]
+            byte_columns = columns[selected] // 8
+            flat_bytes = selected_rows * packed_width + byte_columns
+            unique_bytes = np.unique(flat_bytes)
+            selected_rows = unique_bytes // packed_width
+            byte_columns = unique_bytes % packed_width
+            plane_index = self._require_class(value)
+            packed_values = np.array(
+                self._packed_masks[
+                    plane_index,
+                    selected_rows,
+                    byte_columns,
+                ],
+                copy=True,
+            )
+            snapshot.append(
+                (
+                    plane_index,
+                    selected_rows,
+                    byte_columns,
+                    packed_values,
+                )
+            )
+        return snapshot
+
+    def _restore_membership_bytes(
+        self,
+        snapshot: list[tuple[int, np.ndarray, np.ndarray, np.ndarray]],
+    ) -> None:
+        """Restore a sparse packed-byte snapshot without public setters."""
+
+        for plane_index, rows, byte_columns, packed_values in snapshot:
+            self._packed_masks[
+                plane_index,
+                rows,
+                byte_columns,
+            ] = packed_values
+
+    @staticmethod
+    def _sparse_history_values(values, shape, description: str) -> np.ndarray:
+        array = np.asarray(values)
+        if array.ndim == 0:
+            array = np.full(shape, array, dtype=array.dtype)
+        else:
+            try:
+                array = np.broadcast_to(array, shape)
+            except ValueError as error:
+                raise ValueError(
+                    f"{description} must match sparse indices"
+                ) from error
+        if not (
+            array.dtype == np.dtype(np.bool_)
+            or np.issubdtype(array.dtype, np.integer)
+        ):
+            raise TypeError(f"{description} must be integers")
+        return array
 
     # Short alias for callers that already carry a coordinate tuple.
     def memberships(self, coordinate) -> tuple[int, ...]:

@@ -132,6 +132,119 @@ class OverlapStoreTest(unittest.TestCase):
         )
         self.assertEqual(store.project()[0, 1], 2)
 
+    def test_sparse_semantic_erase_reveals_and_restores_mixed_overlaps(self):
+        _, store = self.make_store()
+        store.update_patch(2, (0, 1), np.ones((1, 2), dtype=np.uint8))
+        store.update_patch(3, (0, 1), np.ones((1, 1), dtype=np.uint8))
+        indices = (np.array([0, 0, 0]), np.array([0, 1, 2]))
+
+        with patch.object(
+            store,
+            "select_plane",
+            side_effect=AssertionError("semantic erase unpacked a plane"),
+        ):
+            changed, top_before, top_after = store.erase_visible_indices(
+                indices
+            )
+
+        self.assertEqual(changed, 2)
+        np.testing.assert_array_equal(top_before, np.array([0, 3, 2]))
+        np.testing.assert_array_equal(top_after, np.array([0, 2, 1]))
+        self.assertEqual(store.memberships_at(0, 0), ())
+        self.assertEqual(store.memberships_at(0, 1), (1, 2))
+        self.assertEqual(store.memberships_at(0, 2), (1,))
+
+        self.assertEqual(
+            store.restore_erased_indices(
+                indices,
+                top_before,
+                top_before,
+                present=True,
+            ),
+            2,
+        )
+        self.assertEqual(store.memberships_at(0, 1), (1, 2, 3))
+        self.assertEqual(store.memberships_at(0, 2), (1, 2))
+        np.testing.assert_array_equal(store.project()[0, :3], top_before)
+
+        self.assertEqual(
+            store.restore_erased_indices(
+                indices,
+                top_before,
+                top_after,
+                present=False,
+            ),
+            2,
+        )
+        np.testing.assert_array_equal(store.project()[0, :3], top_after)
+
+    def test_sparse_semantic_erase_rolls_back_every_failed_setter(self):
+        indices = (np.array([0, 0, 0]), np.array([0, 1, 2]))
+        for fail_at in (1, 2):
+            with self.subTest(fail_at=fail_at):
+                store = OverlapStore.from_legacy(
+                    np.array([[1, 2, 3]], dtype=np.uint8),
+                    {0: "Background", 1: "A", 2: "B", 3: "C"},
+                )
+                snapshot = self.store_snapshot(store)
+                native_setter = store._set_membership_at_indices
+                calls = 0
+
+                def failing_setter(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == fail_at:
+                        raise MemoryError("forced sparse setter failure")
+                    return native_setter(*args, **kwargs)
+
+                with patch.object(
+                    store,
+                    "_set_membership_at_indices",
+                    side_effect=failing_setter,
+                ):
+                    with self.assertRaisesRegex(MemoryError, "forced sparse"):
+                        store.erase_visible_indices(indices)
+
+                self.assert_store_matches_snapshot(store, snapshot)
+
+    def test_sparse_semantic_history_rolls_back_every_failed_setter(self):
+        indices = (np.array([0, 0, 0]), np.array([0, 1, 2]))
+        top_before = np.array([1, 2, 3], dtype=np.uint8)
+        top_after = np.zeros(3, dtype=np.uint8)
+        for fail_at in (1, 2):
+            with self.subTest(fail_at=fail_at):
+                store = OverlapStore.from_legacy(
+                    top_before[np.newaxis, :],
+                    {0: "Background", 1: "A", 2: "B", 3: "C"},
+                )
+                store.erase_visible_indices(indices)
+                snapshot = self.store_snapshot(store)
+                native_setter = store._set_membership_at_indices
+                calls = 0
+
+                def failing_setter(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == fail_at:
+                        raise MemoryError("forced history setter failure")
+                    return native_setter(*args, **kwargs)
+
+                with patch.object(
+                    store,
+                    "_set_membership_at_indices",
+                    side_effect=failing_setter,
+                ):
+                    with self.assertRaisesRegex(MemoryError, "forced history"):
+                        store.restore_erased_indices(
+                            indices,
+                            top_before,
+                            top_before,
+                            present=True,
+                        )
+
+                self.assert_store_matches_snapshot(store, snapshot)
+                np.testing.assert_array_equal(store.project()[0], top_after)
+
     def test_patch_crossing_byte_boundary_does_not_touch_neighbors(self):
         _, store = self.make_store()
         before = store.select_plane(3)

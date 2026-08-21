@@ -102,6 +102,61 @@ class OverlapEditorControllerTest(unittest.TestCase):
         self.assertEqual(controller.composite[4, 4], 1)
         self.assertEqual(store.memberships_at(4, 4), (1,))
 
+    def test_semantic_erase_mixed_tops_preserves_hidden_active_and_restores(self):
+        store = self.make_store()
+        store.update_patch(3, (3, 3), np.ones((1, 1), dtype=np.uint8))
+        controller = OverlapEditorController(store, 1)
+        indices = (
+            np.array([4, 2, 0, 3]),
+            np.array([4, 2, 0, 3]),
+        )
+
+        with patch.object(
+            store,
+            "select_plane",
+            side_effect=AssertionError("semantic erase unpacked a plane"),
+        ), patch.object(
+            store,
+            "project",
+            side_effect=AssertionError("semantic erase projected the slide"),
+        ):
+            changed, bounds, top_before, top_after = (
+                controller.erase_visible_indices(indices)
+            )
+
+        self.assertEqual(changed, 3)
+        self.assertEqual(bounds, (0, 5, 0, 5))
+        np.testing.assert_array_equal(top_before, np.array([0, 1, 3, 2]))
+        np.testing.assert_array_equal(top_after, np.array([0, 0, 2, 1]))
+        self.assertEqual(store.memberships_at(4, 4), (1,))
+        self.assertEqual(store.memberships_at(3, 3), (1, 2))
+        self.assertEqual(controller.edit_mask[4, 4], 1)
+        self.assertEqual(controller.edit_mask[3, 3], 1)
+        self.assertEqual(controller.edit_mask[2, 2], 0)
+
+        changed, _ = controller.restore_erased_indices(
+            controller.normalize_indices(indices),
+            top_before,
+            top_before,
+            present=True,
+        )
+        self.assertEqual(changed, 3)
+        self.assertEqual(store.memberships_at(4, 4), (1, 2))
+        self.assertEqual(store.memberships_at(3, 3), (1, 2, 3))
+        self.assertEqual(controller.edit_mask[2, 2], 1)
+
+        changed, _ = controller.restore_erased_indices(
+            controller.normalize_indices(indices),
+            top_before,
+            top_after,
+            present=False,
+        )
+        self.assertEqual(changed, 3)
+        np.testing.assert_array_equal(
+            controller.projection_values(indices),
+            top_after,
+        )
+
     def test_changed_patch_reads_raw_edit_mask(self):
         store = self.make_store()
         controller = OverlapEditorController(store, 3)

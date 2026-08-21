@@ -346,19 +346,26 @@ def overlap_fill(
     if new_label not in {0, 1}:
         raise ValueError("The active overlap layer accepts only 0 or 1")
 
-    # Erasing is deliberately limited to the connected active membership.
-    # It must not use the lower composite, or it could remove disconnected
-    # active objects that merely reveal the same lower class.
-    if new_label == 0:
-        if int(data[int_coord]) == 0:
-            return
-        fast_fill(layer, int_coord, 0, refresh)
-        return
-
     composite = getattr(layer, "_napari_histo_overlap_composite", None)
     active_value = getattr(layer, "_napari_histo_active_value", None)
     if composite is None or active_value is None:
         raise RuntimeError("Overlap fill is not bound to an active class")
+    composite = np.asarray(composite)
+
+    # Erase follows the actually visible semantic component. The overlap edit
+    # tracker interprets the resulting sparse zero write as "remove each
+    # touched pixel's current top membership", regardless of active class.
+    if new_label == 0:
+        target = int(composite[int_coord])
+        if target == 0:
+            return
+        if layer.contiguous:
+            indices = bounded_flood_indices(composite, int_coord)
+        else:
+            indices = np.nonzero(composite == target)
+        layer.data_setitem(indices, 0, refresh)
+        return
+
     # A 1 in the transparent edit mask may be hidden under another visible
     # class. That is not a completed fill: use the authoritative composite's
     # component so absent neighboring memberships are still painted. Exact
