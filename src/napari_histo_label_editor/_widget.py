@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import warnings
+
 from collections import deque
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,13 +14,16 @@ import pandas as pd
 from PIL import Image
 from napari.qt.threading import create_worker
 from napari.layers.labels._labels_constants import Mode
+from napari.layers.labels._labels_utils import (
+    mouse_event_to_labels_coordinate,
+)
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QLineEdit, QFileDialog, QMessageBox, QGridLayout, 
-    QSizePolicy, QScrollArea, QSlider
+    QAbstractSpinBox, QSizePolicy, QScrollArea, QSpinBox
 )
 from qtpy.QtGui import QColor
-from qtpy.QtCore import Qt 
+from qtpy.QtCore import QTimer, Qt
 from napari.viewer import Viewer
 from napari.utils.colormaps import DirectLabelColormap
 from matplotlib.colors import to_rgba
@@ -45,12 +50,20 @@ from ._io import (
     file_identity,
 )
 from ._overlap_editor import OverlapEditorController
-from ._overlap_store import OverlapStore
+from ._overlap_store import OverlapDelta, OverlapStore
+from ._object_selection import (
+    AnnotationObjectSelection,
+    SelectionTooLargeError,
+    select_visible_component,
+)
 
 Image.MAX_IMAGE_PIXELS = None
 
 MAX_UNDO_HISTORY = 20
 CLASS_SCAN_MASK_BYTES = 8 * 1024 * 1024
+MAX_OBJECT_MOVE_HISTORY_BYTES = 256 * 1024 * 1024
+DEFAULT_ANNOTATION_OPACITY = 0.45
+NATIVE_BRUSH_SIZE_MAX = 512
 
 
 def _tracked_overlap_data_setitem(layer, indices, value, refresh=True):
@@ -140,6 +153,10 @@ class _OverlapEditTracker:
                 "Wait for the current label save to finish before editing."
             )
             return None
+        if self.widget._annotation_selection is not None:
+            # Any pixel edit can split, merge, or retop the connected region.
+            # Clear the preview before coordinates become stale.
+            self.widget._clear_annotation_selection()
         controller = self.widget.overlap_editor
         normalized = controller.normalize_indices(indices)
         value_array = np.asarray(value)
@@ -345,6 +362,87 @@ class _OverlapEditTracker:
         else:
             self.undo_items.append([atom])
 
+    def _move_history_bytes(self) -> int:
+        return sum(
+            atom.nbytes
+            for queue in (self.undo_items, self.redo_items)
+            for history in queue
+            for atom in history
+            if isinstance(atom, OverlapDelta)
+        )
+
+    def move_visible_selection(self, selection, moved):
+        """Apply one planned sparse translation as a paired Undo item."""
+
+        if self.widget._save_worker is not None:
+            raise RuntimeError(
+                "Wait for the current label save to finish before moving."
+            )
+        controller = self.widget.overlap_editor
+        delta = controller.plan_object_move(
+            selection.value,
+            (selection.rows, selection.columns),
+            (
+                int(moved.rows[0] - selection.rows[0]),
+                int(moved.columns[0] - selection.columns[0]),
+            ),
+            expected_revision=selection.store_revision,
+        )
+        if (
+            self._move_history_bytes() + delta.nbytes
+            > MAX_OBJECT_MOVE_HISTORY_BYTES
+        ):
+            raise MemoryError(
+                "Move Undo history reached its safe memory limit. Save and "
+                "reload the project before moving more large regions."
+            )
+
+        native_undo_before = tuple(self.layer._undo_history)
+        native_redo_before = tuple(self.layer._redo_history)
+        custom_undo_before = tuple(self.undo_items)
+        custom_redo_before = tuple(self.redo_items)
+        try:
+            if controller.active_class == delta.value:
+                self.layer._save_history(
+                    (
+                        delta.affected_indices,
+                        delta.membership_before,
+                        delta.membership_after,
+                    )
+                )
+            else:
+                self._add_empty_native_history_atom()
+            self._record(delta)
+            result = controller.apply_overlap_delta(
+                delta,
+                forward=True,
+                expected_revision=selection.store_revision,
+            )
+        except BaseException:
+            self.layer._undo_history.clear()
+            self.layer._undo_history.extend(native_undo_before)
+            self.layer._redo_history.clear()
+            self.layer._redo_history.extend(native_redo_before)
+            self.undo_items.clear()
+            self.undo_items.extend(custom_undo_before)
+            self.redo_items.clear()
+            self.redo_items.extend(custom_redo_before)
+            raise
+
+        # Source and destination may be far apart. Two bounded uploads avoid
+        # turning a small translation into a giant union-rectangle refresh.
+        refresh_error = None
+        for bounds in (result.source_bounds, result.destination_bounds):
+            try:
+                self.widget._refresh_composite_bounds(bounds)
+            except Exception as error:
+                # The transactional store/proxy/history move has committed.
+                # A display upload failure cannot turn that success into a
+                # reported data failure or roll back only one representation.
+                if refresh_error is None:
+                    refresh_error = error
+        return delta, refresh_error
+
     @contextmanager
     def block_history(self):
         if self.block_depth == 0:
@@ -384,20 +482,33 @@ class _OverlapEditTracker:
             return None
         if not self.layer._undo_history:
             return None
+        if self.widget._annotation_selection is not None:
+            self.widget._clear_annotation_selection()
         history = self.undo_items[-1] if self.undo_items else None
         if history is None:
             return self.native_undo()
         snapshot = self._snapshot_native_history_call(
             self.layer._undo_history[-1]
         )
+        if (
+            self.redo_items.maxlen is not None
+            and len(self.redo_items) >= self.redo_items.maxlen
+        ):
+            raise RuntimeError("Paired Redo history is unexpectedly full")
+        try:
+            self.redo_items.append(history)
+        except BaseException:
+            if self.redo_items and self.redo_items[-1] is history:
+                self.redo_items.pop()
+            raise
         try:
             result = self.native_undo()
             self.widget._restore_overlap_history(history, undoing=True)
         except BaseException:
+            self.redo_items.pop()
             self._restore_native_history_call(snapshot)
             raise
         self.undo_items.pop()
-        self.redo_items.append(history)
         return result
 
     def redo(self):
@@ -408,20 +519,33 @@ class _OverlapEditTracker:
             return None
         if not self.layer._redo_history:
             return None
+        if self.widget._annotation_selection is not None:
+            self.widget._clear_annotation_selection()
         history = self.redo_items[-1] if self.redo_items else None
         if history is None:
             return self.native_redo()
         snapshot = self._snapshot_native_history_call(
             self.layer._redo_history[-1]
         )
+        if (
+            self.undo_items.maxlen is not None
+            and len(self.undo_items) >= self.undo_items.maxlen
+        ):
+            raise RuntimeError("Paired Undo history is unexpectedly full")
+        try:
+            self.undo_items.append(history)
+        except BaseException:
+            if self.undo_items and self.undo_items[-1] is history:
+                self.undo_items.pop()
+            raise
         try:
             result = self.native_redo()
             self.widget._restore_overlap_history(history, undoing=False)
         except BaseException:
+            self.undo_items.pop()
             self._restore_native_history_call(snapshot)
             raise
         self.redo_items.pop()
-        self.undo_items.append(history)
         return result
 
     def _snapshot_native_history_call(self, native_item):
@@ -534,6 +658,13 @@ class LabelEditorWidget(QWidget):
         self._active_save_output_dtype: Optional[np.dtype] = None
         self._browse_buttons = []
         self._syncing_overlap_layer = False
+        self._annotation_opacity = DEFAULT_ANNOTATION_OPACITY
+        self._native_labels_controls = None
+        self._native_opacity_slider = None
+        self._annotation_selection: Optional[
+            AnnotationObjectSelection
+        ] = None
+        self._selection_layer = None
 
         self.class_button_layout = None
 
@@ -555,9 +686,23 @@ class LabelEditorWidget(QWidget):
         self.viewer.layers.events.removed.connect(
             self._restore_fast_rendering_after_layer_change
         )
+        # Shapes can reset ``editable`` while napari changes displayed
+        # dimensions.  The selection outline is a read-only preview and must
+        # never become an annotation editing target.
+        self.viewer.dims.events.ndisplay.connect(
+            self._lock_selection_preview_layer
+        )
 
     def _restore_fast_rendering_after_layer_change(self, event=None):
-        del event
+        removed = getattr(event, "value", None)
+        removed_selection = (
+            removed is self._selection_layer
+            and not self._selection_layer_is_present()
+        )
+        if removed_selection:
+            self._selection_layer = None
+            self._annotation_selection = None
+            self.selection_status_label.setText("No region selected")
         layer = self.labels_layer
         if layer is None or not any(
             candidate is layer for candidate in self.viewer.layers
@@ -570,7 +715,24 @@ class LabelEditorWidget(QWidget):
             candidate is composite for candidate in self.viewer.layers
         ):
             enable_fast_texture_updates(self.viewer, composite)
+        if removed_selection:
+            self.viewer.layers.selection.active = layer
         self._update_project_controls()
+
+    def _lock_selection_preview_layer(self, event=None) -> None:
+        """Keep the non-authoritative outline preview read-only."""
+
+        del event
+        if int(self.viewer.dims.ndisplay) != 2:
+            if self._annotation_selection is not None:
+                self._clear_annotation_selection()
+            return
+        if not self._selection_layer_is_present():
+            return
+        try:
+            self._selection_layer.editable = False
+        except (AttributeError, RuntimeError):
+            return
 
     def _build_ui(self):
         layout = QVBoxLayout()
@@ -592,24 +754,6 @@ class LabelEditorWidget(QWidget):
         self.load_btn = QPushButton("Load")
         self.load_btn.clicked.connect(self.load_data)
         layout.addWidget(self.load_btn)
-
-        self.overlay_opacity_layout = QHBoxLayout()
-        self.overlay_opacity_label = QLabel("Annotation opacity")
-        self.overlay_opacity_layout.addWidget(self.overlay_opacity_label)
-        self.overlay_opacity_slider = QSlider(Qt.Horizontal)
-        self.overlay_opacity_slider.setRange(0, 100)
-        self.overlay_opacity_slider.setValue(45)
-        self.overlay_opacity_slider.setEnabled(False)
-        self.overlay_opacity_slider.setToolTip(
-            "Adjust the visible annotation opacity"
-        )
-        self.overlay_opacity_slider.valueChanged.connect(
-            self._set_overlay_opacity
-        )
-        self.overlay_opacity_layout.addWidget(self.overlay_opacity_slider)
-        self.overlay_opacity_value = QLabel("45%")
-        self.overlay_opacity_layout.addWidget(self.overlay_opacity_value)
-        layout.addLayout(self.overlay_opacity_layout)
 
         layout.addWidget(QLabel("Classes"))
 
@@ -655,6 +799,82 @@ class LabelEditorWidget(QWidget):
         self.class_button_scroll.setMaximumHeight(600)
 
         layout.addWidget(self.class_button_scroll)
+
+        layout.addWidget(QLabel("Selected visible region"))
+        self.selection_help_label = QLabel(
+            "Choose napari's Pick tool, then click an annotation."
+        )
+        self.selection_help_label.setWordWrap(True)
+        layout.addWidget(self.selection_help_label)
+        self.selection_status_label = QLabel("No region selected")
+        self.selection_status_label.setWordWrap(True)
+        layout.addWidget(self.selection_status_label)
+
+        selection_actions = QHBoxLayout()
+        self.use_selection_class_btn = QPushButton("Use class")
+        self.use_selection_class_btn.setEnabled(False)
+        self.use_selection_class_btn.setToolTip(
+            "Make the selected region's class the active paint class"
+        )
+        self.use_selection_class_btn.clicked.connect(
+            self._use_selected_annotation_class
+        )
+        selection_actions.addWidget(self.use_selection_class_btn)
+        self.delete_region_btn = QPushButton("Delete…")
+        self.delete_region_btn.setEnabled(False)
+        self.delete_region_btn.setToolTip(
+            "Confirm deletion of this visible region; hidden overlaps remain"
+        )
+        self.delete_region_btn.clicked.connect(
+            self._delete_selected_annotation
+        )
+        selection_actions.addWidget(self.delete_region_btn)
+        self.clear_region_btn = QPushButton("Clear")
+        self.clear_region_btn.setEnabled(False)
+        self.clear_region_btn.setToolTip(
+            "Clear the current region selection without changing annotations"
+        )
+        self.clear_region_btn.clicked.connect(
+            self._clear_annotation_selection
+        )
+        selection_actions.addWidget(self.clear_region_btn)
+        layout.addLayout(selection_actions)
+
+        move_layout = QHBoxLayout()
+        move_layout.addWidget(QLabel("Step"))
+        self.move_region_step = QSpinBox()
+        self.move_region_step.setRange(1, 10_000)
+        self.move_region_step.setValue(1)
+        self.move_region_step.setSuffix(" px")
+        self.move_region_step.setButtonSymbols(QAbstractSpinBox.NoButtons)
+        self.move_region_step.setMinimumWidth(64)
+        self.move_region_step.setMaximumWidth(80)
+        self.move_region_step.setToolTip(
+            "Exact integer distance used by the four move buttons"
+        )
+        move_layout.addWidget(self.move_region_step)
+        self.move_region_up_btn = QPushButton("↑")
+        self.move_region_down_btn = QPushButton("↓")
+        self.move_region_left_btn = QPushButton("←")
+        self.move_region_right_btn = QPushButton("→")
+        for button, row_delta, column_delta in (
+            (self.move_region_up_btn, -1, 0),
+            (self.move_region_down_btn, 1, 0),
+            (self.move_region_left_btn, 0, -1),
+            (self.move_region_right_btn, 0, 1),
+        ):
+            button.setEnabled(False)
+            button.setToolTip(
+                f"Move the selected region by ({row_delta}, {column_delta}) "
+                "times the pixel step"
+            )
+            button.clicked.connect(
+                lambda checked=False, dr=row_delta, dc=column_delta: (
+                    self._move_selected_annotation(dr, dc)
+                )
+            )
+            move_layout.addWidget(button)
+        layout.addLayout(move_layout)
 
         self.save_destination_caption = QLabel("Save destination (editable)")
         layout.addWidget(self.save_destination_caption)
@@ -859,7 +1079,25 @@ class LabelEditorWidget(QWidget):
         # A pending deletion blocks further class-definition changes until it
         # is saved, but class selection and painting remain available.
         self.class_button_container.setEnabled(project_actions_enabled)
-        self.overlay_opacity_slider.setEnabled(project_actions_enabled)
+        selection_ready = (
+            active_layer
+            and int(self.viewer.dims.ndisplay) == 2
+            and self._annotation_selection is not None
+            and self._selection_layer_is_present()
+            and bool(self._selection_layer.visible)
+            and not busy
+        )
+        self.use_selection_class_btn.setEnabled(selection_ready)
+        self.delete_region_btn.setEnabled(selection_ready)
+        self.clear_region_btn.setEnabled(selection_ready)
+        self.move_region_step.setEnabled(selection_ready)
+        for move_button in (
+            self.move_region_up_btn,
+            self.move_region_down_btn,
+            self.move_region_left_btn,
+            self.move_region_right_btn,
+        ):
+            move_button.setEnabled(selection_ready)
 
         if self.labels_path is None:
             self.save_destination_line.clear()
@@ -1079,6 +1317,9 @@ class LabelEditorWidget(QWidget):
         image_data = image_pyramid if len(image_pyramid) > 1 else image
         previous_layers = list(self.viewer.layers)
         previous_layer_ids = {id(layer) for layer in previous_layers}
+        previous_annotation_selection = self._annotation_selection
+        previous_selection_layer = self._selection_layer
+        previous_selection_status = self.selection_status_label.text()
 
         try:
             # File/data validation is complete, so release the previous GPU
@@ -1102,7 +1343,7 @@ class LabelEditorWidget(QWidget):
             composite_layer = self.viewer.add_labels(
                 overlap_editor.composite,
                 name="Annotations",
-                opacity=self.overlay_opacity_slider.value() / 100.0,
+                opacity=self._annotation_opacity,
                 features=self._label_features(class_map),
             )
             composite_layer.colormap = self._multiclass_colormap(
@@ -1139,6 +1380,17 @@ class LabelEditorWidget(QWidget):
             enable_fast_polygon(labels_layer)
             enable_fast_rendering(self.viewer, labels_layer)
             enable_fast_texture_updates(self.viewer, composite_layer)
+            selection_layer = self.viewer.add_shapes(
+                [],
+                ndim=2,
+                name="Selected annotation outline (preview)",
+                edge_color="#ffff00",
+                edge_width=3,
+                face_color="transparent",
+            )
+            selection_layer.editable = False
+            selection_layer.visible = False
+            self.viewer.layers.selection.active = labels_layer
         except BaseException:
             # An add-layer callback may insert a layer and then raise before
             # viewer.add_* returns. Identify rollback targets from the original
@@ -1165,6 +1417,9 @@ class LabelEditorWidget(QWidget):
                     "Load failed and napari could not completely restore the "
                     f"previous scene: {cleanup_errors[0]}"
                 )
+            self._annotation_selection = previous_annotation_selection
+            self._selection_layer = previous_selection_layer
+            self.selection_status_label.setText(previous_selection_status)
             raise
 
         self.image_path = image_path
@@ -1183,6 +1438,12 @@ class LabelEditorWidget(QWidget):
         self.overlap_editor = overlap_editor
         self.composite_layer = composite_layer
         self.labels_layer = labels_layer
+        self._annotation_selection = None
+        self._selection_layer = selection_layer
+        self.selection_status_label.setText("No region selected")
+        self._selection_layer.events.visible.connect(
+            self._on_selection_layer_visibility_change
+        )
         self.labels_layer.events.selected_label.connect(
             self._on_selected_label_change
         )
@@ -1193,9 +1454,16 @@ class LabelEditorWidget(QWidget):
         self.labels_layer.events.opacity.connect(
             self._on_active_layer_opacity_change
         )
+        self.composite_layer.events.opacity.connect(
+            self._on_composite_opacity_change
+        )
         self._enable_overlap_edit_tracking()
         self._install_semantic_pick()
         self._install_semantic_tooltip()
+        self._install_native_labels_controls()
+        # Some Qt window configurations finish registering a newly inserted
+        # layer's controls on the next event-loop turn.
+        QTimer.singleShot(0, self._install_native_labels_controls)
 
         self.viewer.tooltip.visible = True
 
@@ -1394,6 +1662,21 @@ class LabelEditorWidget(QWidget):
         """Restore membership and per-pixel visible tops for one action."""
         self._syncing_overlap_layer = True
         try:
+            move_atoms = [
+                atom for atom in history if isinstance(atom, OverlapDelta)
+            ]
+            if move_atoms:
+                if len(history) != 1 or len(move_atoms) != 1:
+                    raise RuntimeError(
+                        "Move history must contain one sparse move command."
+                    )
+                result = self.overlap_editor.apply_overlap_delta(
+                    move_atoms[0],
+                    forward=not undoing,
+                )
+                self._refresh_composite_bounds(result.source_bounds)
+                self._refresh_composite_bounds(result.destination_bounds)
+                return
             semantic_erase_only = bool(history) and all(
                 len(atom) == 4 for atom in history
             )
@@ -1481,21 +1764,373 @@ class LabelEditorWidget(QWidget):
             self._syncing_overlap_layer = False
 
     def _install_semantic_pick(self) -> None:
-        """Make Pick select the visible semantic class, not binary 0/1."""
+        """Make Pick select one connected visible semantic region."""
         layer = self.labels_layer
         layer._drag_modes = dict(layer._drag_modes)
 
         def semantic_pick(_layer, event):
-            value = self.composite_layer.get_value(
-                event.position,
-                view_direction=event.view_direction,
-                dims_displayed=event.dims_displayed,
-                world=True,
-            )
-            self._select_label(0 if value is None else int(value))
+            self._select_annotation_from_event(event)
 
         layer._napari_histo_semantic_pick = semantic_pick
         layer._drag_modes[Mode.PICK] = semantic_pick
+
+    def _select_annotation_from_event(self, event) -> None:
+        """Select and outline the visible component under one Pick click."""
+
+        if self._save_worker is not None:
+            self.viewer.status = (
+                "Wait for the current label save to finish before selecting."
+            )
+            return
+        if not self._labels_layer_is_active():
+            return
+        coordinate = mouse_event_to_labels_coordinate(
+            self.composite_layer,
+            event,
+        )
+        if coordinate is None:
+            self._clear_annotation_selection()
+            return
+        coordinate = np.round(np.asarray(coordinate)).astype(np.intp)
+        if coordinate.size != 2:
+            self._clear_annotation_selection()
+            self.viewer.status = (
+                "Annotation selection is available only in 2-D."
+            )
+            return
+        try:
+            selected = select_visible_component(
+                self.overlap_editor.composite,
+                tuple(int(value) for value in coordinate),
+                store_revision=getattr(self.overlap_store, "revision", None),
+            )
+        except SelectionTooLargeError as error:
+            self._clear_annotation_selection()
+            self.viewer.status = str(error)
+            return
+        except (MemoryError, TypeError, ValueError) as error:
+            self._clear_annotation_selection()
+            self.viewer.status = f"Could not select annotation: {error}"
+            return
+        if selected is None:
+            self._clear_annotation_selection()
+            self.viewer.status = "No annotation at that location."
+            return
+        try:
+            self._set_annotation_selection(selected)
+        except Exception as error:
+            # The user clicked a new object, so the previous sparse selection
+            # must never remain armed when its replacement outline fails.
+            self._annotation_selection = None
+            if self._selection_layer_is_present():
+                try:
+                    self._selection_layer.data = []
+                    self._selection_layer.editable = False
+                    self._selection_layer.visible = False
+                except Exception:
+                    pass
+            self.selection_status_label.setText("No region selected")
+            if self._labels_layer_is_active():
+                self.viewer.layers.selection.active = self.labels_layer
+            self._update_project_controls()
+            self.viewer.status = (
+                "The annotation selection could not be displayed; nothing "
+                f"is selected ({error})."
+            )
+
+    def _selection_layer_is_present(self) -> bool:
+        return bool(
+            self._selection_layer is not None
+            and any(
+                candidate is self._selection_layer
+                for candidate in self.viewer.layers
+            )
+        )
+
+    @staticmethod
+    def _closed_selection_paths(selection) -> list[np.ndarray]:
+        paths = []
+        for outline in selection.outlines:
+            outline = np.asarray(outline, dtype=float)
+            if outline.shape[0] < 2:
+                continue
+            if not np.array_equal(outline[0], outline[-1]):
+                outline = np.concatenate([outline, outline[:1]], axis=0)
+            paths.append(np.ascontiguousarray(outline, dtype=float))
+        return paths
+
+    def _set_annotation_selection(
+        self,
+        selection: AnnotationObjectSelection,
+    ) -> None:
+        """Show a lightweight Shapes outline for an exact sparse selection."""
+
+        # Invalidate an earlier object before any fallible Shapes allocation
+        # or tessellation. A failed new outline must never leave destructive
+        # actions armed for the object the user previously selected.
+        self._annotation_selection = None
+        self._update_project_controls()
+        paths = self._closed_selection_paths(selection)
+        if not paths:
+            raise ValueError("A selected annotation must have a visible outline")
+        try:
+            camera_zoom = float(self.viewer.camera.zoom)
+        except (AttributeError, TypeError, ValueError):
+            camera_zoom = 1.0
+        edge_width = float(
+            np.clip(3.0 / max(camera_zoom, 1e-6), 1.0, 256.0)
+        )
+        layer = self._selection_layer
+        with warnings.catch_warnings():
+            # NumPy 2.5 exposes a harmless warning in napari 0.6.6's Shapes
+            # line triangulator. Limit suppression to our bounded preview.
+            warnings.filterwarnings(
+                "ignore",
+                message="'where' used without 'out'.*",
+                category=UserWarning,
+                module=(
+                    r"napari\.layers\.shapes\."
+                    r"_accelerated_triangulate_python"
+                ),
+            )
+            if not self._selection_layer_is_present():
+                layer = self.viewer.add_shapes(
+                    paths,
+                    shape_type="path",
+                    name="Selected annotation outline (preview)",
+                    edge_color="#ffff00",
+                    edge_width=edge_width,
+                    face_color="transparent",
+                )
+                self._selection_layer = layer
+                layer.events.visible.connect(
+                    self._on_selection_layer_visibility_change
+                )
+            else:
+                # The Shapes setter resets editable state in napari 0.6.
+                layer.data = []
+                layer.add(
+                    paths,
+                    shape_type="path",
+                    edge_color="#ffff00",
+                    edge_width=edge_width,
+                    face_color="transparent",
+                )
+        layer.editable = False
+        layer.visible = True
+        self._annotation_selection = selection
+        class_name = self.class_map.get(selection.value, str(selection.value))
+        approximation = (
+            " (simplified outline preview)"
+            if selection.simplified_preview
+            else ""
+        )
+        self.selection_status_label.setText(
+            f"Class {selection.value}: {class_name} — "
+            f"{selection.pixel_count:,} pixels{approximation}"
+        )
+        self.viewer.layers.selection.active = self.labels_layer
+        self.viewer.status = (
+            f"Selected visible region: class {selection.value}, "
+            f"{selection.pixel_count:,} pixels."
+        )
+        self._update_project_controls()
+
+    def _on_selection_layer_visibility_change(self, event=None) -> None:
+        del event
+        if (
+            self._annotation_selection is not None
+            and self._selection_layer_is_present()
+            and not self._selection_layer.visible
+        ):
+            self.viewer.status = (
+                "Selection outline is hidden; show it before Delete or Move."
+            )
+            if self._labels_layer_is_active():
+                self.viewer.layers.selection.active = self.labels_layer
+        self._update_project_controls()
+
+    def _clear_annotation_selection(self, checked=False) -> None:
+        del checked
+        self._annotation_selection = None
+        if self._selection_layer_is_present():
+            self._selection_layer.data = []
+            self._selection_layer.editable = False
+            self._selection_layer.visible = False
+        if self._labels_layer_is_active():
+            self.viewer.layers.selection.active = self.labels_layer
+        self.selection_status_label.setText("No region selected")
+        self._update_project_controls()
+
+    def _selected_annotation_is_current(self) -> bool:
+        selection = self._annotation_selection
+        if selection is None or not self._labels_layer_is_active():
+            return False
+        revision = getattr(self.overlap_store, "revision", None)
+        if (
+            selection.store_revision is not None
+            and revision is not None
+            and int(selection.store_revision) != int(revision)
+        ):
+            return False
+        return bool(
+            np.all(
+                self.overlap_editor.composite[
+                    selection.rows,
+                    selection.columns,
+                ]
+                == selection.value
+            )
+        )
+
+    def _use_selected_annotation_class(self) -> None:
+        selection = self._annotation_selection
+        if selection is None:
+            return
+        self._select_label(selection.value)
+        if not self._selected_annotation_is_current():
+            self._clear_annotation_selection()
+
+    def _delete_selected_annotation(self) -> None:
+        """Stage deletion of one exact visible region; Save remains explicit."""
+
+        if self._save_worker is not None:
+            self.viewer.status = (
+                "Wait for the current label save to finish before deleting."
+            )
+            return
+        selection = self._annotation_selection
+        if selection is None:
+            return
+        if not self._selected_annotation_is_current():
+            self._clear_annotation_selection()
+            self.viewer.status = (
+                "The selected region changed. Pick it again before deleting."
+            )
+            return
+        class_name = self.class_map.get(selection.value, str(selection.value))
+        answer = QMessageBox.question(
+            self,
+            "Delete selected annotation?",
+            f"Delete this visible region of class {selection.value}: "
+            f"{class_name}?\n\n"
+            f"Pixels: {selection.pixel_count:,}\n"
+            "Hidden overlapping annotations will be revealed. Nothing is "
+            "written to disk until you press Save.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            self.viewer.status = "Annotation deletion cancelled."
+            return
+        if (
+            self._annotation_selection is not selection
+            or not self._selection_layer_is_present()
+            or not self._selection_layer.visible
+        ):
+            self.viewer.status = (
+                "The selected region changed while confirming. Pick it again."
+            )
+            return
+        if not self._selected_annotation_is_current():
+            self._clear_annotation_selection()
+            self.viewer.status = (
+                "The selected region changed while confirming. Pick it again."
+            )
+            return
+        # QMessageBox runs a nested event loop. A save hotkey may have started
+        # while confirmation was open, so recheck before calling the tracker.
+        if self._save_worker is not None:
+            self.viewer.status = (
+                "Wait for the current label save to finish before deleting."
+            )
+            return
+        try:
+            self.labels_layer.data_setitem(
+                (selection.rows, selection.columns),
+                0,
+            )
+        except (MemoryError, RuntimeError, TypeError, ValueError) as error:
+            self.viewer.status = f"Could not delete selected annotation: {error}"
+            return
+        self._clear_annotation_selection()
+        self.viewer.status = (
+            "Selected annotation deleted in memory. Press Save to write it."
+        )
+
+    def _move_selected_annotation(
+        self,
+        row_direction: int,
+        column_direction: int,
+    ) -> None:
+        """Move the selected visible region by the configured integer step."""
+
+        # The transactional store/history backend is installed below; keep
+        # this UI handler explicit so unsupported states fail without edits.
+        selection = self._annotation_selection
+        if selection is None:
+            return
+        step = int(self.move_region_step.value())
+        row_delta = int(row_direction) * step
+        column_delta = int(column_direction) * step
+        try:
+            moved = selection.translated(
+                row_delta,
+                column_delta,
+                self.overlap_editor.shape,
+            )
+        except ValueError as error:
+            self.viewer.status = str(error)
+            return
+        apply_move = getattr(
+            self.labels_layer._napari_histo_edit_tracker,
+            "move_visible_selection",
+            None,
+        )
+        if apply_move is None:
+            self.viewer.status = "Annotation movement is not available."
+            return
+        try:
+            _delta, refresh_error = apply_move(selection, moved)
+        except (MemoryError, RuntimeError, TypeError, ValueError) as error:
+            self.viewer.status = f"Could not move selected annotation: {error}"
+            return
+        revision = getattr(self.overlap_store, "revision", None)
+        moved = AnnotationObjectSelection(
+            value=moved.value,
+            rows=moved.rows,
+            columns=moved.columns,
+            outlines=moved.outlines,
+            simplified_preview=moved.simplified_preview,
+            store_revision=revision,
+        )
+        # The old coordinates became stale as soon as the transaction
+        # committed. If preview tessellation fails, retain the data move and
+        # disable destructive selection actions until the user picks again.
+        self._annotation_selection = None
+        try:
+            self._set_annotation_selection(moved)
+        except Exception as error:
+            try:
+                self._clear_annotation_selection()
+            except Exception:
+                self._annotation_selection = None
+                self._update_project_controls()
+            self.viewer.status = (
+                "Annotation moved in memory, but its outline could not be "
+                f"redrawn ({error}). Pan or zoom, then Pick it again."
+            )
+            return
+        if refresh_error is not None:
+            self.viewer.status = (
+                "Annotation moved in memory, but the display could not "
+                "refresh. Pan or zoom to redraw, then press Save when ready."
+            )
+            return
+        self.viewer.status = (
+            f"Moved selected annotation by ({row_delta}, {column_delta}) "
+            "pixels in memory. Press Save to write it."
+        )
 
     def _install_semantic_tooltip(self) -> None:
         """Report the visible semantic label through the binary edit layer."""
@@ -1567,21 +2202,148 @@ class LabelEditorWidget(QWidget):
         )
         return f"Top: {top_text} | Memberships: {membership_text}"
 
-    def _set_overlay_opacity(self, value: int) -> None:
-        value = int(value)
-        self.overlay_opacity_value.setText(f"{value}%")
+    def _find_native_labels_controls(self):
+        """Return napari's controls for the transparent edit layer, if ready."""
+
+        if self.labels_layer is None:
+            return None
+        try:
+            window = getattr(self.viewer, "window", None)
+            qt_viewer = getattr(window, "_qt_viewer", None)
+            container = getattr(qt_viewer, "controls", None)
+            return getattr(container, "widgets", {}).get(self.labels_layer)
+        except (AttributeError, RuntimeError):
+            return None
+
+    def _install_native_labels_controls(self, controls=None) -> bool:
+        """Adapt napari's original Labels sliders to the overlap editor.
+
+        The brush control remains connected directly to ``Labels.brush_size``;
+        only its visible range is expanded. The native opacity slider is
+        redirected straight to the visible semantic composite, so changing it
+        never exposes or refreshes the transparent binary edit proxy.
+        """
+
+        layer = self.labels_layer
+        if layer is None or not any(
+            candidate is layer for candidate in self.viewer.layers
+        ):
+            return False
+        if controls is None:
+            controls = self._find_native_labels_controls()
+        if controls is None or getattr(controls, "layer", None) is not layer:
+            return False
+        try:
+            brush_control = controls._brush_size_slider_control
+            brush_slider = brush_control.brush_size_slider
+            brush_maximum = max(
+                NATIVE_BRUSH_SIZE_MAX,
+                int(brush_slider.maximum()),
+                int(layer.brush_size),
+            )
+            brush_slider.setMaximum(brush_maximum)
+            brush_tooltip = (
+                f"Brush size range: 1–{brush_maximum} pixels. "
+                "Drag the slider or click its number to type an exact size."
+            )
+            brush_slider.setToolTip(brush_tooltip)
+            brush_control.brush_size_slider_label.setToolTip(brush_tooltip)
+
+            opacity_control = controls._opacity_blending_controls
+            opacity_slider = opacity_control.opacity_slider
+            opacity_tooltip = (
+                "Adjust the visible Annotations layer. The Annotation tools "
+                "layer remains transparent for painting."
+            )
+            opacity_slider.setToolTip(opacity_tooltip)
+            opacity_control.opacity_label.setToolTip(opacity_tooltip)
+        except (AttributeError, RuntimeError):
+            return False
+
+        already_bridged = self._native_opacity_slider is opacity_slider
+        if not already_bridged:
+            previous_slider = self._native_opacity_slider
+            if previous_slider is not None:
+                try:
+                    previous_slider.valueChanged.disconnect(
+                        self._on_native_opacity_slider_change
+                    )
+                except (TypeError, RuntimeError):
+                    pass
+
+            # napari connects this signal to ``labels_layer.opacity`` through
+            # an anonymous closure. Disconnect it before installing the
+            # semantic bridge; routing through the edit proxy would update its
+            # thumbnail and VisPy node twice for every slider step.
+            try:
+                opacity_slider.valueChanged.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            for callback in tuple(getattr(opacity_control, "_callbacks", ())):
+                try:
+                    layer.events.opacity.disconnect(callback)
+                except (TypeError, ValueError, RuntimeError):
+                    pass
+            opacity_slider.valueChanged.connect(
+                self._on_native_opacity_slider_change
+            )
+
+        self._native_labels_controls = controls
+        self._native_opacity_slider = opacity_slider
+        self._sync_native_opacity_slider()
+        return True
+
+    def _on_native_opacity_slider_change(self, value: float) -> None:
+        """Apply napari's native opacity control to visible annotations."""
+
+        self._set_annotation_opacity(value)
+
+    def _sync_native_opacity_slider(self) -> None:
+        """Show semantic opacity in the edit layer's native opacity slider."""
+
+        slider = self._native_opacity_slider
+        if slider is None:
+            return
+        try:
+            previous = slider.blockSignals(True)
+            try:
+                slider.setValue(self._annotation_opacity)
+            finally:
+                slider.blockSignals(previous)
+        except RuntimeError:
+            self._native_labels_controls = None
+            self._native_opacity_slider = None
+
+    def _set_annotation_opacity(self, value: float) -> None:
+        """Set visible semantic opacity without exposing the binary proxy."""
+
+        value = float(np.clip(value, 0.0, 1.0))
+        self._annotation_opacity = value
         if self.composite_layer is not None and any(
             layer is self.composite_layer for layer in self.viewer.layers
         ):
-            self.composite_layer.opacity = value / 100.0
+            self.composite_layer.opacity = value
+        self._sync_native_opacity_slider()
+
+    def _on_composite_opacity_change(self, event=None) -> None:
+        del event
+        if self.composite_layer is None:
+            return
+        self._annotation_opacity = float(self.composite_layer.opacity)
+        self._sync_native_opacity_slider()
 
     def _on_active_layer_opacity_change(self, event=None) -> None:
         del event
         if self.labels_layer is None or self.labels_layer.opacity == 0:
             return
+        # The binary layer is an invisible tool proxy, never a display layer.
+        # Guard programmatic writes and napari fallbacks without forwarding
+        # them through the semantic opacity control.
         self.labels_layer.opacity = 0.0
+        self._sync_native_opacity_slider()
         self.viewer.status = (
-            "Use the plugin's Annotation opacity slider for visible annotations."
+            "Annotation tools stay transparent. Use napari's native opacity "
+            "slider to adjust the visible Annotations layer."
         )
 
     def _populate_class_buttons(self):
@@ -1851,6 +2613,7 @@ class LabelEditorWidget(QWidget):
 
             deleted_name = self.class_map[value]
             changed = self.overlap_editor.delete_class(value, replacement)
+            self._clear_annotation_selection()
             self.class_map = self.overlap_store.class_map
             self.class_colors = self.overlap_store.class_colors
 
@@ -2137,6 +2900,7 @@ class LabelEditorWidget(QWidget):
                         self.viewer,
                         self.composite_layer,
                     )
+            self._clear_annotation_selection()
             self.class_map = self.overlap_store.class_map
             self.class_colors = self.overlap_store.class_colors
         else:
@@ -2343,12 +3107,27 @@ class LabelEditorWidget(QWidget):
         if self._save_worker is not None:
             self.viewer.status = "Wait for the current label save to finish."
             return
+        tracker = getattr(
+            self.labels_layer,
+            "_napari_histo_edit_tracker",
+            None,
+        )
+        tracker_has_paired_history = bool(
+            tracker is not None and tracker.undo_items
+        )
         if not self._labels_layer_is_active() or not self._undo_labels_layer(
             self.labels_layer
         ):
             self.viewer.status = "Nothing to undo."
             return
 
+        # A paired tracker history already restored the packed membership and
+        # sparse top projection inside ``labels_layer.undo()``. Scanning and
+        # repacking the entire slide here would duplicate that work and turn a
+        # one-pixel Undo into an O(slide) operation.
+        if tracker_has_paired_history:
+            self.viewer.status = "Undo complete."
+            return
         try:
             missed_changes = self.overlap_editor.full_sync()
             if missed_changes:

@@ -1,5 +1,6 @@
 import os
 import unittest
+from collections import deque
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from time import monotonic, sleep
@@ -10,6 +11,7 @@ import imageio.v3 as iio
 import numpy as np
 import pandas as pd
 from napari.components import ViewerModel
+from napari._qt.layer_controls.qt_labels_controls import QtLabelsControls
 from napari.layers import Labels
 from napari.layers.labels._labels_constants import Mode
 from qtpy.QtWidgets import QApplication, QMessageBox
@@ -161,6 +163,46 @@ class LoadSaveIntegrationTest(unittest.TestCase):
         widget.load_data()
         return viewer, widget, labels_path, mapping_path
 
+    @staticmethod
+    def pick_connected_region(widget, position):
+        callback = widget.labels_layer._drag_modes[Mode.PICK]
+        callback(
+            widget.labels_layer,
+            SimpleNamespace(
+                position=position,
+                view_direction=None,
+                dims_displayed=(0, 1),
+            ),
+        )
+        return widget._annotation_selection
+
+    @staticmethod
+    def connected_runtime_state(widget):
+        """Return an exact small-project snapshot for rejected UI actions."""
+
+        tracker = widget.labels_layer._napari_histo_edit_tracker
+        selection = widget._annotation_selection
+        outlines = ()
+        if widget._selection_layer_is_present():
+            outlines = tuple(
+                np.asarray(path).tobytes()
+                for path in widget._selection_layer.data
+            )
+        return (
+            widget.overlap_store._packed_masks.tobytes(),
+            widget.overlap_editor.composite.tobytes(),
+            np.asarray(widget.labels_layer.data).tobytes(),
+            widget.overlap_store.revision,
+            widget.overlap_store.generation,
+            widget.overlap_store.projection_sha256,
+            tuple(id(item) for item in widget.labels_layer._undo_history),
+            tuple(id(item) for item in widget.labels_layer._redo_history),
+            tuple(id(item) for item in tracker.undo_items),
+            tuple(id(item) for item in tracker.redo_items),
+            id(selection) if selection is not None else None,
+            outlines,
+        )
+
     def test_large_mask_optimizations_are_automatic_and_lossless(self):
         with TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -194,6 +236,7 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                     "Histology",
                     "Annotations",
                     "Annotation tools — 1: tumor",
+                    "Selected annotation outline (preview)",
                 ],
             )
             self.assertFalse(viewer.layers[0].multiscale)
@@ -1404,43 +1447,78 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 "Label: 300 — Review",
             )
 
-    def test_plugin_opacity_slider_controls_only_visible_composite(self):
+    def test_native_labels_controls_bridge_opacity_and_large_brush_range(self):
         viewer = ViewerModel()
         empty_widget = LabelEditorWidget(viewer)
-        self.assertFalse(empty_widget.overlay_opacity_slider.isEnabled())
-        self.assertEqual(
-            empty_widget.overlay_opacity_label.text(),
-            "Annotation opacity",
-        )
+        self.assertFalse(hasattr(empty_widget, "overlay_opacity_slider"))
         layout = empty_widget.layout()
         load_index = layout.indexOf(empty_widget.load_btn)
-        self.assertIs(
-            layout.itemAt(load_index + 1).layout(),
-            empty_widget.overlay_opacity_layout,
-        )
         self.assertEqual(
-            layout.itemAt(load_index + 2).widget().text(),
+            layout.itemAt(load_index + 1).widget().text(),
             "Classes",
         )
 
         with TemporaryDirectory() as tmp:
             _, widget, _, _ = self.load_small_project(Path(tmp))
-            self.assertTrue(widget.overlay_opacity_slider.isEnabled())
-            self.assertEqual(widget.overlay_opacity_slider.value(), 45)
             self.assertAlmostEqual(widget.composite_layer.opacity, 0.45)
             self.assertEqual(widget.labels_layer.opacity, 0.0)
+            controls = QtLabelsControls(widget.labels_layer)
+            try:
+                self.assertTrue(widget._install_native_labels_controls(controls))
+                opacity_slider = (
+                    controls._opacity_blending_controls.opacity_slider
+                )
+                brush_slider = (
+                    controls._brush_size_slider_control.brush_size_slider
+                )
+                self.assertAlmostEqual(opacity_slider.value(), 0.45)
+                self.assertEqual(brush_slider.minimum(), 1)
+                self.assertEqual(brush_slider.maximum(), 512)
+                self.assertIn("1–512", brush_slider.toolTip())
 
-            widget.overlay_opacity_slider.setValue(67)
-            self.assertEqual(widget.overlay_opacity_value.text(), "67%")
-            self.assertAlmostEqual(widget.composite_layer.opacity, 0.67)
-            self.assertEqual(widget.labels_layer.opacity, 0.0)
+                proxy_opacity_events = []
+                widget.labels_layer.events.opacity.connect(
+                    lambda event: proxy_opacity_events.append(
+                        widget.labels_layer.opacity
+                    )
+                )
+                with patch.object(
+                    widget.composite_layer,
+                    "refresh",
+                    side_effect=AssertionError(
+                        "opacity change refreshed the full annotation layer"
+                    ),
+                ):
+                    opacity_slider.setValue(0.67)
+                self.assertAlmostEqual(widget.composite_layer.opacity, 0.67)
+                self.assertAlmostEqual(opacity_slider.value(), 0.67)
+                self.assertEqual(widget.labels_layer.opacity, 0.0)
+                self.assertEqual(proxy_opacity_events, [])
 
-            widget.labels_layer.opacity = 0.8
-            self.assertEqual(widget.labels_layer.opacity, 0.0)
+                brush_slider.setValue(401)
+                self.assertEqual(widget.labels_layer.brush_size, 401)
 
-            widget._save_worker = object()
-            widget._update_project_controls()
-            self.assertFalse(widget.overlay_opacity_slider.isEnabled())
+                # Programmatic proxy opacity cannot expose the binary edit
+                # mask or change visible annotation opacity.
+                widget.labels_layer.opacity = 0.8
+                self.assertAlmostEqual(widget.composite_layer.opacity, 0.67)
+                self.assertAlmostEqual(opacity_slider.value(), 0.67)
+                self.assertEqual(widget.labels_layer.opacity, 0.0)
+
+                # Selecting the visible composite and using its own native
+                # slider also updates the cached edit-layer control.
+                widget.composite_layer.opacity = 0.32
+                self.assertAlmostEqual(opacity_slider.value(), 0.32)
+                self.assertAlmostEqual(widget._annotation_opacity, 0.32)
+
+                # The deferred real-window retry is harmless and does not
+                # duplicate the slider connection.
+                self.assertTrue(widget._install_native_labels_controls(controls))
+                opacity_slider.setValue(0.28)
+                self.assertAlmostEqual(widget.composite_layer.opacity, 0.28)
+                self.assertEqual(widget.labels_layer.opacity, 0.0)
+            finally:
+                controls.close()
 
     def test_repaint_hidden_memberships_is_local_and_undo_redo_exact(self):
         with TemporaryDirectory() as tmp:
@@ -2030,7 +2108,7 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                     "semantic Fill history scanned the full slide"
                 ),
             ):
-                widget.labels_layer.undo()
+                widget.undo()
                 self.assertEqual(widget.composite_layer.data[2, 2], 2)
                 self.assertEqual(
                     widget.overlap_store.memberships_at(2, 2),
@@ -2043,14 +2121,24 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                     np.ones((3, 3), dtype=np.uint8),
                 )
 
-    def test_pick_uses_visible_semantic_class_without_binary_id_leak(self):
+    def test_pick_selects_connected_visible_region_without_switching_paint_class(
+        self,
+    ):
         with TemporaryDirectory() as tmp:
             _, widget, _, _ = self.load_small_project(Path(tmp))
             widget._upsert_class(2, "B", "#123456")
+            widget.labels_layer.data_setitem(
+                (np.array([2, 2, 3]), np.array([2, 3, 2])),
+                1,
+            )
             widget._upsert_class(300, "Review", "#abcdef")
+            widget.labels_layer.data_setitem(
+                (np.array([5]), np.array([5])),
+                1,
+            )
             callback = widget.labels_layer._drag_modes[Mode.PICK]
             event = SimpleNamespace(
-                position=(0, 0),
+                position=(2, 2),
                 view_direction=None,
                 dims_displayed=(0, 1),
             )
@@ -2059,32 +2147,678 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 widget.labels_layer._drag_modes,
                 type(widget.labels_layer)._drag_modes,
             )
-            with patch.object(
-                widget.composite_layer,
-                "get_value",
-                return_value=2,
-            ):
-                callback(widget.labels_layer, event)
+            callback(widget.labels_layer, event)
+            self.assertEqual(widget.overlap_editor.active_class, 300)
+            self.assertEqual(widget.labels_layer.selected_label, 1)
+            self.assertEqual(widget._annotation_selection.value, 2)
+            self.assertEqual(widget._annotation_selection.pixel_count, 3)
+            self.assertTrue(widget._selection_layer.visible)
+            self.assertFalse(widget._selection_layer.editable)
+            self.assertTrue(widget.delete_region_btn.isEnabled())
+            for path in widget._selection_layer.data:
+                np.testing.assert_allclose(path[0], path[-1])
+
+            widget._use_selected_annotation_class()
             self.assertEqual(widget.overlap_editor.active_class, 2)
-            self.assertEqual(widget.labels_layer.selected_label, 1)
+
+            event.position = (5, 5)
+            callback(widget.labels_layer, event)
+            self.assertEqual(widget._annotation_selection.value, 300)
+            self.assertEqual(widget.overlap_editor.active_class, 2)
+
+            event.position = (0, 0)
+            callback(widget.labels_layer, event)
+            self.assertIsNone(widget._annotation_selection)
+            self.assertFalse(widget._selection_layer.visible)
+            self.assertFalse(widget.delete_region_btn.isEnabled())
+            self.assertEqual(widget.overlap_editor.active_class, 2)
+
+    def test_delete_connected_region_reveals_hidden_and_has_exact_history(self):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            rows = np.array([2, 2], dtype=np.intp)
+            columns = np.array([2, 3], dtype=np.intp)
+            widget.labels_layer.data_setitem((rows, columns), 1)
+            widget._upsert_class(2, "Visible", "#123456")
+            widget.labels_layer.data_setitem((rows, columns), 1)
+            # Keep a deliberately unrelated class active. Deletion must erase
+            # the visible class and pair an empty native Labels history atom.
+            widget._upsert_class(3, "Unrelated", "#abcdef")
+            self.assertEqual(widget.overlap_editor.active_class, 3)
+            selection = self.pick_connected_region(widget, (2, 2))
+            self.assertEqual(selection.value, 2)
+            self.assertEqual(selection.pixel_count, 2)
+
+            file_before = labels_path.read_bytes()
+            packed_before = np.array(
+                widget.overlap_store._packed_masks,
+                copy=True,
+            )
+            projection_before = np.array(
+                widget.overlap_editor.composite,
+                copy=True,
+            )
+            tracker = widget.labels_layer._napari_histo_edit_tracker
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.Yes,
+            ), patch.object(
+                widget.overlap_editor,
+                "full_sync",
+                side_effect=AssertionError(
+                    "connected deletion history scanned the full slide"
+                ),
+            ):
+                widget._delete_selected_annotation()
+                self.assertIsNone(widget._annotation_selection)
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite[rows, columns],
+                    np.ones(2, dtype=np.uint8),
+                )
+                for row, column in zip(rows, columns):
+                    self.assertEqual(
+                        widget.overlap_store.memberships_at(row, column),
+                        (1,),
+                    )
+                self.assertEqual(labels_path.read_bytes(), file_before)
+                self.assertEqual(len(widget.labels_layer._undo_history), 1)
+                self.assertEqual(len(tracker.undo_items), 1)
+
+                widget.undo()
+                np.testing.assert_array_equal(
+                    widget.overlap_store._packed_masks,
+                    packed_before,
+                )
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite,
+                    projection_before,
+                )
+                for row, column in zip(rows, columns):
+                    self.assertEqual(
+                        set(widget.overlap_store.memberships_at(row, column)),
+                        {1, 2},
+                    )
+                self.assertEqual(len(widget.labels_layer._redo_history), 1)
+                self.assertEqual(len(tracker.redo_items), 1)
+
+                widget.labels_layer.redo()
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite[rows, columns],
+                    np.ones(2, dtype=np.uint8),
+                )
+                for row, column in zip(rows, columns):
+                    self.assertEqual(
+                        widget.overlap_store.memberships_at(row, column),
+                        (1,),
+                    )
+                self.assertEqual(len(widget.labels_layer._undo_history), 1)
+                self.assertEqual(len(tracker.undo_items), 1)
+                self.assertEqual(labels_path.read_bytes(), file_before)
+
+    def test_move_connected_overlap_is_one_sparse_undo_with_unrelated_active(
+        self,
+    ):
+        with TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, widget, labels_path, _ = self.load_small_project(root)
+            row = np.full(4, 2, dtype=np.intp)
+            base_columns = np.arange(2, 6, dtype=np.intp)
+            widget.labels_layer.data_setitem((row, base_columns), 1)
+
+            widget._upsert_class(2, "Moving", "#123456")
+            source_columns = np.arange(2, 5, dtype=np.intp)
+            source_rows = np.full(3, 2, dtype=np.intp)
+            widget.labels_layer.data_setitem(
+                (source_rows, source_columns),
+                1,
+            )
+            widget._upsert_class(3, "Destination top", "#654321")
+            widget.labels_layer.data_setitem(
+                (np.array([2]), np.array([5])),
+                1,
+            )
+            widget._upsert_class(4, "Unrelated active", "#abcdef")
+            self.assertEqual(widget.overlap_editor.active_class, 4)
+            self.assertFalse(np.any(widget.labels_layer.data))
+
+            selection = self.pick_connected_region(widget, (2, 2))
+            self.assertEqual(selection.value, 2)
+            self.assertEqual(selection.pixel_count, 3)
+            packed_before = np.array(
+                widget.overlap_store._packed_masks,
+                copy=True,
+            )
+            projection_before = np.array(
+                widget.overlap_editor.composite,
+                copy=True,
+            )
+            proxy_before = np.array(widget.labels_layer.data, copy=True)
+            file_before = labels_path.read_bytes()
+            tracker = widget.labels_layer._napari_histo_edit_tracker
+
+            widget.move_region_step.setValue(1)
+            with patch.object(
+                widget.overlap_editor,
+                "full_sync",
+                side_effect=AssertionError("move history scanned the slide"),
+            ), patch.object(
+                widget.overlap_store,
+                "project",
+                side_effect=AssertionError("move rebuilt the projection"),
+            ), patch.object(
+                widget.overlap_store,
+                "select_plane",
+                side_effect=AssertionError("move unpacked a class plane"),
+            ):
+                widget._move_selected_annotation(0, 1)
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite[2, 2:6],
+                    np.array([1, 2, 2, 2], dtype=np.uint8),
+                )
+                self.assertEqual(
+                    widget.overlap_store.memberships_at(2, 2),
+                    (1,),
+                )
+                self.assertEqual(
+                    set(widget.overlap_store.memberships_at(2, 5)),
+                    {1, 2, 3},
+                )
+                self.assertEqual(
+                    widget.overlap_store.memberships_at(2, 5)[-1],
+                    2,
+                )
+                self.assertEqual(widget.overlap_editor.active_class, 4)
+                np.testing.assert_array_equal(
+                    widget.labels_layer.data,
+                    proxy_before,
+                )
+                self.assertEqual(len(widget.labels_layer._undo_history), 1)
+                self.assertEqual(len(tracker.undo_items), 1)
+                packed_after = np.array(
+                    widget.overlap_store._packed_masks,
+                    copy=True,
+                )
+                projection_after = np.array(
+                    widget.overlap_editor.composite,
+                    copy=True,
+                )
+
+                widget.undo()
+                np.testing.assert_array_equal(
+                    widget.overlap_store._packed_masks,
+                    packed_before,
+                )
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite,
+                    projection_before,
+                )
+                np.testing.assert_array_equal(
+                    widget.labels_layer.data,
+                    proxy_before,
+                )
+                self.assertEqual(len(widget.labels_layer._undo_history), 0)
+                self.assertEqual(len(widget.labels_layer._redo_history), 1)
+                self.assertEqual(len(tracker.undo_items), 0)
+                self.assertEqual(len(tracker.redo_items), 1)
+
+                widget.labels_layer.redo()
+                np.testing.assert_array_equal(
+                    widget.overlap_store._packed_masks,
+                    packed_after,
+                )
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite,
+                    projection_after,
+                )
+                np.testing.assert_array_equal(
+                    widget.labels_layer.data,
+                    proxy_before,
+                )
+                self.assertEqual(len(widget.labels_layer._undo_history), 1)
+                self.assertEqual(len(tracker.undo_items), 1)
+                self.assertEqual(widget.overlap_editor.active_class, 4)
+            self.assertEqual(labels_path.read_bytes(), file_before)
+
+    def test_move_connected_active_class_keeps_native_history_aligned(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            source_rows = np.array([3, 3], dtype=np.intp)
+            source_columns = np.array([2, 3], dtype=np.intp)
+            widget.labels_layer.data_setitem(
+                (source_rows, source_columns),
+                1,
+            )
+            widget._limit_undo_history(widget.labels_layer)
+            selection = self.pick_connected_region(widget, (3, 2))
+            self.assertEqual(selection.value, 1)
+            self.assertEqual(widget.overlap_editor.active_class, 1)
+            packed_before = np.array(
+                widget.overlap_store._packed_masks,
+                copy=True,
+            )
+            projection_before = np.array(
+                widget.overlap_editor.composite,
+                copy=True,
+            )
+            proxy_before = np.array(widget.labels_layer.data, copy=True)
+            tracker = widget.labels_layer._napari_histo_edit_tracker
 
             with patch.object(
-                widget.composite_layer,
-                "get_value",
-                return_value=300,
+                widget.overlap_editor,
+                "full_sync",
+                side_effect=AssertionError("active move scanned the slide"),
+            ), patch.object(
+                widget.overlap_store,
+                "project",
+                side_effect=AssertionError("active move rebuilt projection"),
+            ), patch.object(
+                widget.overlap_store,
+                "select_plane",
+                side_effect=AssertionError("active move unpacked a plane"),
             ):
-                callback(widget.labels_layer, event)
-            self.assertEqual(widget.overlap_editor.active_class, 300)
-            self.assertEqual(widget.labels_layer.selected_label, 1)
+                widget._move_selected_annotation(0, 1)
+                np.testing.assert_array_equal(
+                    widget.labels_layer.data[3, 2:5],
+                    np.array([0, 1, 1], dtype=np.uint8),
+                )
+                packed_after = np.array(
+                    widget.overlap_store._packed_masks,
+                    copy=True,
+                )
+                projection_after = np.array(
+                    widget.overlap_editor.composite,
+                    copy=True,
+                )
+                proxy_after = np.array(widget.labels_layer.data, copy=True)
+                self.assertEqual(len(widget.labels_layer._undo_history), 1)
+                self.assertEqual(len(tracker.undo_items), 1)
+
+                widget.undo()
+                np.testing.assert_array_equal(
+                    widget.overlap_store._packed_masks,
+                    packed_before,
+                )
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite,
+                    projection_before,
+                )
+                np.testing.assert_array_equal(
+                    widget.labels_layer.data,
+                    proxy_before,
+                )
+                self.assertEqual(len(widget.labels_layer._redo_history), 1)
+                self.assertEqual(len(tracker.redo_items), 1)
+
+                widget.labels_layer.redo()
+                np.testing.assert_array_equal(
+                    widget.overlap_store._packed_masks,
+                    packed_after,
+                )
+                np.testing.assert_array_equal(
+                    widget.overlap_editor.composite,
+                    projection_after,
+                )
+                np.testing.assert_array_equal(
+                    widget.labels_layer.data,
+                    proxy_after,
+                )
+                self.assertEqual(len(widget.labels_layer._undo_history), 1)
+                self.assertEqual(len(tracker.undo_items), 1)
+
+    def test_connected_region_invalid_moves_are_exact_noops(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            selection = self.pick_connected_region(widget, (1, 1))
+            self.assertIsNotNone(selection)
+
+            widget.move_region_step.setValue(2)
+            state_before = self.connected_runtime_state(widget)
+            widget._move_selected_annotation(-1, 0)
+            self.assertEqual(
+                self.connected_runtime_state(widget),
+                state_before,
+            )
+            self.assertIn("outside the image", widget.viewer.status)
+
+            stale = type(selection)(
+                value=selection.value,
+                rows=selection.rows,
+                columns=selection.columns,
+                outlines=selection.outlines,
+                simplified_preview=selection.simplified_preview,
+                store_revision=int(selection.store_revision) - 1,
+            )
+            widget._annotation_selection = stale
+            stale_before = self.connected_runtime_state(widget)
+            widget._move_selected_annotation(0, 1)
+            self.assertEqual(
+                self.connected_runtime_state(widget),
+                stale_before,
+            )
+            self.assertIn("stale", widget.viewer.status)
+
+            widget._set_annotation_selection(selection)
+            widget._save_worker = object()
+            widget._update_project_controls()
+            try:
+                saving_before = self.connected_runtime_state(widget)
+                widget._move_selected_annotation(0, 1)
+                self.assertEqual(
+                    self.connected_runtime_state(widget),
+                    saving_before,
+                )
+                self.assertIn("save to finish", widget.viewer.status)
+                self.assertFalse(widget.move_region_right_btn.isEnabled())
+            finally:
+                widget._save_worker = None
+                widget._update_project_controls()
+
+    def test_hidden_or_removed_connected_outline_disables_actions(self):
+        with TemporaryDirectory() as tmp:
+            viewer, widget, _, _ = self.load_small_project(Path(tmp))
+            self.assertIsNotNone(self.pick_connected_region(widget, (1, 1)))
+            action_widgets = (
+                widget.use_selection_class_btn,
+                widget.delete_region_btn,
+                widget.clear_region_btn,
+                widget.move_region_step,
+                widget.move_region_up_btn,
+                widget.move_region_down_btn,
+                widget.move_region_left_btn,
+                widget.move_region_right_btn,
+            )
+            self.assertTrue(all(action.isEnabled() for action in action_widgets))
+
+            outline = widget._selection_layer
+            # napari Shapes can reset editable state while changing displayed
+            # dimensions; the preview must never become a data-editing layer.
+            outline.editable = True
+            widget._lock_selection_preview_layer()
+            self.assertFalse(outline.editable)
+            outline.visible = False
+            self.assertIsNotNone(widget._annotation_selection)
+            self.assertTrue(all(not action.isEnabled() for action in action_widgets))
+            self.assertIn("outline is hidden", widget.viewer.status)
+
+            outline.visible = True
+            self.assertTrue(all(action.isEnabled() for action in action_widgets))
+            viewer.layers.remove(outline)
+            self.assertIsNone(widget._selection_layer)
+            self.assertIsNone(widget._annotation_selection)
+            self.assertTrue(all(not action.isEnabled() for action in action_widgets))
+            self.assertEqual(
+                widget.selection_status_label.text(),
+                "No region selected",
+            )
+
+    def test_entering_3d_clears_connected_selection_without_data_changes(self):
+        with TemporaryDirectory() as tmp:
+            viewer, widget, _, _ = self.load_small_project(Path(tmp))
+            self.assertIsNotNone(self.pick_connected_region(widget, (1, 1)))
+            outline = widget._selection_layer
+            state_before = self.connected_runtime_state(widget)
+
+            viewer.dims.ndisplay = 3
+
+            self.assertEqual(viewer.dims.ndisplay, 3)
+            self.assertEqual(
+                self.connected_runtime_state(widget)[:10],
+                state_before[:10],
+            )
+            self.assertIsNone(widget._annotation_selection)
+            self.assertFalse(outline.visible)
+            self.assertEqual(outline.data, [])
+            action_widgets = (
+                widget.use_selection_class_btn,
+                widget.delete_region_btn,
+                widget.clear_region_btn,
+                widget.move_region_step,
+                widget.move_region_up_btn,
+                widget.move_region_down_btn,
+                widget.move_region_left_btn,
+                widget.move_region_right_btn,
+            )
+            self.assertTrue(all(not action.isEnabled() for action in action_widgets))
+            self.assertEqual(
+                widget.selection_status_label.text(),
+                "No region selected",
+            )
+
+    def test_clear_outline_restores_annotation_tools_as_active_layer(self):
+        with TemporaryDirectory() as tmp:
+            viewer, widget, _, _ = self.load_small_project(Path(tmp))
+            self.assertIsNotNone(self.pick_connected_region(widget, (1, 1)))
+            outline = widget._selection_layer
+            viewer.layers.selection.active = outline
+            self.assertIs(viewer.layers.selection.active, outline)
+            state_before = self.connected_runtime_state(widget)
+
+            widget.clear_region_btn.click()
+
+            self.assertEqual(
+                self.connected_runtime_state(widget)[:10],
+                state_before[:10],
+            )
+            self.assertIsNone(widget._annotation_selection)
+            self.assertFalse(outline.visible)
+            self.assertEqual(outline.data, [])
+            self.assertIs(viewer.layers.selection.active, widget.labels_layer)
+            self.assertFalse(widget.delete_region_btn.isEnabled())
+            self.assertFalse(widget.move_region_right_btn.isEnabled())
+
+    def test_failed_replacement_outline_never_leaves_old_selection_armed(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            widget.labels_layer.data_setitem(
+                (np.array([4]), np.array([4])),
+                1,
+            )
+            selected_a = self.pick_connected_region(widget, (1, 1))
+            self.assertIsNotNone(selected_a)
+            self.assertTrue(widget.delete_region_btn.isEnabled())
+            state_before = self.connected_runtime_state(widget)
 
             with patch.object(
-                widget.composite_layer,
-                "get_value",
-                return_value=0,
+                widget._selection_layer,
+                "add",
+                side_effect=RuntimeError("injected outline failure"),
             ):
-                callback(widget.labels_layer, event)
-            self.assertEqual(widget.overlap_editor.active_class, 300)
-            self.assertEqual(widget.labels_layer.selected_label, 0)
+                self.pick_connected_region(widget, (4, 4))
+
+            # The failed preview may clear UI-only outline state, but it must
+            # not touch membership, projection, proxy, or either history pair.
+            self.assertEqual(
+                self.connected_runtime_state(widget)[:10],
+                state_before[:10],
+            )
+            self.assertIsNone(widget._annotation_selection)
+            self.assertFalse(widget._selection_layer.visible)
+            self.assertEqual(widget.selection_status_label.text(), "No region selected")
+            action_widgets = (
+                widget.use_selection_class_btn,
+                widget.delete_region_btn,
+                widget.clear_region_btn,
+                widget.move_region_step,
+                widget.move_region_up_btn,
+                widget.move_region_down_btn,
+                widget.move_region_left_btn,
+                widget.move_region_right_btn,
+            )
+            self.assertTrue(all(not action.isEnabled() for action in action_widgets))
+            self.assertIn("nothing is selected", widget.viewer.status)
+
+    def test_delete_confirmation_that_starts_save_is_exact_noop(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, labels_path, _ = self.load_small_project(Path(tmp))
+            selection = self.pick_connected_region(widget, (1, 1))
+            self.assertIsNotNone(selection)
+            state_before = self.connected_runtime_state(widget)
+            file_before = labels_path.read_bytes()
+            worker = FakeSaveWorker()
+
+            def start_save_then_confirm(*args, **kwargs):
+                del args, kwargs
+                widget.save_labels()
+                self.assertIs(widget._save_worker, worker)
+                return QMessageBox.Yes
+
+            with patch(
+                "napari_histo_label_editor._widget.create_worker",
+                return_value=worker,
+            ), patch.object(
+                QMessageBox,
+                "question",
+                side_effect=start_save_then_confirm,
+            ):
+                widget._delete_selected_annotation()
+
+            self.assertEqual(worker.start_count, 1)
+            self.assertIs(widget._save_worker, worker)
+            self.assertEqual(self.connected_runtime_state(widget), state_before)
+            self.assertIs(widget._annotation_selection, selection)
+            self.assertEqual(labels_path.read_bytes(), file_before)
+            self.assertIn("save to finish before deleting", widget.viewer.status)
+            worker.finished.emit()
+
+    def test_delete_confirmation_selection_change_modifies_neither_object(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, labels_path, _ = self.load_small_project(Path(tmp))
+            widget._upsert_class(2, "Second", "#123456")
+            widget.labels_layer.data_setitem(
+                (np.array([4]), np.array([4])),
+                1,
+            )
+            selected_a = self.pick_connected_region(widget, (1, 1))
+            self.assertEqual(selected_a.value, 1)
+            state_before = self.connected_runtime_state(widget)
+            file_before = labels_path.read_bytes()
+
+            def select_b_then_confirm(*args, **kwargs):
+                del args, kwargs
+                selected_b = self.pick_connected_region(widget, (4, 4))
+                self.assertEqual(selected_b.value, 2)
+                return QMessageBox.Yes
+
+            with patch.object(
+                QMessageBox,
+                "question",
+                side_effect=select_b_then_confirm,
+            ):
+                widget._delete_selected_annotation()
+
+            self.assertEqual(
+                self.connected_runtime_state(widget)[:10],
+                state_before[:10],
+            )
+            self.assertIsNot(widget._annotation_selection, selected_a)
+            self.assertEqual(widget._annotation_selection.value, 2)
+            self.assertEqual(widget.overlap_editor.composite[1, 1], 1)
+            self.assertEqual(widget.overlap_editor.composite[4, 4], 2)
+            self.assertEqual(
+                widget.overlap_store.memberships_at(1, 1),
+                (1,),
+            )
+            self.assertEqual(
+                widget.overlap_store.memberships_at(4, 4),
+                (2,),
+            )
+            self.assertEqual(labels_path.read_bytes(), file_before)
+            self.assertIn("changed while confirming", widget.viewer.status)
+
+    def test_paired_history_destination_append_failure_is_exact_noop(self):
+        class FailingAppendDeque(deque):
+            def append(self, item):
+                del item
+                raise MemoryError("injected paired-history allocation failure")
+
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            widget.labels_layer.data_setitem(
+                (np.array([3]), np.array([4])),
+                1,
+            )
+            tracker = widget.labels_layer._napari_histo_edit_tracker
+            self.assertEqual(len(tracker.undo_items), 1)
+
+            tracker.redo_items = FailingAppendDeque(
+                tracker.redo_items,
+                maxlen=tracker.redo_items.maxlen,
+            )
+            undo_before = self.connected_runtime_state(widget)
+            with self.assertRaisesRegex(
+                MemoryError,
+                "paired-history allocation failure",
+            ):
+                widget.labels_layer.undo()
+            self.assertEqual(self.connected_runtime_state(widget), undo_before)
+
+            tracker.redo_items = deque(
+                tracker.redo_items,
+                maxlen=tracker.redo_items.maxlen,
+            )
+            widget.labels_layer.undo()
+            self.assertEqual(len(tracker.redo_items), 1)
+            tracker.undo_items = FailingAppendDeque(
+                tracker.undo_items,
+                maxlen=tracker.undo_items.maxlen,
+            )
+            redo_before = self.connected_runtime_state(widget)
+            with self.assertRaisesRegex(
+                MemoryError,
+                "paired-history allocation failure",
+            ):
+                widget.labels_layer.redo()
+            self.assertEqual(self.connected_runtime_state(widget), redo_before)
+
+    def test_move_refresh_failure_keeps_applied_move_and_history(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            widget.labels_layer.data_setitem(
+                (np.array([2, 2]), np.array([2, 3])),
+                1,
+            )
+            widget._limit_undo_history(widget.labels_layer)
+            selection = self.pick_connected_region(widget, (2, 2))
+            packed_before = np.array(
+                widget.overlap_store._packed_masks,
+                copy=True,
+            )
+            projection_before = np.array(
+                widget.overlap_editor.composite,
+                copy=True,
+            )
+            tracker = widget.labels_layer._napari_histo_edit_tracker
+            with patch.object(
+                widget,
+                "_refresh_composite_bounds",
+                side_effect=MemoryError("injected display upload failure"),
+            ):
+                widget._move_selected_annotation(0, 1)
+
+            np.testing.assert_array_equal(
+                widget.overlap_editor.composite[2, 2:5],
+                np.array([0, 1, 1], dtype=np.uint8),
+            )
+            self.assertEqual(len(widget.labels_layer._undo_history), 1)
+            self.assertEqual(len(tracker.undo_items), 1)
+            self.assertNotIn("Could not move", widget.viewer.status)
+            self.assertIsNotNone(widget._annotation_selection)
+            np.testing.assert_array_equal(
+                widget._annotation_selection.columns,
+                selection.columns + 1,
+            )
+
+            widget.undo()
+            np.testing.assert_array_equal(
+                widget.overlap_store._packed_masks,
+                packed_before,
+            )
+            np.testing.assert_array_equal(
+                widget.overlap_editor.composite,
+                projection_before,
+            )
 
     def test_large_new_class_promotes_edit_and_save_dtypes_losslessly(self):
         with TemporaryDirectory() as tmp:

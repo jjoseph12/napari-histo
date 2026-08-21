@@ -45,6 +45,8 @@ def bounded_flood_indices(
     *,
     initial_window: int = LOCAL_FLOOD_WINDOW,
     max_local_pixels: int = MAX_LOCAL_FLOOD_PIXELS,
+    max_component_pixels: int | None = None,
+    allow_full_fallback: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return a 4-connected component without starting at full-slide size.
 
@@ -65,6 +67,8 @@ def bounded_flood_indices(
         raise ValueError("initial_window must be at least 1")
     if max_local_pixels < 1:
         raise ValueError("max_local_pixels must be at least 1")
+    if max_component_pixels is not None and max_component_pixels < 1:
+        raise ValueError("max_component_pixels must be at least 1")
 
     height, width = labels.shape
     seed_row, seed_column = (int(seed[0]), int(seed[1]))
@@ -87,6 +91,11 @@ def bounded_flood_indices(
         local_labels = labels[row_start:row_stop, column_start:column_stop]
         local_seed = (seed_row - row_start, seed_column - column_start)
         matches = flood(local_labels, local_seed, connectivity=1)
+        if (
+            max_component_pixels is not None
+            and int(np.count_nonzero(matches)) > max_component_pixels
+        ):
+            raise ValueError("connected component exceeds the pixel limit")
 
         expand_top = bool(
             row_start > 0
@@ -153,9 +162,20 @@ def bounded_flood_indices(
         )
 
         if next_pixels > max_local_pixels:
+            if not allow_full_fallback:
+                raise ValueError(
+                    "connected component exceeds the bounded flood window"
+                )
             # Release the local mask before allocating the full fallback.
             del matches
-            return np.nonzero(flood(labels, seed, connectivity=1))
+            full_matches = flood(labels, seed, connectivity=1)
+            if (
+                max_component_pixels is not None
+                and int(np.count_nonzero(full_matches))
+                > max_component_pixels
+            ):
+                raise ValueError("connected component exceeds the pixel limit")
+            return np.nonzero(full_matches)
 
         row_start, row_stop = next_row_start, next_row_stop
         column_start, column_stop = next_column_start, next_column_stop

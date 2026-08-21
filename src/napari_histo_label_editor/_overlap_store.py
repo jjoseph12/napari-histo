@@ -15,9 +15,11 @@ from __future__ import annotations
 
 import hashlib
 import io
+import operator
 import re
 import uuid
 from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
 from typing import Optional
 
 import numpy as np
@@ -28,6 +30,7 @@ from ._class_config import normalize_color
 FORMAT_VERSION = 1
 PACK_BITORDER = "little"
 _SCAN_BYTES = 8 * 1024 * 1024
+_MAX_MOVE_DELTA_BYTES = 64 * 1024 * 1024
 _NORMALIZED_COLOR = re.compile(r"#[0-9a-f]{6}\Z")
 _GENERATION = re.compile(r"[0-9a-f]{32}\Z")
 _REQUIRED_PAYLOAD_KEYS = frozenset(
@@ -55,9 +58,93 @@ _BYTE_POPCOUNT = np.unpackbits(
 
 __all__ = [
     "FORMAT_VERSION",
+    "OverlapDelta",
+    "OverlapMoveResult",
     "OverlapStore",
     "hash_projection",
 ]
+
+
+def _read_only_copy(values, *, dtype=None) -> np.ndarray:
+    """Return an owned C-contiguous array that callers cannot mutate."""
+
+    result = np.array(values, dtype=dtype, copy=True, order="C")
+    result.setflags(write=False)
+    return result
+
+
+@dataclass(frozen=True, eq=False)
+class OverlapDelta:
+    """Immutable sparse history token for one translated annotation object.
+
+    The before/after arrays are aligned with ``affected_rows`` and
+    ``affected_columns``.  They are complete enough to replay either
+    direction without unpacking a class plane or reprojecting the slide.
+    ``store_id`` intentionally binds a token to its live originating store;
+    these runtime history objects are not a serialized file format.
+    """
+
+    store_id: int
+    shape: tuple[int, int]
+    value: int
+    row_delta: int
+    column_delta: int
+    source_rows: np.ndarray
+    source_columns: np.ndarray
+    destination_rows: np.ndarray
+    destination_columns: np.ndarray
+    affected_rows: np.ndarray
+    affected_columns: np.ndarray
+    membership_before: np.ndarray
+    membership_after: np.ndarray
+    projection_before: np.ndarray
+    projection_after: np.ndarray
+    source_bounds: tuple[int, int, int, int]
+    destination_bounds: tuple[int, int, int, int]
+    revision_before: int
+    revision_after: int
+
+    @property
+    def source_indices(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.source_rows, self.source_columns
+
+    @property
+    def destination_indices(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.destination_rows, self.destination_columns
+
+    @property
+    def affected_indices(self) -> tuple[np.ndarray, np.ndarray]:
+        return self.affected_rows, self.affected_columns
+
+    @property
+    def nbytes(self) -> int:
+        """Exact bytes owned by the sparse array payload of this token."""
+
+        arrays = (
+            self.source_rows,
+            self.source_columns,
+            self.destination_rows,
+            self.destination_columns,
+            self.affected_rows,
+            self.affected_columns,
+            self.membership_before,
+            self.membership_after,
+            self.projection_before,
+            self.projection_after,
+        )
+        return sum(int(array.nbytes) for array in arrays)
+
+
+@dataclass(frozen=True)
+class OverlapMoveResult:
+    """Bounded refresh information returned after applying a move delta."""
+
+    changed: int
+    source_bounds: tuple[int, int, int, int]
+    destination_bounds: tuple[int, int, int, int]
+    forward: bool
+    revision_before: int
+    revision_after: int
 
 
 def _validate_label_array(data, description: str) -> np.ndarray:
@@ -333,6 +420,7 @@ class OverlapStore:
         )
         self._projection_sha256 = str(projection_sha256)
         self._generation = str(generation)
+        self._revision = 0
         if projection is None:
             self._projection = self._project_by_global_order(
                 dtype=self._projection_dtype,
@@ -477,6 +565,12 @@ class OverlapStore:
     @property
     def generation(self) -> str:
         return self._generation
+
+    @property
+    def revision(self) -> int:
+        """Monotonic in-memory mutation counter for stale-selection checks."""
+
+        return self._revision
 
     @property
     def packed_masks(self) -> np.ndarray:
@@ -753,6 +847,385 @@ class OverlapStore:
         self._mark_modified()
         return count
 
+    def plan_move(
+        self,
+        value: int,
+        indices,
+        offset,
+        *,
+        expected_revision: int | None = None,
+    ) -> OverlapDelta:
+        """Plan an exact sparse translation without mutating the store.
+
+        The selected source must still be visibly owned by ``value``.  The
+        resulting membership is ``(old & ~source) | destination``; translated
+        pixels become visibly topmost while source-only pixels reveal the
+        stable hidden fallback. A destination cannot contain a same-class
+        membership outside the source because one boolean class plane cannot
+        preserve two object identities after such a merge. ``expected_revision``
+        should be the revision captured when the UI selected the object.
+        """
+
+        value = int(value)
+        self._require_class(value)
+        if expected_revision is not None:
+            try:
+                selection_revision = operator.index(expected_revision)
+            except TypeError as error:
+                raise TypeError("Expected revision must be an integer") from error
+            if selection_revision != self._revision:
+                raise RuntimeError(
+                    "The selected annotation is stale; select it again."
+                )
+
+        try:
+            raw_row_delta, raw_column_delta = offset
+        except (TypeError, ValueError) as error:
+            raise ValueError(
+                "Move offset must contain row and column deltas"
+            ) from error
+        if isinstance(raw_row_delta, (bool, np.bool_)) or isinstance(
+            raw_column_delta,
+            (bool, np.bool_),
+        ):
+            raise TypeError("Move deltas must be integers")
+        try:
+            row_delta = operator.index(raw_row_delta)
+            column_delta = operator.index(raw_column_delta)
+        except TypeError as error:
+            raise TypeError("Move deltas must be integers") from error
+        if row_delta == 0 and column_delta == 0:
+            raise ValueError("Move offset cannot be zero")
+
+        source_rows, source_columns = self._sparse_indices(indices)
+        if source_rows.size == 0:
+            raise ValueError("A moved annotation cannot be empty")
+        width = self._shape[1]
+        source_linear = (
+            source_rows.astype(np.intp, copy=False) * width
+            + source_columns.astype(np.intp, copy=False)
+        )
+        if np.unique(source_linear).size != source_linear.size:
+            raise ValueError("Moved annotation coordinates must be unique")
+
+        row_min = int(source_rows.min()) + row_delta
+        row_max = int(source_rows.max()) + row_delta
+        column_min = int(source_columns.min()) + column_delta
+        column_max = int(source_columns.max()) + column_delta
+        if (
+            row_min < 0
+            or column_min < 0
+            or row_max >= self._shape[0]
+            or column_max >= self._shape[1]
+        ):
+            raise ValueError("The moved annotation would leave the image")
+        if np.any(self._projection[source_rows, source_columns] != value):
+            raise RuntimeError(
+                "The selected annotation is stale; select it again."
+            )
+
+        # Refuse an operation whose immutable history token could itself put
+        # the application under memory pressure. This check precedes all
+        # destination/union allocations and intentionally overestimates a
+        # maximally disjoint source and destination.
+        source_count = int(source_rows.size)
+        affected_limit = source_count * 2
+        estimated_token_bytes = (
+            source_count * np.dtype(np.intp).itemsize * 4
+            + affected_limit * np.dtype(np.intp).itemsize * 2
+            + affected_limit * 2
+            + affected_limit * self._projection.dtype.itemsize * 2
+        )
+        if estimated_token_bytes > _MAX_MOVE_DELTA_BYTES:
+            raise ValueError(
+                "The selected annotation is too large to move safely; "
+                "split it into smaller annotations first."
+            )
+
+        source_rows = np.asarray(source_rows, dtype=np.intp)
+        source_columns = np.asarray(source_columns, dtype=np.intp)
+        destination_rows = source_rows + row_delta
+        destination_columns = source_columns + column_delta
+        destination_linear = destination_rows * width + destination_columns
+        affected_linear = np.unique(
+            np.concatenate((source_linear, destination_linear))
+        )
+        affected_rows = affected_linear // width
+        affected_columns = affected_linear % width
+        source_positions = np.searchsorted(affected_linear, source_linear)
+        destination_positions = np.searchsorted(
+            affected_linear,
+            destination_linear,
+        )
+
+        membership_before = self._membership_at_indices(
+            value,
+            affected_rows,
+            affected_columns,
+        )
+        source_membership = np.zeros(affected_rows.shape, dtype=bool)
+        source_membership[source_positions] = True
+        destination_outside_source = ~source_membership[
+            destination_positions
+        ]
+        if np.any(
+            membership_before[
+                destination_positions[destination_outside_source]
+            ]
+        ):
+            raise ValueError(
+                "The move would merge with another annotation of the same "
+                "class. Move somewhere that does not overlap that class."
+            )
+        membership_after = np.array(membership_before, copy=True)
+        membership_after[source_positions] = False
+        membership_after[destination_positions] = True
+
+        projection_before = np.array(
+            self._projection[affected_rows, affected_columns],
+            copy=True,
+        )
+        projection_after = np.zeros(
+            affected_rows.shape,
+            dtype=self._projection.dtype,
+        )
+        for class_value in self._z_order:
+            membership = (
+                membership_after
+                if class_value == value
+                else self._membership_at_indices(
+                    class_value,
+                    affected_rows,
+                    affected_columns,
+                )
+            )
+            projection_after[membership] = class_value
+        # A move is a local paint at the destination, independent of global
+        # class order or any previously raised top at those pixels.
+        projection_after[destination_positions] = value
+
+        source_bounds = (
+            int(source_rows.min()),
+            int(source_rows.max()) + 1,
+            int(source_columns.min()),
+            int(source_columns.max()) + 1,
+        )
+        destination_bounds = (
+            int(destination_rows.min()),
+            int(destination_rows.max()) + 1,
+            int(destination_columns.min()),
+            int(destination_columns.max()) + 1,
+        )
+        revision_before = self._revision
+        return OverlapDelta(
+            store_id=id(self),
+            shape=self._shape,
+            value=value,
+            row_delta=row_delta,
+            column_delta=column_delta,
+            source_rows=_read_only_copy(source_rows, dtype=np.intp),
+            source_columns=_read_only_copy(source_columns, dtype=np.intp),
+            destination_rows=_read_only_copy(
+                destination_rows,
+                dtype=np.intp,
+            ),
+            destination_columns=_read_only_copy(
+                destination_columns,
+                dtype=np.intp,
+            ),
+            affected_rows=_read_only_copy(affected_rows, dtype=np.intp),
+            affected_columns=_read_only_copy(
+                affected_columns,
+                dtype=np.intp,
+            ),
+            membership_before=_read_only_copy(
+                membership_before,
+                dtype=bool,
+            ),
+            membership_after=_read_only_copy(
+                membership_after,
+                dtype=bool,
+            ),
+            projection_before=_read_only_copy(
+                projection_before,
+                dtype=self._projection.dtype,
+            ),
+            projection_after=_read_only_copy(
+                projection_after,
+                dtype=self._projection.dtype,
+            ),
+            source_bounds=source_bounds,
+            destination_bounds=destination_bounds,
+            revision_before=revision_before,
+            revision_after=revision_before + 1,
+        )
+
+    def apply_delta(
+        self,
+        delta: OverlapDelta,
+        *,
+        forward: bool,
+        expected_revision: int | None = None,
+    ) -> OverlapMoveResult:
+        """Atomically apply or reverse one :class:`OverlapDelta`.
+
+        Both the packed membership and authoritative sparse top values must
+        match the requested side of the token. A stale or out-of-order token
+        is rejected before mutation. Failed packed writes restore raw bytes,
+        projection values, metadata hashes, and the in-memory revision.
+        """
+
+        if not isinstance(delta, OverlapDelta):
+            raise TypeError("delta must be an OverlapDelta")
+        if not isinstance(forward, (bool, np.bool_)):
+            raise TypeError("forward must be a boolean")
+        if delta.store_id != id(self) or tuple(delta.shape) != self._shape:
+            raise ValueError("Move delta belongs to a different overlap store")
+        self._require_class(delta.value)
+        if expected_revision is not None:
+            try:
+                required_revision = operator.index(expected_revision)
+            except TypeError as error:
+                raise TypeError("Expected revision must be an integer") from error
+            if required_revision != self._revision:
+                raise RuntimeError("Move history revision is stale")
+
+        rows, columns = self._sparse_indices(delta.affected_indices)
+        expected_membership = np.asarray(
+            delta.membership_before
+            if forward
+            else delta.membership_after
+        )
+        desired_membership = np.asarray(
+            delta.membership_after
+            if forward
+            else delta.membership_before
+        )
+        expected_projection = np.asarray(
+            delta.projection_before
+            if forward
+            else delta.projection_after
+        )
+        desired_projection = np.asarray(
+            delta.projection_after
+            if forward
+            else delta.projection_before
+        )
+        if any(array.shape != rows.shape for array in (
+            expected_membership,
+            desired_membership,
+            expected_projection,
+            desired_projection,
+        )) or rows.shape != columns.shape:
+            raise ValueError("Move delta arrays are not aligned")
+        if (
+            expected_membership.dtype != np.dtype(np.bool_)
+            or desired_membership.dtype != np.dtype(np.bool_)
+        ):
+            raise TypeError("Move membership history must be boolean")
+        if not (
+            np.issubdtype(expected_projection.dtype, np.integer)
+            and np.issubdtype(desired_projection.dtype, np.integer)
+        ):
+            raise TypeError("Move projection history must be integer")
+        if rows.size:
+            linear = rows * self._shape[1] + columns
+            if np.unique(linear).size != linear.size:
+                raise ValueError("Move delta coordinates must be unique")
+
+        current_membership = self._membership_at_indices(
+            delta.value,
+            rows,
+            columns,
+        )
+        current_projection = np.array(
+            self._projection[rows, columns],
+            copy=True,
+        )
+        if not np.array_equal(current_membership, expected_membership) or not (
+            np.array_equal(current_projection, expected_projection)
+        ):
+            raise RuntimeError("Move delta no longer matches overlap state")
+
+        # Validate the complete requested sparse projection before touching a
+        # packed byte. This also protects the store if a caller fabricates or
+        # tampers with a runtime history token.
+        occupied = np.zeros(rows.shape, dtype=bool)
+        valid_top = np.zeros(rows.shape, dtype=bool)
+        for class_value in self._class_values:
+            membership = (
+                desired_membership
+                if class_value == delta.value
+                else self._membership_at_indices(
+                    class_value,
+                    rows,
+                    columns,
+                )
+            )
+            occupied |= membership
+            valid_top |= membership & (desired_projection == class_value)
+        if np.any((desired_projection == 0) != ~occupied) or np.any(
+            (desired_projection != 0) & ~valid_top
+        ):
+            raise ValueError(
+                "Move projection history does not match memberships"
+            )
+
+        changed = (current_membership != desired_membership) | (
+            current_projection != desired_projection
+        )
+        revision_before = self._revision
+        changed_count = int(np.count_nonzero(changed))
+        result = OverlapMoveResult(
+            changed=changed_count,
+            source_bounds=delta.source_bounds,
+            destination_bounds=delta.destination_bounds,
+            forward=bool(forward),
+            revision_before=revision_before,
+            revision_after=revision_before + int(changed_count != 0),
+        )
+        if changed_count == 0:
+            return result
+
+        selector_values = np.broadcast_to(
+            np.asarray(delta.value, dtype=np.int64),
+            rows.shape,
+        )
+        packed_snapshot = self._snapshot_membership_bytes(
+            (delta.value,),
+            rows,
+            columns,
+            selector_values=selector_values,
+        )
+        projection_sha256 = self._projection_sha256
+        generation = self._generation
+        revision = self._revision
+        try:
+            removals = current_membership & ~desired_membership
+            additions = ~current_membership & desired_membership
+            self._set_membership_at_indices(
+                delta.value,
+                rows[removals],
+                columns[removals],
+                present=False,
+            )
+            self._set_membership_at_indices(
+                delta.value,
+                rows[additions],
+                columns[additions],
+                present=True,
+            )
+            self._projection[rows, columns] = desired_projection
+            self._mark_modified()
+        except BaseException:
+            self._restore_membership_bytes(packed_snapshot)
+            self._projection[rows, columns] = current_projection
+            self._projection_sha256 = projection_sha256
+            self._generation = generation
+            self._revision = revision
+            raise
+        return result
+
     def erase_visible_indices(
         self,
         indices,
@@ -806,6 +1279,7 @@ class OverlapStore:
         )
         projection_sha256 = self._projection_sha256
         generation = self._generation
+        revision = self._revision
         try:
             for raw_value in affected_values:
                 value = int(raw_value)
@@ -823,6 +1297,7 @@ class OverlapStore:
             self._projection[rows, columns] = top_before
             self._projection_sha256 = projection_sha256
             self._generation = generation
+            self._revision = revision
             raise
         return int(np.count_nonzero(erase)), top_before, top_after
 
@@ -907,6 +1382,7 @@ class OverlapStore:
         )
         projection_sha256 = self._projection_sha256
         generation = self._generation
+        revision = self._revision
         try:
             for raw_value in affected_values:
                 value = int(raw_value)
@@ -927,6 +1403,7 @@ class OverlapStore:
             self._projection[rows, columns] = projection_before
             self._projection_sha256 = projection_sha256
             self._generation = generation
+            self._revision = revision
             raise
         return int(np.count_nonzero(changed))
 
@@ -968,17 +1445,19 @@ class OverlapStore:
             projection_snapshot,
             self._projection_sha256,
             self._generation,
+            self._revision,
         )
 
     def restore_erased_transaction(self, snapshot) -> None:
         """Restore an opaque multi-atom snapshot without new allocations."""
 
-        packed, projection, projection_sha256, generation = snapshot
+        packed, projection, projection_sha256, generation, revision = snapshot
         self._restore_membership_bytes(packed)
         for rows, columns, values in projection:
             self._projection[rows, columns] = values
         self._projection_sha256 = projection_sha256
         self._generation = generation
+        self._revision = revision
 
     def restore_projection_indices(self, indices, values) -> int:
         """Restore sparse authoritative tops after membership Undo/Redo.
@@ -1545,6 +2024,7 @@ class OverlapStore:
     def _mark_modified(self) -> None:
         self._projection_sha256 = ""
         self._generation = ""
+        self._revision += 1
 
     def _projection_matches(self, projection) -> bool:
         array = _validate_label_array(projection, "Projection")

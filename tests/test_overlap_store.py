@@ -41,6 +41,26 @@ class OverlapStoreTest(unittest.TestCase):
         return labels, store
 
     @staticmethod
+    def make_move_store():
+        labels = np.zeros((5, 9), dtype=np.uint8)
+        labels[2, [1, 3, 4, 5, 6]] = 2
+        store = OverlapStore.from_legacy(
+            labels,
+            {0: "Background", 1: "Moved", 2: "Lower", 3: "Other"},
+        )
+        store.update_patch(
+            3,
+            (2, 2),
+            np.array([[1, 0, 1]], dtype=np.uint8),
+        )
+        store.update_patch(
+            1,
+            (2, 1),
+            np.ones((1, 3), dtype=np.uint8),
+        )
+        return store
+
+    @staticmethod
     def store_snapshot(store):
         return {
             "class_map": store.class_map,
@@ -50,6 +70,7 @@ class OverlapStoreTest(unittest.TestCase):
             "projection_dtype": store.projection_dtype,
             "projection_sha256": store.projection_sha256,
             "generation": store.generation,
+            "revision": store.revision,
             "packed_masks": np.array(store.packed_masks, copy=True),
             "projection": store.project(),
         }
@@ -65,6 +86,7 @@ class OverlapStoreTest(unittest.TestCase):
             snapshot["projection_sha256"],
         )
         self.assertEqual(store.generation, snapshot["generation"])
+        self.assertEqual(store.revision, snapshot["revision"])
         np.testing.assert_array_equal(
             store.packed_masks,
             snapshot["packed_masks"],
@@ -131,6 +153,223 @@ class OverlapStoreTest(unittest.TestCase):
             1,
         )
         self.assertEqual(store.project()[0, 1], 2)
+
+    def test_sparse_move_formula_tops_and_exact_undo_redo(self):
+        store = self.make_move_store()
+        source = (np.array([2, 2, 2]), np.array([1, 2, 3]))
+        before = self.store_snapshot(store)
+        revision = store.revision
+
+        with patch.object(
+            store,
+            "select_plane",
+            side_effect=AssertionError("move unpacked a class plane"),
+        ), patch.object(
+            store,
+            "project",
+            side_effect=AssertionError("move projected the slide"),
+        ):
+            delta = store.plan_move(
+                1,
+                source,
+                (0, 2),
+                expected_revision=revision,
+            )
+            result = store.apply_delta(
+                delta,
+                forward=True,
+                expected_revision=revision,
+            )
+
+        self.assertEqual(delta.source_bounds, (2, 3, 1, 4))
+        self.assertEqual(delta.destination_bounds, (2, 3, 3, 6))
+        self.assertEqual(result.source_bounds, delta.source_bounds)
+        self.assertEqual(result.destination_bounds, delta.destination_bounds)
+        self.assertGreater(delta.nbytes, 0)
+        for values in (
+            delta.source_rows,
+            delta.source_columns,
+            delta.destination_rows,
+            delta.destination_columns,
+            delta.affected_rows,
+            delta.affected_columns,
+            delta.membership_before,
+            delta.membership_after,
+            delta.projection_before,
+            delta.projection_after,
+        ):
+            self.assertFalse(values.flags.writeable)
+        # (old & ~{1,2,3}) | {3,4,5} is exactly {3,4,5}.
+        np.testing.assert_array_equal(
+            np.flatnonzero(store.select_plane(1)[2]),
+            np.array([3, 4, 5]),
+        )
+        # Source-only pixels reveal their hidden memberships, source/dest
+        # overlap stays class 1, and destination paints class 1 on top.
+        np.testing.assert_array_equal(
+            store.projection_view[2, 1:6],
+            np.array([2, 3, 1, 1, 1]),
+        )
+        self.assertEqual(store.memberships_at(2, 3), (2, 1))
+        self.assertEqual(store.memberships_at(2, 4), (2, 3, 1))
+        self.assertEqual(result.revision_before, revision)
+        self.assertEqual(result.revision_after, revision + 1)
+
+        undo = store.apply_delta(delta, forward=False)
+        self.assertGreater(undo.changed, 0)
+        np.testing.assert_array_equal(store.packed_masks, before["packed_masks"])
+        np.testing.assert_array_equal(
+            store.projection_view,
+            before["projection"],
+        )
+        self.assertGreater(store.revision, result.revision_after)
+
+        redo = store.apply_delta(delta, forward=True)
+        self.assertGreater(redo.changed, 0)
+        np.testing.assert_array_equal(
+            np.flatnonzero(store.select_plane(1)[2]),
+            np.array([3, 4, 5]),
+        )
+
+    def test_move_rejections_are_exact_noops(self):
+        store = self.make_move_store()
+        source = (np.array([2, 2, 2]), np.array([1, 2, 3]))
+        before = self.store_snapshot(store)
+
+        for offset in ((0, 0), (0, -2), (-3, 0)):
+            with self.subTest(offset=offset):
+                with self.assertRaises(ValueError):
+                    store.plan_move(1, source, offset)
+                self.assert_store_matches_snapshot(store, before)
+        with self.assertRaisesRegex(ValueError, "unique"):
+            store.plan_move(
+                1,
+                (np.array([2, 2]), np.array([1, 1])),
+                (0, 1),
+            )
+        self.assert_store_matches_snapshot(store, before)
+
+        selected_revision = store.revision
+        store.set_class_metadata(3, name="Renamed")
+        changed = self.store_snapshot(store)
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            store.plan_move(
+                1,
+                source,
+                (0, 1),
+                expected_revision=selected_revision,
+            )
+        self.assert_store_matches_snapshot(store, changed)
+
+        # Even without a supplied revision, a source pixel no longer visibly
+        # owned by the selected class rejects the stale component.
+        store.raise_projection_indices(
+            2,
+            (np.array([2]), np.array([1])),
+        )
+        changed = self.store_snapshot(store)
+        with self.assertRaisesRegex(RuntimeError, "stale"):
+            store.plan_move(1, source, (0, 1))
+        self.assert_store_matches_snapshot(store, changed)
+
+    def test_move_rejects_visible_and_hidden_same_class_destinations(self):
+        source = (np.array([2, 2, 2]), np.array([1, 2, 3]))
+        for hidden in (False, True):
+            with self.subTest(hidden=hidden):
+                store = self.make_move_store()
+                store.update_patch(
+                    1,
+                    (2, 5),
+                    np.ones((1, 1), dtype=np.uint8),
+                )
+                if hidden:
+                    store.raise_projection_indices(
+                        2,
+                        (np.array([2]), np.array([5])),
+                    )
+                    self.assertEqual(store.projection_view[2, 5], 2)
+                    self.assertIn(1, store.memberships_at(2, 5))
+                before = self.store_snapshot(store)
+
+                with self.assertRaisesRegex(ValueError, "same class"):
+                    store.plan_move(1, source, (0, 2))
+
+                self.assert_store_matches_snapshot(store, before)
+
+    def test_move_allows_shifted_source_overlap_and_cross_class_overlap(self):
+        store = self.make_move_store()
+        source = (np.array([2, 2, 2]), np.array([1, 2, 3]))
+
+        # Destination {3,4,5} overlaps the source at 3 and other classes at
+        # 3, 4, and 5. Only a same-class membership outside source is unsafe.
+        delta = store.plan_move(1, source, (0, 2))
+        store.apply_delta(delta, forward=True)
+
+        np.testing.assert_array_equal(
+            np.flatnonzero(store.select_plane(1)[2]),
+            np.array([3, 4, 5]),
+        )
+        self.assertEqual(store.memberships_at(2, 3), (2, 1))
+        self.assertEqual(store.memberships_at(2, 4), (2, 3, 1))
+
+    def test_failed_sparse_move_restores_every_raw_state_field(self):
+        for fail_at in (1, 2):
+            with self.subTest(fail_at=fail_at):
+                store = self.make_move_store()
+                source = (np.array([2, 2, 2]), np.array([1, 2, 3]))
+                delta = store.plan_move(1, source, (0, 2))
+                before = self.store_snapshot(store)
+                native_setter = store._set_membership_at_indices
+                calls = 0
+
+                def failing_setter(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == fail_at:
+                        raise MemoryError("forced move setter failure")
+                    return native_setter(*args, **kwargs)
+
+                with patch.object(
+                    store,
+                    "_set_membership_at_indices",
+                    side_effect=failing_setter,
+                ):
+                    with self.assertRaisesRegex(MemoryError, "forced move"):
+                        store.apply_delta(delta, forward=True)
+
+                self.assert_store_matches_snapshot(store, before)
+
+    def test_stale_move_delta_is_rejected_before_any_additional_mutation(self):
+        store = self.make_move_store()
+        source = (np.array([2, 2, 2]), np.array([1, 2, 3]))
+        delta = store.plan_move(1, source, (0, 2))
+        store.raise_projection_indices(
+            2,
+            (np.array([2]), np.array([1])),
+        )
+        stale_state = self.store_snapshot(store)
+
+        with self.assertRaisesRegex(RuntimeError, "no longer matches"):
+            store.apply_delta(delta, forward=True)
+
+        self.assert_store_matches_snapshot(store, stale_state)
+
+    def test_failed_move_mark_restores_incremented_revision(self):
+        store = self.make_move_store()
+        source = (np.array([2, 2, 2]), np.array([1, 2, 3]))
+        delta = store.plan_move(1, source, (0, 2))
+        before = self.store_snapshot(store)
+        native_mark = store._mark_modified
+
+        def failing_mark():
+            native_mark()
+            raise MemoryError("forced move mark failure")
+
+        with patch.object(store, "_mark_modified", side_effect=failing_mark):
+            with self.assertRaisesRegex(MemoryError, "forced move mark"):
+                store.apply_delta(delta, forward=True)
+
+        self.assert_store_matches_snapshot(store, before)
 
     def test_sparse_semantic_erase_reveals_and_restores_mixed_overlaps(self):
         _, store = self.make_store()

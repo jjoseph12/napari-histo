@@ -33,6 +33,8 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * Bounding-box polygon rendering instead of full-slide temporary masks
 * Cursor-aligned, high-visibility polygon preview on oversized textures
 * Partial GPU brush updates even when napari downsamples the Labels texture
+* Connected-region selection with an outline, confirmed deletion, and
+  one-step move Undo/Redo
 * Automatic multiscale display for large RGB images
 * Non-blocking, atomic saves that keep the interface responsive
 * Save the ordinary 2-D projection and lossless overlap data together inside
@@ -171,17 +173,21 @@ The plugin will display:
 * one shortcut button for every class
 * a shortcut button for **Background**
 
-The napari layer list uses three purpose-based names:
+The napari layer list uses four purpose-based names:
 
 * **Annotation tools — value: name** is the transparent working layer that
   keeps napari's Paint, Fill, Erase, Polygon, Pick, and Undo tools available;
 * **Annotations** is the visible top-class result generated from the lossless
-  overlap model; and
-* **Histology** is the tissue image underneath.
+  overlap model;
+* **Histology** is the tissue image underneath; and
+* **Selected annotation outline (preview)** is a locked, lightweight yellow
+  outline. It stays hidden until a visible region is selected.
 
 Keep **Annotation tools** selected while drawing. Its transparency is
-intentional; use the plugin's **Annotation opacity** control directly below
-**Load** to change how strongly the visible **Annotations** layer is shown.
+intentional. Use the original napari **opacity** slider in the Labels controls
+to change how strongly the visible **Annotations** layer is shown. The plugin
+redirects that slider to the visible overlay while the editing proxy stays
+transparent.
 
 Hover over the label overlay to see the label value and class name at the
 cursor (for example, `Label: 3 — Tumor`). The overlay can remain visible while
@@ -264,11 +270,41 @@ the revealed class follows a stable saved fallback order. The format preserves
 every membership and the current visible top class, but it does not store a
 complete chronological stack of every past paint operation at each pixel.
 
-The Pick tool uses the visible semantic projection: picking a displayed class
-selects that semantic class rather than the internal binary edit value.
+The Pick tool uses the visible semantic projection. It selects the connected
+visible region under the cursor rather than the internal binary edit value or
+silently changing the active paint class.
 
-All Paint, Polygon, Fill, Erase, repaint, and Pick-driven annotation changes
-remain in memory until **Save** is pressed.
+All Paint, Polygon, Fill, Erase, repaint, region Delete, and region Move
+changes remain in memory until **Save** is pressed.
+
+## Selecting, outlining, deleting, or moving a visible region
+
+Choose napari's **Pick** tool and click a visible annotation. The editor draws
+a yellow outline and reports its class and pixel count under **Selected visible
+region**. Selection follows 4-connected visible pixels. Because a semantic
+pixel mask does not retain the identity of every polygon that originally drew
+it, touching regions of the same visible class are one connected region.
+
+The selected pixels are exact. For a very complicated boundary, only the
+yellow preview may be simplified; the Delete or Move operation still uses the
+exact selected pixels. Regions above the safe selection limit are refused
+without changing data.
+
+Available actions are:
+
+* **Use class** changes the active paint class to the selected
+  region's class.
+* **Delete…** asks for confirmation, removes only that visible class
+  membership, and reveals any annotation underneath.
+* **Step** sets an exact integer pixel distance; the four arrow buttons
+  translate the region. Other classes at the destination remain stored as
+  overlaps. Moves outside the image or into a separate region of the same
+  class are refused instead of merging annotation identities.
+* **Clear** cancels the selection without changing annotations.
+
+Delete and Move each create one Undo step. The outline preview is not saved or
+exported; it only shows the currently selected pixels. The moved/deleted
+annotation data itself remains in memory until **Save**, just like painting.
 
 ---
 
@@ -314,10 +350,13 @@ Classes already present in the polygon remain stored underneath it.
 
 # Adjusting Annotation Visibility
 
-Use the plugin's **Annotation opacity** slider directly below **Load** to
-adjust the visible annotations.
-The napari Labels controls operate on a transparent editing proxy; its opacity
-is forced to zero so it cannot cover the semantic composite.
+Use the original napari Labels **opacity** slider to adjust the visible
+annotations. The editor redirects that native control to **Annotations** while
+keeping the transparent editing proxy at zero opacity.
+
+The native **brush size** control is expanded from `1–40` to `1–512`. Drag the
+slider or click its displayed number to type an exact size. Very large brushes
+touch many pixels per stroke, so reduce the size if painting becomes slower.
 
 Reducing opacity allows the underlying histology image to remain visible while editing.
 
@@ -431,7 +470,7 @@ napari workflow.
 * Zoom in before editing fine structures.
 * Use **Fill** for correcting entire objects.
 * Use **Background + Fill** to quickly remove incorrectly labeled objects.
-* Reduce **Annotation opacity** when tracing difficult boundaries.
+* Reduce the native Labels **opacity** when tracing difficult boundaries.
 * Keep **Histology** below **Annotations** for the clearest visualization.
 
 ---

@@ -23,7 +23,7 @@ import numpy as np
 import numpy.typing as npt
 
 if TYPE_CHECKING:
-    from ._overlap_store import OverlapStore
+    from ._overlap_store import OverlapDelta, OverlapMoveResult, OverlapStore
 
 
 __all__ = ["OverlapEditorController"]
@@ -105,6 +105,12 @@ class OverlapEditorController:
         """
 
         return self._edit_mask
+
+    @property
+    def revision(self) -> int:
+        """Current in-memory store revision for selection freshness checks."""
+
+        return self.store.revision
 
     def select_class(self, value: int) -> np.ndarray:
         """Switch the binary editor to ``value`` without reprojecting.
@@ -282,6 +288,92 @@ class OverlapEditorController:
                 removed_active_columns,
             ] = 0
         return int(changed), bounds, top_before, top_after
+
+    def plan_object_move(
+        self,
+        value: int,
+        indices: Any,
+        offset: Sequence[int],
+        *,
+        expected_revision: int | None = None,
+    ) -> "OverlapDelta":
+        """Build an immutable sparse move token without changing arrays."""
+
+        normalized = self.normalize_indices(indices)
+        return self.store.plan_move(
+            value,
+            normalized,
+            offset,
+            expected_revision=expected_revision,
+        )
+
+    def apply_overlap_delta(
+        self,
+        delta: "OverlapDelta",
+        *,
+        forward: bool,
+        expected_revision: int | None = None,
+    ) -> "OverlapMoveResult":
+        """Atomically apply a move token and synchronize the active proxy."""
+
+        proxy_rollback = None
+        if self._active_class == delta.value:
+            expected_membership = (
+                delta.membership_before
+                if forward
+                else delta.membership_after
+            )
+            desired_membership = (
+                delta.membership_after
+                if forward
+                else delta.membership_before
+            )
+            proxy_current = np.array(
+                self._edit_mask[delta.affected_indices],
+                copy=True,
+            )
+            proxy_matches_expected = np.array_equal(
+                proxy_current != 0,
+                expected_membership,
+            )
+            proxy_matches_desired = np.array_equal(
+                proxy_current != 0,
+                desired_membership,
+            )
+            if not proxy_matches_expected and not proxy_matches_desired:
+                raise RuntimeError(
+                    "Move delta no longer matches the active edit mask"
+                )
+            proxy_rollback = expected_membership
+            if not proxy_matches_desired:
+                try:
+                    self._edit_mask[
+                        delta.affected_indices
+                    ] = desired_membership
+                except BaseException:
+                    # Bypass a failing ndarray-subclass override so even an
+                    # injected partial proxy write is restored exactly.
+                    np.ndarray.__setitem__(
+                        self._edit_mask,
+                        delta.affected_indices,
+                        proxy_rollback,
+                    )
+                    raise
+        try:
+            result = self.store.apply_delta(
+                delta,
+                forward=forward,
+                expected_revision=expected_revision,
+            )
+        except BaseException:
+            if proxy_rollback is not None:
+                np.ndarray.__setitem__(
+                    self._edit_mask,
+                    delta.affected_indices,
+                    proxy_rollback,
+                )
+            raise
+        return result
 
     def restore_erased_indices(
         self,
