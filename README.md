@@ -199,7 +199,11 @@ using this readout.
 
 ## Selecting a class
 
-Click one of the colored class buttons.
+Click one of the colored class buttons, type a mapped class ID in napari's
+native **label** field, or use its `+`/`-` controls to step through the mapped
+classes. The native field now shows the real semantic value (for example,
+`25`) even though the transparent working layer stays internally binary for
+fast, lossless overlap editing.
 
 Example:
 
@@ -270,9 +274,10 @@ the revealed class follows a stable saved fallback order. The format preserves
 every membership and the current visible top class, but it does not store a
 complete chronological stack of every past paint operation at each pixel.
 
-The Pick tool uses the visible semantic projection. It selects the connected
-visible region under the cursor rather than the internal binary edit value or
-silently changing the active paint class.
+The Pick tool uses the visible semantic projection. It selects and outlines
+the connected visible region under the cursor and makes that region's real
+semantic class the active paint class, rather than exposing the internal
+binary edit value.
 
 All Paint, Polygon, Fill, Erase, repaint, region Delete, and region Move
 changes remain in memory until **Save** is pressed.
@@ -292,8 +297,8 @@ without changing data.
 
 Available actions are:
 
-* **Use class** changes the active paint class to the selected
-  region's class.
+* **Use class** restores the selected region's class as the active paint class
+  if a different class was chosen after making the selection.
 * **Delete…** asks for confirmation, removes only that visible class
   membership, and reveals any annotation underneath.
 * **Step** sets an exact integer pixel distance; the four arrow buttons
@@ -354,9 +359,12 @@ Use the original napari Labels **opacity** slider to adjust the visible
 annotations. The editor redirects that native control to **Annotations** while
 keeping the transparent editing proxy at zero opacity.
 
-The native **brush size** control is expanded from `1–40` to `1–512`. Drag the
-slider or click its displayed number to type an exact size. Very large brushes
-touch many pixels per stroke, so reduce the size if painting becomes slower.
+The native **brush size** control shared by Paint and Erase is expanded from
+`1–40` to `1–512`. Its row visibly reads **brush size 1–512**: drag from small
+to large, use the arrow keys for one-pixel changes, or click the current number
+to type an exact size. The Erase button uses a brush-shaped icon while
+retaining its Erase behavior and shortcut. Very large brushes touch many
+pixels per stroke, so reduce the size if painting becomes slower.
 
 Reducing opacity allows the underlying histology image to remain visible while editing.
 

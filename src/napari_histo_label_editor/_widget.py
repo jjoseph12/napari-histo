@@ -49,6 +49,7 @@ from ._io import (
     build_image_pyramid,
     file_identity,
 )
+from ._native_labels_controls import adapt_native_labels_tool_controls
 from ._overlap_editor import OverlapEditorController
 from ._overlap_store import OverlapDelta, OverlapStore
 from ._object_selection import (
@@ -661,6 +662,8 @@ class LabelEditorWidget(QWidget):
         self._annotation_opacity = DEFAULT_ANNOTATION_OPACITY
         self._native_labels_controls = None
         self._native_opacity_slider = None
+        self._native_semantic_label_control = None
+        self._native_semantic_label_spinbox = None
         self._annotation_selection: Optional[
             AnnotationObjectSelection
         ] = None
@@ -685,6 +688,13 @@ class LabelEditorWidget(QWidget):
         )
         self.viewer.layers.events.removed.connect(
             self._restore_fast_rendering_after_layer_change
+        )
+        # Qt layer controls can be registered after the layer-model event or
+        # recreated when layer selection changes. Retry briefly on each active
+        # layer transition so the semantic class/opacity/brush bridges do not
+        # depend on one event-loop turn during initial load.
+        self.viewer.layers.selection.events.active.connect(
+            self._schedule_native_labels_controls_install
         )
         # Shapes can reset ``editable`` while napari changes displayed
         # dimensions.  The selection outline is a read-only preview and must
@@ -717,7 +727,15 @@ class LabelEditorWidget(QWidget):
             enable_fast_texture_updates(self.viewer, composite)
         if removed_selection:
             self.viewer.layers.selection.active = layer
+        self._schedule_native_labels_controls_install()
         self._update_project_controls()
+
+    def _schedule_native_labels_controls_install(self, event=None) -> None:
+        """Retry adaptation while napari finishes creating layer controls."""
+
+        del event
+        for delay_ms in (0, 50, 250):
+            QTimer.singleShot(delay_ms, self._install_native_labels_controls)
 
     def _lock_selection_preview_layer(self, event=None) -> None:
         """Keep the non-authoritative outline preview read-only."""
@@ -1099,6 +1117,8 @@ class LabelEditorWidget(QWidget):
         ):
             move_button.setEnabled(selection_ready)
 
+        self._sync_native_semantic_label_selector()
+
         if self.labels_path is None:
             self.save_destination_line.clear()
             self.save_destination_caption.setText("Save destination (editable)")
@@ -1461,9 +1481,7 @@ class LabelEditorWidget(QWidget):
         self._install_semantic_pick()
         self._install_semantic_tooltip()
         self._install_native_labels_controls()
-        # Some Qt window configurations finish registering a newly inserted
-        # layer's controls on the next event-loop turn.
-        QTimer.singleShot(0, self._install_native_labels_controls)
+        self._schedule_native_labels_controls_install()
 
         self.viewer.tooltip.visible = True
 
@@ -1818,6 +1836,16 @@ class LabelEditorWidget(QWidget):
             return
         try:
             self._set_annotation_selection(selected)
+            # Pick retains the connected-region outline for move/delete and
+            # also makes the clicked semantic class the active paint class.
+            # Avoid rebuilding the same binary membership plane when it is
+            # already active; background clicks are handled above as no
+            # selection and deliberately leave the paint class unchanged.
+            if (
+                self.overlap_editor.active_class != selected.value
+                or int(self.labels_layer.selected_label) != 1
+            ):
+                self._select_label(selected.value)
         except Exception as error:
             # The user clicked a new object, so the previous sparse selection
             # must never remain armed when its replacement outline fails.
@@ -2218,10 +2246,11 @@ class LabelEditorWidget(QWidget):
     def _install_native_labels_controls(self, controls=None) -> bool:
         """Adapt napari's original Labels sliders to the overlap editor.
 
-        The brush control remains connected directly to ``Labels.brush_size``;
-        only its visible range is expanded. The native opacity slider is
-        redirected straight to the visible semantic composite, so changing it
-        never exposes or refreshes the transparent binary edit proxy.
+        Presentation-only brush/eraser adaptation leaves napari's actions and
+        ``Labels.brush_size`` connection intact. The native opacity slider is
+        redirected straight to the visible semantic composite, and the label
+        field is decoupled to show semantic IDs while the edit proxy stays
+        binary.
         """
 
         layer = self.labels_layer
@@ -2233,22 +2262,12 @@ class LabelEditorWidget(QWidget):
             controls = self._find_native_labels_controls()
         if controls is None or getattr(controls, "layer", None) is not layer:
             return False
+        if not adapt_native_labels_tool_controls(
+            controls,
+            maximum_brush_size=NATIVE_BRUSH_SIZE_MAX,
+        ):
+            return False
         try:
-            brush_control = controls._brush_size_slider_control
-            brush_slider = brush_control.brush_size_slider
-            brush_maximum = max(
-                NATIVE_BRUSH_SIZE_MAX,
-                int(brush_slider.maximum()),
-                int(layer.brush_size),
-            )
-            brush_slider.setMaximum(brush_maximum)
-            brush_tooltip = (
-                f"Brush size range: 1–{brush_maximum} pixels. "
-                "Drag the slider or click its number to type an exact size."
-            )
-            brush_slider.setToolTip(brush_tooltip)
-            brush_control.brush_size_slider_label.setToolTip(brush_tooltip)
-
             opacity_control = controls._opacity_blending_controls
             opacity_slider = opacity_control.opacity_slider
             opacity_tooltip = (
@@ -2257,6 +2276,19 @@ class LabelEditorWidget(QWidget):
             )
             opacity_slider.setToolTip(opacity_tooltip)
             opacity_control.opacity_label.setToolTip(opacity_tooltip)
+
+            label_control = controls._label_control
+            semantic_spinbox = label_control.selection_spinbox
+            semantic_tooltip = (
+                "Active annotation class. Type a mapped class ID or use "
+                "the arrows to move between available classes; 0 selects "
+                "the semantic eraser."
+            )
+            semantic_spinbox.setToolTip(semantic_tooltip)
+            label_control.label_color_label.setToolTip(semantic_tooltip)
+            label_control.colorbox.setToolTip(
+                "Color of the active semantic annotation class"
+            )
         except (AttributeError, RuntimeError):
             return False
 
@@ -2288,9 +2320,50 @@ class LabelEditorWidget(QWidget):
                 self._on_native_opacity_slider_change
             )
 
+        semantic_already_bridged = (
+            self._native_semantic_label_spinbox is semantic_spinbox
+        )
+        if not semantic_already_bridged:
+            previous_spinbox = self._native_semantic_label_spinbox
+            if previous_spinbox is not None:
+                try:
+                    previous_spinbox.valueChanged.disconnect(
+                        self._on_native_semantic_label_change
+                    )
+                except (TypeError, RuntimeError):
+                    pass
+
+            # QtLabelControl normally mirrors Labels.selected_label in both
+            # directions and resets the range from the layer's binary dtype.
+            # This edit layer must remain encoded as 0/1, while the user-facing
+            # selector displays real semantic class IDs. Keep the colorbox's
+            # own layer-event connections: its 0/1 colormap is deliberately
+            # recolored to the current semantic class.
+            try:
+                semantic_spinbox.valueChanged.disconnect(
+                    label_control.change_selection
+                )
+            except (TypeError, RuntimeError):
+                pass
+            for callback in tuple(getattr(label_control, "_callbacks", ())):
+                try:
+                    layer.events.selected_label.disconnect(callback)
+                except (TypeError, ValueError, RuntimeError):
+                    pass
+            try:
+                layer.events.data.disconnect(label_control._on_data_change)
+            except (TypeError, ValueError, RuntimeError):
+                pass
+            semantic_spinbox.valueChanged.connect(
+                self._on_native_semantic_label_change
+            )
+
         self._native_labels_controls = controls
         self._native_opacity_slider = opacity_slider
+        self._native_semantic_label_control = label_control
+        self._native_semantic_label_spinbox = semantic_spinbox
         self._sync_native_opacity_slider()
+        self._sync_native_semantic_label_selector()
         return True
 
     def _on_native_opacity_slider_change(self, value: float) -> None:
@@ -2313,6 +2386,78 @@ class LabelEditorWidget(QWidget):
         except RuntimeError:
             self._native_labels_controls = None
             self._native_opacity_slider = None
+
+    def _semantic_label_selector_value(self) -> int:
+        """Return the semantic class represented by the binary tool state."""
+
+        if not self._labels_layer_is_active():
+            return 0
+        if int(self.labels_layer.selected_label) == 0:
+            return 0
+        return int(self.overlap_editor.active_class or 0)
+
+    def _sync_native_semantic_label_selector(self) -> None:
+        """Show semantic class IDs without changing the binary edit proxy."""
+
+        spinbox = self._native_semantic_label_spinbox
+        if spinbox is None:
+            return
+        available = [
+            int(value) for value in self.class_map if int(value) > 0
+        ]
+        maximum = max(available, default=1)
+        value = self._semantic_label_selector_value()
+        maximum = max(maximum, value, 1)
+        try:
+            previous = spinbox.blockSignals(True)
+            try:
+                spinbox.setRange(0, maximum)
+                spinbox.setValue(value)
+                spinbox.setEnabled(self._labels_layer_is_active())
+            finally:
+                spinbox.blockSignals(previous)
+        except RuntimeError:
+            self._native_semantic_label_control = None
+            self._native_semantic_label_spinbox = None
+
+    def _on_native_semantic_label_change(self, requested: int) -> None:
+        """Select a mapped semantic class from napari's native label field."""
+
+        requested = int(requested)
+        current = self._semantic_label_selector_value()
+        available = sorted(
+            int(value) for value in self.class_map if int(value) > 0
+        )
+        target = requested
+        if requested not in self.class_map:
+            # A one-step request comes from the native +/- buttons or wheel.
+            # Move to the adjacent mapped class so sparse IDs such as 1, 23,
+            # 300 remain practical to navigate. Arbitrary unknown typed IDs
+            # are rejected and the selector is restored exactly.
+            if requested == current + 1:
+                target = next(
+                    (value for value in available if value > current),
+                    current,
+                )
+            elif requested == current - 1:
+                target = next(
+                    (
+                        value
+                        for value in reversed(available)
+                        if value < current
+                    ),
+                    0,
+                )
+            else:
+                self.viewer.status = (
+                    f"Class {requested} is not available. Choose a mapped "
+                    "class ID."
+                )
+                self._sync_native_semantic_label_selector()
+                return
+
+        self._select_label(target)
+        self._sync_native_semantic_label_selector()
 
     def _set_annotation_opacity(self, value: float) -> None:
         """Set visible semantic opacity without exposing the binary proxy."""

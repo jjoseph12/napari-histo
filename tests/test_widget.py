@@ -1471,10 +1471,86 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 brush_slider = (
                     controls._brush_size_slider_control.brush_size_slider
                 )
+                semantic_spinbox = (
+                    controls._label_control.selection_spinbox
+                )
                 self.assertAlmostEqual(opacity_slider.value(), 0.45)
                 self.assertEqual(brush_slider.minimum(), 1)
                 self.assertEqual(brush_slider.maximum(), 512)
                 self.assertIn("1–512", brush_slider.toolTip())
+                self.assertEqual(semantic_spinbox.value(), 1)
+                self.assertEqual(widget.labels_layer.selected_label, 1)
+                self.assertIn(
+                    "annotation class",
+                    semantic_spinbox.toolTip(),
+                )
+
+                widget._upsert_class(23, "Tumor edge", "#123456", persist=False)
+                widget._upsert_class(300, "Review", "#abcdef", persist=False)
+                self.assertEqual(semantic_spinbox.minimum(), 0)
+                self.assertEqual(semantic_spinbox.maximum(), 300)
+                self.assertEqual(semantic_spinbox.value(), 300)
+                self.assertEqual(widget.labels_layer.selected_label, 1)
+
+                # Semantic selection never writes a high ID into the binary
+                # proxy and does not trigger a complete composite refresh.
+                with patch.object(
+                    widget.composite_layer,
+                    "refresh",
+                    side_effect=AssertionError(
+                        "semantic class selection refreshed the full slide"
+                    ),
+                ):
+                    semantic_spinbox.setValue(23)
+                self.assertEqual(widget.overlap_editor.active_class, 23)
+                self.assertEqual(widget.labels_layer.selected_label, 1)
+                self.assertEqual(semantic_spinbox.value(), 23)
+                np.testing.assert_allclose(
+                    widget.labels_layer._selected_color,
+                    widget._label_rgba(23),
+                )
+
+                # Native +/- navigation skips gaps between mapped IDs.
+                semantic_spinbox.stepBy(1)
+                self.assertEqual(semantic_spinbox.value(), 300)
+                self.assertEqual(widget.overlap_editor.active_class, 300)
+                self.assertEqual(widget.labels_layer.selected_label, 1)
+                semantic_spinbox.stepBy(-1)
+                self.assertEqual(semantic_spinbox.value(), 23)
+                self.assertEqual(widget.overlap_editor.active_class, 23)
+
+                # Unknown typed IDs restore the real class without changing
+                # the proxy, store, or active semantic class.
+                revision_before = widget.overlap_store.revision
+                semantic_spinbox.setValue(17)
+                self.assertEqual(semantic_spinbox.value(), 23)
+                self.assertEqual(widget.overlap_editor.active_class, 23)
+                self.assertEqual(widget.labels_layer.selected_label, 1)
+                self.assertEqual(widget.overlap_store.revision, revision_before)
+                self.assertIn("Class 17 is not available", widget.viewer.status)
+
+                semantic_spinbox.setValue(0)
+                self.assertEqual(widget.labels_layer.selected_label, 0)
+                self.assertEqual(widget.overlap_editor.active_class, 23)
+                self.assertEqual(semantic_spinbox.value(), 0)
+                semantic_spinbox.stepBy(1)
+                self.assertEqual(widget.overlap_editor.active_class, 1)
+                self.assertEqual(widget.labels_layer.selected_label, 1)
+                self.assertEqual(semantic_spinbox.value(), 1)
+
+                # Binary data events must not reset the decoupled selector's
+                # range back to uint8, and installing twice is idempotent.
+                widget.labels_layer.events.data()
+                self.assertEqual(semantic_spinbox.maximum(), 300)
+                self.assertTrue(widget._install_native_labels_controls(controls))
+                with patch.object(
+                    widget,
+                    "_select_label",
+                    wraps=widget._select_label,
+                ) as select_label:
+                    semantic_spinbox.setValue(23)
+                select_label.assert_called_once_with(23)
+                self.assertEqual(widget.labels_layer.selected_label, 1)
 
                 proxy_opacity_events = []
                 widget.labels_layer.events.opacity.connect(
@@ -2121,7 +2197,7 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                     np.ones((3, 3), dtype=np.uint8),
                 )
 
-    def test_pick_selects_connected_visible_region_without_switching_paint_class(
+    def test_pick_selects_connected_visible_region_and_activates_its_class(
         self,
     ):
         with TemporaryDirectory() as tmp:
@@ -2148,7 +2224,7 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 type(widget.labels_layer)._drag_modes,
             )
             callback(widget.labels_layer, event)
-            self.assertEqual(widget.overlap_editor.active_class, 300)
+            self.assertEqual(widget.overlap_editor.active_class, 2)
             self.assertEqual(widget.labels_layer.selected_label, 1)
             self.assertEqual(widget._annotation_selection.value, 2)
             self.assertEqual(widget._annotation_selection.pixel_count, 3)
@@ -2164,14 +2240,14 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             event.position = (5, 5)
             callback(widget.labels_layer, event)
             self.assertEqual(widget._annotation_selection.value, 300)
-            self.assertEqual(widget.overlap_editor.active_class, 2)
+            self.assertEqual(widget.overlap_editor.active_class, 300)
 
             event.position = (0, 0)
             callback(widget.labels_layer, event)
             self.assertIsNone(widget._annotation_selection)
             self.assertFalse(widget._selection_layer.visible)
             self.assertFalse(widget.delete_region_btn.isEnabled())
-            self.assertEqual(widget.overlap_editor.active_class, 2)
+            self.assertEqual(widget.overlap_editor.active_class, 300)
 
     def test_delete_connected_region_reveals_hidden_and_has_exact_history(self):
         with TemporaryDirectory() as tmp:
@@ -2189,6 +2265,11 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             selection = self.pick_connected_region(widget, (2, 2))
             self.assertEqual(selection.value, 2)
             self.assertEqual(selection.pixel_count, 2)
+            # Pick activates the clicked semantic class. Restore the
+            # deliberately unrelated tool class for this delete-history case.
+            widget._select_label(3)
+            self.assertEqual(widget.overlap_editor.active_class, 3)
+            self.assertFalse(np.any(widget.labels_layer.data))
 
             file_before = labels_path.read_bytes()
             packed_before = np.array(
@@ -2286,6 +2367,11 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             selection = self.pick_connected_region(widget, (2, 2))
             self.assertEqual(selection.value, 2)
             self.assertEqual(selection.pixel_count, 3)
+            # Pick activates class 2 by design; this test specifically covers
+            # sparse move history when a different class is active.
+            widget._select_label(4)
+            self.assertEqual(widget.overlap_editor.active_class, 4)
+            self.assertFalse(np.any(widget.labels_layer.data))
             packed_before = np.array(
                 widget.overlap_store._packed_masks,
                 copy=True,
@@ -2708,12 +2794,17 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             ):
                 widget._delete_selected_annotation()
 
-            self.assertEqual(
-                self.connected_runtime_state(widget)[:10],
-                state_before[:10],
-            )
+            state_after = self.connected_runtime_state(widget)
+            # Pick changed only the active tool class/binary proxy. The
+            # guarded delete must leave authoritative memberships, projection,
+            # revision/generation/hash, and both history pairs untouched.
+            self.assertEqual(state_after[:2], state_before[:2])
+            self.assertEqual(state_after[3:10], state_before[3:10])
             self.assertIsNot(widget._annotation_selection, selected_a)
             self.assertEqual(widget._annotation_selection.value, 2)
+            self.assertEqual(widget.overlap_editor.active_class, 2)
+            self.assertEqual(widget.labels_layer.data[4, 4], 1)
+            self.assertEqual(np.count_nonzero(widget.labels_layer.data), 1)
             self.assertEqual(widget.overlap_editor.composite[1, 1], 1)
             self.assertEqual(widget.overlap_editor.composite[4, 4], 2)
             self.assertEqual(
