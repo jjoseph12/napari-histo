@@ -14,7 +14,8 @@ from napari.components import ViewerModel
 from napari._qt.layer_controls.qt_labels_controls import QtLabelsControls
 from napari.layers import Labels
 from napari.layers.labels._labels_constants import Mode
-from qtpy.QtWidgets import QApplication, QMessageBox
+from qtpy.QtCore import QCoreApplication, QEvent
+from qtpy.QtWidgets import QApplication, QDockWidget, QMessageBox, QWidget
 
 from napari_histo_label_editor._embedded_annotations import (
     read_embedded_annotations,
@@ -23,7 +24,10 @@ from napari_histo_label_editor._fast_fill import overlap_fill
 from napari_histo_label_editor._fast_polygon import fast_paint_polygon
 from napari_histo_label_editor._class_config import read_class_config
 from napari_histo_label_editor._overlap_store import OverlapStore
-from napari_histo_label_editor._widget import LabelEditorWidget
+from napari_histo_label_editor._widget import (
+    LabelEditorWidget,
+    SELECTION_ACTIONS_DOCK_NAME,
+)
 
 
 class FakeSignal:
@@ -136,6 +140,87 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             if monotonic() >= deadline:
                 self.fail("Background label save did not finish")
             sleep(0.005)
+
+    def test_selection_actions_use_one_compact_companion_dock_lifecycle(self):
+        class FakeWindow:
+            def __init__(self):
+                self.dock_widgets = {
+                    SELECTION_ACTIONS_DOCK_NAME: QWidget()
+                }
+                self.docks = {}
+                self.add_calls = []
+                self.remove_calls = []
+
+            def add_dock_widget(self, widget, **kwargs):
+                self.add_calls.append((widget, kwargs))
+                name = kwargs["name"]
+                dock = QDockWidget(name)
+                dock.setWidget(widget)
+                self.dock_widgets[name] = widget
+                self.docks[name] = dock
+                return dock
+
+            def remove_dock_widget(self, widget):
+                self.remove_calls.append(widget)
+                for name, candidate in tuple(self.dock_widgets.items()):
+                    if candidate is not widget:
+                        continue
+                    self.dock_widgets.pop(name)
+                    dock = self.docks.pop(name, None)
+                    if dock is not None:
+                        widget.setParent(None)
+                        dock.deleteLater()
+                    return
+                raise LookupError(widget)
+
+        original_viewer = ViewerModel()
+        widget = LabelEditorWidget(original_viewer)
+        self.assertEqual(widget.layout().indexOf(widget.selection_actions_widget), -1)
+        self.assertEqual(
+            [
+                widget.selection_actions_widget.layout().itemAt(index).widget()
+                for index in range(
+                    widget.selection_actions_widget.layout().count()
+                )
+            ],
+            [widget.delete_region_btn, widget.clear_region_btn],
+        )
+        self.assertIsNone(widget._selection_actions_dock)
+
+        owner = QDockWidget("editor")
+        owner.setWidget(widget)
+        fake_window = FakeWindow()
+        stale = fake_window.dock_widgets[SELECTION_ACTIONS_DOCK_NAME]
+        widget.viewer = SimpleNamespace(window=fake_window)
+
+        widget._install_selection_actions_dock()
+        self.assertEqual(fake_window.remove_calls, [stale])
+        self.assertEqual(len(fake_window.add_calls), 1)
+        _, kwargs = fake_window.add_calls[0]
+        self.assertEqual(kwargs["area"], "left")
+        self.assertEqual(kwargs["allowed_areas"], ["left"])
+        self.assertFalse(kwargs["add_vertical_stretch"])
+        self.assertEqual(
+            widget._selection_actions_dock.minimumHeight(),
+            widget._selection_actions_dock.maximumHeight(),
+        )
+        self.assertLessEqual(widget._selection_actions_dock.maximumHeight(), 90)
+
+        first_dock = widget._selection_actions_dock
+        widget._install_selection_actions_dock()
+        self.assertIs(widget._selection_actions_dock, first_dock)
+        self.assertEqual(len(fake_window.add_calls), 1)
+
+        # napari detaches the editor before deleting its wrapping dock.  The
+        # companion must leave the public dock mapping at the same time.
+        widget.setParent(None)
+        owner.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        self.app.processEvents()
+        self.assertNotIn(
+            SELECTION_ACTIONS_DOCK_NAME,
+            fake_window.dock_widgets,
+        )
 
     @staticmethod
     def load_small_project(
@@ -2202,6 +2287,19 @@ class LoadSaveIntegrationTest(unittest.TestCase):
     ):
         with TemporaryDirectory() as tmp:
             _, widget, _, _ = self.load_small_project(Path(tmp))
+            self.assertEqual(widget.delete_region_btn.text(), "Delete…")
+            self.assertEqual(widget.clear_region_btn.text(), "Clear")
+            for removed_control in (
+                "selection_help_label",
+                "selection_status_label",
+                "use_selection_class_btn",
+                "move_region_step",
+                "move_region_up_btn",
+                "move_region_down_btn",
+                "move_region_left_btn",
+                "move_region_right_btn",
+            ):
+                self.assertFalse(hasattr(widget, removed_control))
             widget._upsert_class(2, "B", "#123456")
             widget.labels_layer.data_setitem(
                 (np.array([2, 2, 3]), np.array([2, 3, 2])),
@@ -2306,6 +2404,11 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 self.assertEqual(labels_path.read_bytes(), file_before)
                 self.assertEqual(len(widget.labels_layer._undo_history), 1)
                 self.assertEqual(len(tracker.undo_items), 1)
+                compact_atom = tracker.undo_items[-1][0]
+                self.assertEqual(compact_atom[0][0].dtype, np.dtype(np.int32))
+                self.assertEqual(compact_atom[0][1].dtype, np.dtype(np.int32))
+                self.assertEqual(np.asarray(compact_atom[1]).ndim, 0)
+                self.assertEqual(np.asarray(compact_atom[3]).ndim, 0)
 
                 widget.undo()
                 np.testing.assert_array_equal(
@@ -2337,6 +2440,106 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                 self.assertEqual(len(widget.labels_layer._undo_history), 1)
                 self.assertEqual(len(tracker.undo_items), 1)
                 self.assertEqual(labels_path.read_bytes(), file_before)
+
+    def test_selected_delete_failure_is_exact_noop_and_keeps_selection(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            selection = self.pick_connected_region(widget, (1, 1))
+            state_before = self.connected_runtime_state(widget)
+
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.Yes,
+            ), patch.object(
+                widget.overlap_store,
+                "_set_membership_at_indices",
+                side_effect=MemoryError("forced selected erase failure"),
+            ):
+                widget._delete_selected_annotation()
+
+            self.assertEqual(self.connected_runtime_state(widget), state_before)
+            self.assertIs(widget._annotation_selection, selection)
+            self.assertTrue(widget.delete_region_btn.isEnabled())
+            self.assertIn("Could not delete", widget.viewer.status)
+
+    def test_selected_delete_refresh_failure_is_committed_and_truthful(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            selection = self.pick_connected_region(widget, (1, 1))
+            rows = selection.rows.copy()
+            columns = selection.columns.copy()
+            tracker = widget.labels_layer._napari_histo_edit_tracker
+
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.Yes,
+            ), patch.object(
+                widget,
+                "_refresh_composite_bounds",
+                side_effect=RuntimeError("forced display upload failure"),
+            ):
+                widget._delete_selected_annotation()
+
+            self.assertIsNone(widget._annotation_selection)
+            self.assertFalse(widget.delete_region_btn.isEnabled())
+            np.testing.assert_array_equal(
+                widget.overlap_editor.composite[rows, columns],
+                np.zeros(rows.shape, dtype=widget.overlap_editor.composite.dtype),
+            )
+            self.assertEqual(len(widget.labels_layer._undo_history), 1)
+            self.assertEqual(len(tracker.undo_items), 1)
+            self.assertIn("deleted in memory", widget.viewer.status)
+            self.assertIn("display could not refresh", widget.viewer.status)
+
+    def test_selected_delete_history_never_corrupts_switched_active_proxy(self):
+        with TemporaryDirectory() as tmp:
+            _, widget, _, _ = self.load_small_project(Path(tmp))
+            widget._upsert_class(2, "Other", "#123456")
+            widget.labels_layer.data_setitem(
+                (np.array([4]), np.array([4])),
+                1,
+            )
+            selection = self.pick_connected_region(widget, (1, 1))
+            self.assertEqual(selection.value, 1)
+
+            with patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.Yes,
+            ):
+                widget._delete_selected_annotation()
+
+            # Simulate a retained-history class switch without the ordinary
+            # UI helper's deliberate history reset (for example an external
+            # controller caller). Native history must still never target this
+            # newly active binary proxy with the deleted class's coordinates.
+            widget.overlap_editor.select_class(2)
+            expected_proxy = widget.overlap_store.select_plane(2).astype(
+                np.uint8
+            )
+            np.testing.assert_array_equal(widget.labels_layer.data, expected_proxy)
+
+            widget.undo()
+            np.testing.assert_array_equal(widget.labels_layer.data, expected_proxy)
+            np.testing.assert_array_equal(
+                widget.overlap_editor.composite[
+                    selection.rows,
+                    selection.columns,
+                ],
+                np.ones(selection.rows.shape, dtype=np.uint8),
+            )
+
+            widget.labels_layer.redo()
+            np.testing.assert_array_equal(widget.labels_layer.data, expected_proxy)
+            np.testing.assert_array_equal(
+                widget.overlap_editor.composite[
+                    selection.rows,
+                    selection.columns,
+                ],
+                np.zeros(selection.rows.shape, dtype=np.uint8),
+            )
 
     def test_move_connected_overlap_is_one_sparse_undo_with_unrelated_active(
         self,
@@ -2384,7 +2587,6 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             file_before = labels_path.read_bytes()
             tracker = widget.labels_layer._napari_histo_edit_tracker
 
-            widget.move_region_step.setValue(1)
             with patch.object(
                 widget.overlap_editor,
                 "full_sync",
@@ -2559,9 +2761,8 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             selection = self.pick_connected_region(widget, (1, 1))
             self.assertIsNotNone(selection)
 
-            widget.move_region_step.setValue(2)
             state_before = self.connected_runtime_state(widget)
-            widget._move_selected_annotation(-1, 0)
+            widget._move_selected_annotation(-1, 0, step=2)
             self.assertEqual(
                 self.connected_runtime_state(widget),
                 state_before,
@@ -2596,7 +2797,8 @@ class LoadSaveIntegrationTest(unittest.TestCase):
                     saving_before,
                 )
                 self.assertIn("save to finish", widget.viewer.status)
-                self.assertFalse(widget.move_region_right_btn.isEnabled())
+                self.assertFalse(widget.delete_region_btn.isEnabled())
+                self.assertFalse(widget.clear_region_btn.isEnabled())
             finally:
                 widget._save_worker = None
                 widget._update_project_controls()
@@ -2606,14 +2808,8 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             viewer, widget, _, _ = self.load_small_project(Path(tmp))
             self.assertIsNotNone(self.pick_connected_region(widget, (1, 1)))
             action_widgets = (
-                widget.use_selection_class_btn,
                 widget.delete_region_btn,
                 widget.clear_region_btn,
-                widget.move_region_step,
-                widget.move_region_up_btn,
-                widget.move_region_down_btn,
-                widget.move_region_left_btn,
-                widget.move_region_right_btn,
             )
             self.assertTrue(all(action.isEnabled() for action in action_widgets))
 
@@ -2634,10 +2830,6 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertIsNone(widget._selection_layer)
             self.assertIsNone(widget._annotation_selection)
             self.assertTrue(all(not action.isEnabled() for action in action_widgets))
-            self.assertEqual(
-                widget.selection_status_label.text(),
-                "No region selected",
-            )
 
     def test_entering_3d_clears_connected_selection_without_data_changes(self):
         with TemporaryDirectory() as tmp:
@@ -2657,20 +2849,10 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertFalse(outline.visible)
             self.assertEqual(outline.data, [])
             action_widgets = (
-                widget.use_selection_class_btn,
                 widget.delete_region_btn,
                 widget.clear_region_btn,
-                widget.move_region_step,
-                widget.move_region_up_btn,
-                widget.move_region_down_btn,
-                widget.move_region_left_btn,
-                widget.move_region_right_btn,
             )
             self.assertTrue(all(not action.isEnabled() for action in action_widgets))
-            self.assertEqual(
-                widget.selection_status_label.text(),
-                "No region selected",
-            )
 
     def test_clear_outline_restores_annotation_tools_as_active_layer(self):
         with TemporaryDirectory() as tmp:
@@ -2692,7 +2874,7 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             self.assertEqual(outline.data, [])
             self.assertIs(viewer.layers.selection.active, widget.labels_layer)
             self.assertFalse(widget.delete_region_btn.isEnabled())
-            self.assertFalse(widget.move_region_right_btn.isEnabled())
+            self.assertFalse(widget.clear_region_btn.isEnabled())
 
     def test_failed_replacement_outline_never_leaves_old_selection_armed(self):
         with TemporaryDirectory() as tmp:
@@ -2721,16 +2903,9 @@ class LoadSaveIntegrationTest(unittest.TestCase):
             )
             self.assertIsNone(widget._annotation_selection)
             self.assertFalse(widget._selection_layer.visible)
-            self.assertEqual(widget.selection_status_label.text(), "No region selected")
             action_widgets = (
-                widget.use_selection_class_btn,
                 widget.delete_region_btn,
                 widget.clear_region_btn,
-                widget.move_region_step,
-                widget.move_region_up_btn,
-                widget.move_region_down_btn,
-                widget.move_region_left_btn,
-                widget.move_region_right_btn,
             )
             self.assertTrue(all(not action.isEnabled() for action in action_widgets))
             self.assertIn("nothing is selected", widget.viewer.status)

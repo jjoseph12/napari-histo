@@ -65,6 +65,22 @@ __all__ = [
 ]
 
 
+class _UniqueSparseIndices(tuple):
+    """Internal marker for validated, unique sparse coordinates.
+
+    Connected-component selection already produces unique row-major
+    coordinates. Retaining that fact lets Delete and its Undo/Redo history
+    avoid repeatedly expanding compact coordinates to ``intp`` and sorting
+    them with ``np.unique``. Construction is private; bounds and integer
+    validation remain the controller's responsibility.
+    """
+
+    __slots__ = ()
+
+    def __new__(cls, rows: np.ndarray, columns: np.ndarray):
+        return super().__new__(cls, (rows, columns))
+
+
 def _read_only_copy(values, *, dtype=None) -> np.ndarray:
     """Return an owned C-contiguous array that callers cannot mutate."""
 
@@ -1247,7 +1263,7 @@ class OverlapStore:
         """
 
         rows, columns = self._sparse_indices(indices)
-        if rows.size:
+        if rows.size and not isinstance(indices, _UniqueSparseIndices):
             linear = rows.astype(np.intp, copy=False) * self._shape[1]
             linear = linear + columns.astype(np.intp, copy=False)
             if np.unique(linear).size != linear.size:
@@ -1301,6 +1317,73 @@ class OverlapStore:
             raise
         return int(np.count_nonzero(erase)), top_before, top_after
 
+    def erase_selected_visible_indices(
+        self,
+        indices: _UniqueSparseIndices,
+        value: int,
+        *,
+        expected_revision: int,
+    ) -> tuple[int, np.ndarray]:
+        """Erase one revision-bound selected component without re-sorting it.
+
+        ``indices`` comes only from the connected-component picker, whose
+        flood output is unique and row-major. ``expected_revision`` binds the
+        coordinates and their single visible value to the exact state that
+        was picked. Only the varying newly revealed projection is returned;
+        the erased/top-before value is the scalar ``value``.
+        """
+
+        if not isinstance(indices, _UniqueSparseIndices):
+            raise TypeError("Selected erase requires trusted unique indices")
+        if int(expected_revision) != self._revision:
+            raise RuntimeError("The selected annotation is stale")
+        value = int(value)
+        self._require_class(value)
+        rows, columns = self._sparse_indices(indices)
+        if rows.size == 0:
+            return 0, np.empty(0, dtype=self._projection.dtype)
+
+        # Every coordinate shows ``value`` at this revision. Build only the
+        # varying fallback projection; an N-element top-before array would be
+        # a needless copy of one scalar in large Delete history.
+        top_after = np.zeros(rows.shape, dtype=self._projection.dtype)
+        for fallback_value in self._z_order:
+            if int(fallback_value) == value:
+                continue
+            membership = self._membership_at_indices(
+                fallback_value,
+                rows,
+                columns,
+            )
+            top_after[membership] = fallback_value
+
+        packed_snapshot = self._snapshot_membership_bytes(
+            (value,),
+            rows,
+            columns,
+            selector_values=None,
+        )
+        projection_sha256 = self._projection_sha256
+        generation = self._generation
+        revision = self._revision
+        try:
+            self._set_membership_at_indices(
+                value,
+                rows,
+                columns,
+                present=False,
+            )
+            self._projection[rows, columns] = top_after
+            self._mark_modified()
+        except BaseException:
+            self._restore_membership_bytes(packed_snapshot)
+            self._projection[rows, columns] = value
+            self._projection_sha256 = projection_sha256
+            self._generation = generation
+            self._revision = revision
+            raise
+        return int(rows.size), top_after
+
     def restore_erased_indices(
         self,
         indices,
@@ -1320,7 +1403,18 @@ class OverlapStore:
         if not isinstance(present, (bool, np.bool_)):
             raise TypeError("present must be a boolean")
         rows, columns = self._sparse_indices(indices)
-        if rows.size:
+        raw_erased = np.asarray(erased_values)
+        if (
+            isinstance(indices, _UniqueSparseIndices)
+            and raw_erased.ndim == 0
+        ):
+            return self._restore_selected_erased_indices(
+                indices,
+                int(raw_erased),
+                projection_values,
+                present=bool(present),
+            )
+        if rows.size and not isinstance(indices, _UniqueSparseIndices):
             linear = rows.astype(np.intp, copy=False) * self._shape[1]
             linear = linear + columns.astype(np.intp, copy=False)
             if np.unique(linear).size != linear.size:
@@ -1407,6 +1501,106 @@ class OverlapStore:
             raise
         return int(np.count_nonzero(changed))
 
+    def _restore_selected_erased_indices(
+        self,
+        indices: _UniqueSparseIndices,
+        erased_value: int,
+        projection_values,
+        *,
+        present: bool,
+    ) -> int:
+        """Replay one compact single-class selection history atom."""
+
+        rows, columns = self._sparse_indices(indices)
+        erased_value = int(erased_value)
+        if erased_value == 0:
+            raise ValueError("Selected erase history cannot target background")
+        self._require_class(erased_value)
+        requested = np.asarray(projection_values)
+        if requested.ndim == 0:
+            requested_scalar = int(requested)
+        else:
+            try:
+                requested = np.broadcast_to(requested, rows.shape)
+            except ValueError as error:
+                raise ValueError(
+                    "Projection history values must match sparse indices"
+                ) from error
+            requested_scalar = None
+        if not (
+            requested.dtype == np.dtype(np.bool_)
+            or np.issubdtype(requested.dtype, np.integer)
+        ):
+            raise TypeError("Projection history values must be integers")
+        if rows.size == 0:
+            return 0
+
+        occupied = np.zeros(rows.shape, dtype=bool)
+        valid_top = np.zeros(rows.shape, dtype=bool)
+        membership_changed = np.zeros(rows.shape, dtype=bool)
+        for class_value in self._class_values:
+            membership = self._membership_at_indices(
+                class_value,
+                rows,
+                columns,
+            )
+            if class_value == erased_value:
+                membership_changed[:] = membership != present
+                membership = membership.copy()
+                membership.fill(present)
+            occupied |= membership
+            if requested_scalar is None:
+                valid_top |= membership & (requested == class_value)
+            elif requested_scalar == class_value:
+                valid_top |= membership
+        if requested_scalar is None:
+            invalid = np.any((requested == 0) != ~occupied) or np.any(
+                (requested != 0) & ~valid_top
+            )
+        elif requested_scalar == 0:
+            invalid = bool(np.any(occupied))
+        else:
+            invalid = bool(np.any(~occupied) or np.any(~valid_top))
+        if invalid:
+            raise ValueError(
+                "Semantic eraser history projection does not match "
+                "memberships"
+            )
+
+        packed_snapshot = self._snapshot_membership_bytes(
+            (erased_value,),
+            rows,
+            columns,
+            selector_values=None,
+        )
+        projection_before = np.array(
+            self._projection[rows, columns],
+            copy=True,
+        )
+        projection_sha256 = self._projection_sha256
+        generation = self._generation
+        revision = self._revision
+        try:
+            self._set_membership_at_indices(
+                erased_value,
+                rows,
+                columns,
+                present=present,
+            )
+            projection_changed = projection_before != requested
+            self._projection[rows, columns] = requested
+            changed = membership_changed | projection_changed
+            if np.any(changed):
+                self._mark_modified()
+        except BaseException:
+            self._restore_membership_bytes(packed_snapshot)
+            self._projection[rows, columns] = projection_before
+            self._projection_sha256 = projection_sha256
+            self._generation = generation
+            self._revision = revision
+            raise
+        return int(np.count_nonzero(changed))
+
     def snapshot_erased_transaction(self, changes):
         """Capture sparse raw state for an atomic multi-atom history action.
 
@@ -1419,12 +1613,22 @@ class OverlapStore:
         projection_snapshot = []
         for indices, erased_values in changes:
             rows, columns = self._sparse_indices(indices)
-            erased = self._sparse_history_values(
-                erased_values,
-                rows.shape,
-                "Erased membership values",
+            raw_erased = np.asarray(erased_values)
+            compact_single_value = (
+                isinstance(indices, _UniqueSparseIndices)
+                and raw_erased.ndim == 0
+                and int(raw_erased) != 0
             )
-            affected_values = np.unique(erased[erased != 0])
+            if compact_single_value:
+                erased = None
+                affected_values = (int(raw_erased),)
+            else:
+                erased = self._sparse_history_values(
+                    erased_values,
+                    rows.shape,
+                    "Erased membership values",
+                )
+                affected_values = np.unique(erased[erased != 0])
             packed_snapshot.extend(
                 self._snapshot_membership_bytes(
                     affected_values,
@@ -1579,7 +1783,7 @@ class OverlapStore:
         rows: np.ndarray,
         columns: np.ndarray,
         *,
-        selector_values: np.ndarray,
+        selector_values: np.ndarray | None,
     ) -> list[tuple[int, np.ndarray, np.ndarray, np.ndarray]]:
         """Copy only packed bytes touched by a sparse multi-class change."""
 
@@ -1587,9 +1791,13 @@ class OverlapStore:
         packed_width = self._packed_masks.shape[2]
         for raw_value in values:
             value = int(raw_value)
-            selected = selector_values == value
-            selected_rows = rows[selected]
-            byte_columns = columns[selected] // 8
+            if selector_values is None:
+                selected_rows = rows
+                byte_columns = columns // 8
+            else:
+                selected = selector_values == value
+                selected_rows = rows[selected]
+                byte_columns = columns[selected] // 8
             flat_bytes = selected_rows * packed_width + byte_columns
             unique_bytes = np.unique(flat_bytes)
             selected_rows = unique_bytes // packed_width

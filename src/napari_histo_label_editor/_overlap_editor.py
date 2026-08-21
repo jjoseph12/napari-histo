@@ -22,6 +22,8 @@ from typing import TYPE_CHECKING, Any
 import numpy as np
 import numpy.typing as npt
 
+from ._overlap_store import _UniqueSparseIndices
+
 if TYPE_CHECKING:
     from ._overlap_store import OverlapDelta, OverlapMoveResult, OverlapStore
 
@@ -231,6 +233,11 @@ class OverlapEditorController:
         """Return validated, unique sparse row/column coordinates."""
 
         rows, columns = self._coordinate_arrays(indices)
+        if isinstance(indices, _UniqueSparseIndices):
+            # Connected-selection coordinates were made unique by the flood
+            # itself. Keep their compact dtype and the trusted marker through
+            # Delete and paired Undo/Redo history.
+            return _UniqueSparseIndices(rows, columns)
         if rows.size == 0:
             return rows.astype(np.intp), columns.astype(np.intp)
         linear = (
@@ -239,6 +246,15 @@ class OverlapEditorController:
         )
         unique = np.unique(linear)
         return unique // self._shape[1], unique % self._shape[1]
+
+    def _unique_selection_indices(
+        self,
+        indices: Any,
+    ) -> _UniqueSparseIndices:
+        """Validate picker-owned unique coordinates without sorting/copying."""
+
+        rows, columns = self._coordinate_arrays(indices)
+        return _UniqueSparseIndices(rows, columns)
 
     def raise_active_indices(
         self,
@@ -288,6 +304,57 @@ class OverlapEditorController:
                 removed_active_columns,
             ] = 0
         return int(changed), bounds, top_before, top_after
+
+    def erase_selected_visible_indices(
+        self,
+        indices: _UniqueSparseIndices,
+        value: int,
+        *,
+        expected_revision: int,
+    ) -> tuple[
+        int,
+        tuple[int, int, int, int] | None,
+        np.ndarray,
+    ]:
+        """Erase one picker-owned component with compact one-value history."""
+
+        normalized = self.normalize_indices(indices)
+        if not isinstance(normalized, _UniqueSparseIndices):
+            raise TypeError("Selected erase requires trusted unique indices")
+        rows, columns = normalized
+        bounds = self._bounds_for_coordinates(rows, columns)
+        value = int(value)
+        active_proxy_changed = bool(
+            rows.size and self._active_class == value
+        )
+        if active_proxy_changed:
+            try:
+                self._edit_mask[rows, columns] = 0
+            except BaseException:
+                # A fault-injection ndarray subclass may raise after writing.
+                # Bypass its override so the store is still untouched and the
+                # proxy returns to the picked membership state.
+                np.ndarray.__setitem__(
+                    self._edit_mask,
+                    (rows, columns),
+                    1,
+                )
+                raise
+        try:
+            changed, top_after = self.store.erase_selected_visible_indices(
+                normalized,
+                value,
+                expected_revision=int(expected_revision),
+            )
+        except BaseException:
+            if active_proxy_changed:
+                np.ndarray.__setitem__(
+                    self._edit_mask,
+                    (rows, columns),
+                    1,
+                )
+            raise
+        return int(changed), bounds, top_after
 
     def plan_object_move(
         self,
@@ -392,11 +459,19 @@ class OverlapEditorController:
         active_rows = np.empty(0, dtype=np.intp)
         active_columns = np.empty(0, dtype=np.intp)
         if self._active_class is not None and erased.size:
-            active = (
-                np.broadcast_to(erased, rows.shape) == self._active_class
-            )
-            active_rows = rows[active]
-            active_columns = columns[active]
+            if (
+                isinstance(normalized, _UniqueSparseIndices)
+                and erased.ndim == 0
+            ):
+                if int(erased) == self._active_class:
+                    active_rows = rows
+                    active_columns = columns
+            else:
+                active = (
+                    np.broadcast_to(erased, rows.shape) == self._active_class
+                )
+                active_rows = rows[active]
+                active_columns = columns[active]
         changed = self.store.restore_erased_indices(
             normalized,
             erased,

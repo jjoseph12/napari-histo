@@ -176,7 +176,7 @@ def fast_polygon_points_change(visual: Any, event: Any = None) -> None:
         # The overlay is parented to the Labels visual and therefore inherits
         # napari's tile2data scale.  Mouse points are already full-resolution
         # data coordinates, so compensate here or an oversized texture's
-        # polygon preview is displaced (2x along Maren's wide image axis).
+        # polygon preview is displaced (for example, 2x along a wide axis).
         try:
             tile_scale = np.asarray(
                 visual.layer._transforms["tile2data"].scale,

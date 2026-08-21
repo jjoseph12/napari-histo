@@ -3,6 +3,9 @@ import unittest
 import numpy as np
 
 from napari_histo_label_editor._object_selection import (
+    MAX_EXACT_OUTLINE_PIXELS,
+    MAX_SELECTION_PIXELS,
+    MAX_SELECTION_SEARCH_PIXELS,
     SelectionTooLargeError,
     select_visible_component,
 )
@@ -63,6 +66,108 @@ class ObjectSelectionTest(unittest.TestCase):
             ),
         )
 
+    def test_selection_larger_than_old_limit_is_exact_and_compact(self):
+        projection = np.ones((800, 800), dtype=np.uint8)
+
+        selected = select_visible_component(
+            projection,
+            (400, 400),
+            max_exact_outline_pixels=64,
+        )
+
+        self.assertEqual(selected.pixel_count, 640_000)
+        self.assertEqual(selected.rows.dtype, np.dtype(np.int32))
+        self.assertEqual(selected.columns.dtype, np.dtype(np.int32))
+        self.assertFalse(selected.rows.flags.writeable)
+        self.assertFalse(selected.columns.flags.writeable)
+        self.assertLessEqual(
+            selected.rows.nbytes + selected.columns.nbytes,
+            selected.pixel_count * 8,
+        )
+        self.assertEqual(selected.bounds, (0, 800, 0, 800))
+        self.assertTrue(selected.simplified_preview)
+
+    def test_search_budget_is_independent_from_outline_budget(self):
+        projection = np.zeros((2, 4096), dtype=np.uint8)
+        projection[0] = 9
+
+        selected = select_visible_component(
+            projection,
+            (0, 2048),
+            max_selection_pixels=5000,
+            max_search_pixels=8192,
+            max_exact_outline_pixels=32,
+        )
+
+        self.assertEqual(selected.pixel_count, 4096)
+        self.assertEqual(selected.bounds, (0, 1, 0, 4096))
+        self.assertTrue(selected.simplified_preview)
+
+    def test_exact_indices_can_be_consumed_in_bounded_views(self):
+        projection = np.ones((9, 11), dtype=np.uint8)
+        selected = select_visible_component(projection, (4, 5))
+
+        chunks = tuple(selected.iter_indices(max_pixels=17))
+
+        self.assertEqual(len(chunks), 6)
+        self.assertTrue(all(rows.size <= 17 for rows, _ in chunks))
+        np.testing.assert_array_equal(
+            np.concatenate([rows for rows, _ in chunks]),
+            selected.rows,
+        )
+        np.testing.assert_array_equal(
+            np.concatenate([columns for _, columns in chunks]),
+            selected.columns,
+        )
+        with self.assertRaisesRegex(ValueError, "max_pixels"):
+            tuple(selected.iter_indices(0))
+
+    def test_search_window_limit_has_distinct_bounded_error(self):
+        projection = np.zeros((2, 4096), dtype=np.uint8)
+        projection[0] = 3
+
+        with self.assertRaisesRegex(
+            SelectionTooLargeError,
+            "2,048-pixel search window",
+        ):
+            select_visible_component(
+                projection,
+                (0, 2048),
+                max_selection_pixels=5000,
+                max_search_pixels=2048,
+                max_exact_outline_pixels=32,
+            )
+
+    def test_default_budgets_cover_common_full_slide_canvas(self):
+        self.assertEqual(MAX_EXACT_OUTLINE_PIXELS, 4 * 1024 * 1024)
+        self.assertGreaterEqual(MAX_SELECTION_PIXELS, 16_000_000)
+        self.assertGreaterEqual(
+            MAX_SELECTION_SEARCH_PIXELS,
+            7048 * 8001,
+        )
+
+    def test_default_large_span_keeps_exact_pixels_with_bounded_preview(self):
+        projection = np.zeros((2049, 2048), dtype=np.uint8)
+        projection[[0, -1], :] = 6
+        projection[:, [0, -1]] = 6
+
+        selected = select_visible_component(projection, (0, 0))
+
+        self.assertEqual(selected.pixel_count, 2 * 2049 + 2 * 2048 - 4)
+        self.assertEqual(selected.bounds, (0, 2049, 0, 2048))
+        self.assertTrue(selected.simplified_preview)
+        np.testing.assert_array_equal(
+            selected.outline,
+            np.array(
+                [
+                    [-0.5, -0.5],
+                    [-0.5, 2047.5],
+                    [2048.5, 2047.5],
+                    [2048.5, -0.5],
+                ]
+            ),
+        )
+
     def test_translation_is_exact_and_rejects_image_exit(self):
         projection = np.zeros((7, 8), dtype=np.uint8)
         projection[2:4, 3:5] = 7
@@ -78,6 +183,8 @@ class ObjectSelectionTest(unittest.TestCase):
             selected.outline + np.array([2.0, -1.0]),
         )
         self.assertEqual(len(moved.outlines), len(selected.outlines))
+        self.assertFalse(moved.rows.flags.writeable)
+        self.assertFalse(moved.columns.flags.writeable)
         with self.assertRaisesRegex(ValueError, "outside the image"):
             selected.translated(-3, 0, projection.shape)
 

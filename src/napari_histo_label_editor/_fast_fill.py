@@ -28,14 +28,139 @@ LOCAL_FLOOD_WINDOW = 1024
 MAX_LOCAL_FLOOD_PIXELS = 16 * 1024 * 1024
 
 
+def _fit_interval_around_required(
+    desired_start: int,
+    desired_stop: int,
+    required_start: int,
+    required_stop: int,
+    length: int,
+) -> tuple[int, int]:
+    """Place a fixed-length interval inside ``desired`` around ``required``."""
+
+    lowest_start = max(desired_start, required_stop - length)
+    highest_start = min(required_start, desired_stop - length)
+    preferred_start = (desired_start + desired_stop - length) // 2
+    start = min(max(preferred_start, lowest_start), highest_start)
+    return int(start), int(start + length)
+
+
+def _fit_window_to_pixel_budget(
+    desired_bounds: tuple[int, int, int, int],
+    required_bounds: tuple[int, int, int, int],
+    max_pixels: int,
+) -> tuple[int, int, int, int]:
+    """Clip an expansion rectangle without excluding proven component bounds."""
+
+    desired_row_start, desired_row_stop, desired_col_start, desired_col_stop = (
+        int(value) for value in desired_bounds
+    )
+    required_row_start, required_row_stop, required_col_start, required_col_stop = (
+        int(value) for value in required_bounds
+    )
+    desired_height = desired_row_stop - desired_row_start
+    desired_width = desired_col_stop - desired_col_start
+    required_height = required_row_stop - required_row_start
+    required_width = required_col_stop - required_col_start
+    if required_height * required_width > int(max_pixels):
+        raise ValueError("required flood bounds exceed the pixel budget")
+    if desired_height * desired_width <= int(max_pixels):
+        return desired_bounds
+
+    # Preserve the desired aspect ratio where possible, then spend any
+    # remaining budget on the other dimension. Required bounds always fit,
+    # as checked above, so the integer divisions cannot collapse either axis.
+    balanced_height = int(
+        np.sqrt(int(max_pixels) * desired_height / max(1, desired_width))
+    )
+    target_height = min(
+        desired_height,
+        max(required_height, balanced_height),
+        int(max_pixels) // required_width,
+    )
+    target_width = min(desired_width, int(max_pixels) // target_height)
+    if target_width < required_width:
+        target_width = required_width
+        target_height = min(
+            desired_height,
+            int(max_pixels) // target_width,
+        )
+
+    row_start, row_stop = _fit_interval_around_required(
+        desired_row_start,
+        desired_row_stop,
+        required_row_start,
+        required_row_stop,
+        target_height,
+    )
+    col_start, col_stop = _fit_interval_around_required(
+        desired_col_start,
+        desired_col_stop,
+        required_col_start,
+        required_col_stop,
+        target_width,
+    )
+    return row_start, row_stop, col_start, col_stop
+
+
 def _mask_indices_with_offset(
     mask: np.ndarray,
     row_offset: int = 0,
     column_offset: int = 0,
+    *,
+    index_dtype=None,
+    max_chunk_pixels: int = 1024 * 1024,
 ) -> tuple[np.ndarray, np.ndarray]:
-    rows, columns = np.nonzero(mask)
-    rows += row_offset
-    columns += column_offset
+    """Return mask coordinates, optionally into compact chunked outputs.
+
+    ``np.nonzero`` always creates two platform-sized arrays.  That is ideal
+    for ordinary paint/fill regions, but a multi-million-pixel object
+    selection can briefly need twice the memory of its compact int32 result.
+    The opt-in dtype path fills the final arrays in bounded row chunks so the
+    largest temporary coordinate pair is independent of component size.
+    """
+
+    if index_dtype is None:
+        rows, columns = np.nonzero(mask)
+        rows += row_offset
+        columns += column_offset
+        return rows, columns
+
+    dtype = np.dtype(index_dtype)
+    if not np.issubdtype(dtype, np.signedinteger):
+        raise TypeError("index_dtype must be a signed integer dtype")
+    if max_chunk_pixels < 1:
+        raise ValueError("max_chunk_pixels must be at least 1")
+    count = int(np.count_nonzero(mask))
+    rows = np.empty(count, dtype=dtype)
+    columns = np.empty(count, dtype=dtype)
+    if count == 0:
+        return rows, columns
+
+    width = int(mask.shape[1])
+    rows_per_chunk = max(1, int(max_chunk_pixels) // max(1, width))
+    output_start = 0
+    for local_row_start in range(0, int(mask.shape[0]), rows_per_chunk):
+        local_row_stop = min(
+            int(mask.shape[0]),
+            local_row_start + rows_per_chunk,
+        )
+        local_rows, local_columns = np.nonzero(
+            mask[local_row_start:local_row_stop]
+        )
+        output_stop = output_start + int(local_rows.size)
+        np.add(
+            local_rows,
+            int(row_offset) + local_row_start,
+            out=rows[output_start:output_stop],
+            casting="unsafe",
+        )
+        np.add(
+            local_columns,
+            int(column_offset),
+            out=columns[output_start:output_stop],
+            casting="unsafe",
+        )
+        output_start = output_stop
     return rows, columns
 
 
@@ -47,6 +172,7 @@ def bounded_flood_indices(
     max_local_pixels: int = MAX_LOCAL_FLOOD_PIXELS,
     max_component_pixels: int | None = None,
     allow_full_fallback: bool = True,
+    index_dtype=None,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Return a 4-connected component without starting at full-slide size.
 
@@ -133,6 +259,7 @@ def bounded_flood_indices(
                 matches,
                 row_start,
                 column_start,
+                index_dtype=index_dtype,
             )
 
         current_height = row_stop - row_start
@@ -157,26 +284,119 @@ def bounded_flood_indices(
             if expand_right
             else column_stop
         )
+
+        # If a component crosses both opposing sides of the current window,
+        # jump that axis to the image bounds when the resulting rectangle is
+        # still inside the caller's explicit search budget.  Broad tissue
+        # regions then need one large compiled flood instead of retaining
+        # several progressively-sized allocator arenas at peak memory.
+        accelerated_row_start = (
+            0 if expand_top and expand_bottom else next_row_start
+        )
+        accelerated_row_stop = (
+            height if expand_top and expand_bottom else next_row_stop
+        )
+        accelerated_column_start = (
+            0 if expand_left and expand_right else next_column_start
+        )
+        accelerated_column_stop = (
+            width if expand_left and expand_right else next_column_stop
+        )
+        accelerated_pixels = (
+            accelerated_row_stop - accelerated_row_start
+        ) * (accelerated_column_stop - accelerated_column_start)
+        if accelerated_pixels <= max_local_pixels:
+            next_row_start = accelerated_row_start
+            next_row_stop = accelerated_row_stop
+            next_column_start = accelerated_column_start
+            next_column_stop = accelerated_column_stop
         next_pixels = (next_row_stop - next_row_start) * (
             next_column_stop - next_column_start
         )
 
         if next_pixels > max_local_pixels:
-            if not allow_full_fallback:
-                raise ValueError(
-                    "connected component exceeds the bounded flood window"
-                )
-            # Release the local mask before allocating the full fallback.
-            del matches
-            full_matches = flood(labels, seed, connectivity=1)
-            if (
-                max_component_pixels is not None
-                and int(np.count_nonzero(full_matches))
-                > max_component_pixels
-            ):
-                raise ValueError("connected component exceeds the pixel limit")
-            return np.nonzero(full_matches)
+            # A geometric growth step may overshoot the budget even though
+            # the actual component fits (for example 30x30 -> 90x90 around a
+            # 40x40 object). Derive the component bounds already proven by
+            # this flood, plus one required pixel on every connected edge.
+            # Only that lower bound can prove the component is too large.
+            occupied_rows = np.flatnonzero(np.any(matches, axis=1))
+            occupied_columns = np.flatnonzero(np.any(matches, axis=0))
+            match_row_start = row_start + int(occupied_rows[0])
+            match_row_stop = row_start + int(occupied_rows[-1]) + 1
+            match_column_start = column_start + int(occupied_columns[0])
+            match_column_stop = column_start + int(occupied_columns[-1]) + 1
 
+            required_row_start = (
+                row_start - 1 if expand_top else match_row_start
+            )
+            required_row_stop = (
+                row_stop + 1 if expand_bottom else match_row_stop
+            )
+            required_column_start = (
+                column_start - 1 if expand_left else match_column_start
+            )
+            required_column_stop = (
+                column_stop + 1 if expand_right else match_column_stop
+            )
+            required_pixels = (
+                required_row_stop - required_row_start
+            ) * (required_column_stop - required_column_start)
+
+            if required_pixels <= max_local_pixels:
+                # Empty margins on a non-expanding side cannot belong to the
+                # current component. Reclaim them before distributing the
+                # remaining budget across the sides that do expand.
+                desired_bounds = (
+                    next_row_start if expand_top else match_row_start,
+                    next_row_stop if expand_bottom else match_row_stop,
+                    next_column_start if expand_left else match_column_start,
+                    next_column_stop if expand_right else match_column_stop,
+                )
+                (
+                    next_row_start,
+                    next_row_stop,
+                    next_column_start,
+                    next_column_stop,
+                ) = _fit_window_to_pixel_budget(
+                    desired_bounds,
+                    (
+                        required_row_start,
+                        required_row_stop,
+                        required_column_start,
+                        required_column_stop,
+                    ),
+                    max_local_pixels,
+                )
+                next_pixels = (next_row_stop - next_row_start) * (
+                    next_column_stop - next_column_start
+                )
+            else:
+                if not allow_full_fallback:
+                    raise ValueError(
+                        "connected component exceeds the bounded flood window"
+                    )
+                # Release the local mask before allocating the full fallback.
+                del matches
+                full_matches = flood(labels, seed, connectivity=1)
+                if (
+                    max_component_pixels is not None
+                    and int(np.count_nonzero(full_matches))
+                    > max_component_pixels
+                ):
+                    raise ValueError(
+                        "connected component exceeds the pixel limit"
+                    )
+                return _mask_indices_with_offset(
+                    full_matches,
+                    index_dtype=index_dtype,
+                )
+
+        # Do not keep the prior flood mask alive while the next, larger one
+        # is allocated.  Python evaluates the right-hand side of the next
+        # ``matches = flood(...)`` before replacing the old reference, which
+        # otherwise makes consecutive expansion masks overlap at peak memory.
+        del matches
         row_start, row_stop = next_row_start, next_row_stop
         column_start, column_stop = next_column_start, next_column_stop
 

@@ -174,6 +174,37 @@ class FastFillTest(unittest.TestCase):
         np.testing.assert_array_equal(actual[0], expected[0])
         np.testing.assert_array_equal(actual[1], expected[1])
 
+    def test_growth_overshoot_is_clipped_instead_of_rejecting_component(self):
+        labels = np.zeros((100, 100), dtype=np.uint8)
+        labels[30:70, 30:70] = 5
+        allocated_shapes = []
+
+        def recording_flood(data, seed, connectivity):
+            allocated_shapes.append(data.shape)
+            return reference_flood(data, seed, connectivity=connectivity)
+
+        with patch(
+            "napari_histo_label_editor._fast_fill.flood",
+            side_effect=recording_flood,
+        ):
+            actual = bounded_flood_indices(
+                labels,
+                (50, 50),
+                initial_window=10,
+                max_local_pixels=5000,
+                allow_full_fallback=False,
+            )
+
+        expected = np.nonzero(
+            reference_flood(labels, (50, 50), connectivity=1)
+        )
+        np.testing.assert_array_equal(actual[0], expected[0])
+        np.testing.assert_array_equal(actual[1], expected[1])
+        self.assertTrue(
+            all(height * width <= 5000 for height, width in allocated_shapes)
+        )
+        self.assertNotIn(labels.shape, allocated_shapes)
+
     def test_bounded_flood_matches_reference_for_random_components(self):
         rng = np.random.default_rng(2048)
         labels = rng.integers(0, 4, size=(80, 96), dtype=np.uint8)

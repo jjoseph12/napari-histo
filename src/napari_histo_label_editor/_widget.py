@@ -20,7 +20,7 @@ from napari.layers.labels._labels_utils import (
 from qtpy.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QLineEdit, QFileDialog, QMessageBox, QGridLayout, 
-    QAbstractSpinBox, QSizePolicy, QScrollArea, QSpinBox
+    QSizePolicy, QScrollArea, QDockWidget
 )
 from qtpy.QtGui import QColor
 from qtpy.QtCore import QTimer, Qt
@@ -65,6 +65,7 @@ CLASS_SCAN_MASK_BYTES = 8 * 1024 * 1024
 MAX_OBJECT_MOVE_HISTORY_BYTES = 256 * 1024 * 1024
 DEFAULT_ANNOTATION_OPACITY = 0.45
 NATIVE_BRUSH_SIZE_MAX = 512
+SELECTION_ACTIONS_DOCK_NAME = "Histology selected region"
 
 
 def _tracked_overlap_data_setitem(layer, indices, value, refresh=True):
@@ -355,6 +356,92 @@ class _OverlapEditTracker:
         if changed:
             self.widget._refresh_composite_bounds(bounds)
         return result
+
+    def erase_visible_selection(self, selection):
+        """Erase one picker-owned component without generic index expansion.
+
+        The connected flood already guarantees unique row-major coordinates
+        and binds them to a store revision.  This dedicated button path keeps
+        those compact coordinates through native/custom history instead of
+        repeatedly converting and sorting them like an arbitrary brush input.
+        """
+
+        if self.widget._save_worker is not None:
+            raise RuntimeError(
+                "Wait for the current label save to finish before deleting."
+            )
+        if self.block_depth or self.layer._block_history:
+            raise RuntimeError(
+                "Selected annotation deletion cannot join another edit."
+            )
+        if selection.store_revision is None:
+            raise RuntimeError("The selected annotation has no store revision")
+
+        controller = self.widget.overlap_editor
+        # Picker output is frozen at construction, but retain this invariant
+        # for selections supplied by older sessions or focused callers before
+        # history begins sharing the arrays without copying them.
+        selection.rows.setflags(write=False)
+        selection.columns.setflags(write=False)
+        indices = controller._unique_selection_indices(
+            (selection.rows, selection.columns)
+        )
+        value = int(selection.value)
+        projection_dtype = controller.composite.dtype
+        erased_value = np.asarray(value, dtype=projection_dtype).reshape(())
+
+        # Build and enqueue every tiny history container before the store
+        # transaction. Assigning the varying top-after array into this list
+        # after commit is pointer replacement and cannot allocate. This keeps
+        # a deque/list allocation failure an exact no-op.
+        atom = [indices, erased_value, erased_value, erased_value]
+        history_item = [atom]
+        native_undo_before = tuple(self.layer._undo_history)
+        native_redo_before = tuple(self.layer._redo_history)
+        native_staged_before = tuple(self.layer._staged_history)
+        custom_undo_before = tuple(self.undo_items)
+        custom_redo_before = tuple(self.redo_items)
+        try:
+            # The binary proxy represents whichever class is active *when
+            # history is replayed*, which may differ from the picked class.
+            # Never retain selected coordinates in native history: an empty
+            # alignment atom lets the semantic controller update only the
+            # currently relevant proxy during Undo/Redo and prevents ghost
+            # memberships after a class switch.
+            self._add_empty_native_history_atom()
+            self.redo_items.clear()
+            self.undo_items.append(history_item)
+            _changed, bounds, top_after = (
+                controller.erase_selected_visible_indices(
+                    indices,
+                    value,
+                    expected_revision=int(selection.store_revision),
+                )
+            )
+            atom[2] = top_after
+        except BaseException:
+            # The controller/store restore proxy, memberships, projection,
+            # generation, and revision on mutation failures. Restore both
+            # paired history sides here, including any maxlen eviction.
+            self.layer._undo_history.clear()
+            self.layer._undo_history.extend(native_undo_before)
+            self.layer._redo_history.clear()
+            self.layer._redo_history.extend(native_redo_before)
+            self.layer._staged_history[:] = native_staged_before
+            self.undo_items.clear()
+            self.undo_items.extend(custom_undo_before)
+            self.redo_items.clear()
+            self.redo_items.extend(custom_redo_before)
+            raise
+
+        try:
+            self.widget._refresh_composite_bounds(bounds)
+        except Exception as error:
+            # Memberships, projection, proxy, and paired history have already
+            # committed. A display upload failure must not be reported as a
+            # failed Delete or leave stale destructive controls armed.
+            return error
+        return None
 
     def _record(self, atom) -> None:
         self.redo_items.clear()
@@ -650,6 +737,8 @@ class LabelEditorWidget(QWidget):
         self._pending_deleted_value: Optional[int] = None
         self._pending_deleted_replacement: Optional[int] = None
         self._changing_selected_label = False
+        self._undo_in_progress = False
+        self._undo_feedback_token = 0
         self._save_worker = None
         self._active_save_path: Optional[Path] = None
         self._active_save_layer = None
@@ -668,6 +757,8 @@ class LabelEditorWidget(QWidget):
             AnnotationObjectSelection
         ] = None
         self._selection_layer = None
+        self._selection_actions_dock = None
+        self._selection_actions_owner_dock = None
 
         self.class_button_layout = None
 
@@ -680,6 +771,7 @@ class LabelEditorWidget(QWidget):
         self.overlap_editor: Optional[OverlapEditorController] = None
 
         self._build_ui()
+        self._schedule_selection_actions_dock_install()
         self._bind_hotkeys()
         # napari recreates every layer's polygon overlay when layers are added
         # or removed. Reinstall our preview callback after that core rebuild.
@@ -712,7 +804,6 @@ class LabelEditorWidget(QWidget):
         if removed_selection:
             self._selection_layer = None
             self._annotation_selection = None
-            self.selection_status_label.setText("No region selected")
         layer = self.labels_layer
         if layer is None or not any(
             candidate is layer for candidate in self.viewer.layers
@@ -818,26 +909,21 @@ class LabelEditorWidget(QWidget):
 
         layout.addWidget(self.class_button_scroll)
 
-        layout.addWidget(QLabel("Selected visible region"))
-        self.selection_help_label = QLabel(
-            "Choose napari's Pick tool, then click an annotation."
+        # Keep destructive selection actions in their own compact widget.  A
+        # real napari Viewer docks it beneath the layer list on the left;
+        # ViewerModel/headless callers still own the same buttons without
+        # reaching into napari's Qt implementation details.
+        self.selection_actions_widget = QWidget(self)
+        self.selection_actions_widget.setObjectName(
+            "histologySelectedRegionActions"
         )
-        self.selection_help_label.setWordWrap(True)
-        layout.addWidget(self.selection_help_label)
-        self.selection_status_label = QLabel("No region selected")
-        self.selection_status_label.setWordWrap(True)
-        layout.addWidget(self.selection_status_label)
-
-        selection_actions = QHBoxLayout()
-        self.use_selection_class_btn = QPushButton("Use class")
-        self.use_selection_class_btn.setEnabled(False)
-        self.use_selection_class_btn.setToolTip(
-            "Make the selected region's class the active paint class"
+        self.selection_actions_widget.setSizePolicy(
+            QSizePolicy.MinimumExpanding,
+            QSizePolicy.Fixed,
         )
-        self.use_selection_class_btn.clicked.connect(
-            self._use_selected_annotation_class
-        )
-        selection_actions.addWidget(self.use_selection_class_btn)
+        selection_actions = QHBoxLayout(self.selection_actions_widget)
+        selection_actions.setContentsMargins(6, 4, 6, 4)
+        selection_actions.setSpacing(6)
         self.delete_region_btn = QPushButton("Delete…")
         self.delete_region_btn.setEnabled(False)
         self.delete_region_btn.setToolTip(
@@ -856,43 +942,6 @@ class LabelEditorWidget(QWidget):
             self._clear_annotation_selection
         )
         selection_actions.addWidget(self.clear_region_btn)
-        layout.addLayout(selection_actions)
-
-        move_layout = QHBoxLayout()
-        move_layout.addWidget(QLabel("Step"))
-        self.move_region_step = QSpinBox()
-        self.move_region_step.setRange(1, 10_000)
-        self.move_region_step.setValue(1)
-        self.move_region_step.setSuffix(" px")
-        self.move_region_step.setButtonSymbols(QAbstractSpinBox.NoButtons)
-        self.move_region_step.setMinimumWidth(64)
-        self.move_region_step.setMaximumWidth(80)
-        self.move_region_step.setToolTip(
-            "Exact integer distance used by the four move buttons"
-        )
-        move_layout.addWidget(self.move_region_step)
-        self.move_region_up_btn = QPushButton("↑")
-        self.move_region_down_btn = QPushButton("↓")
-        self.move_region_left_btn = QPushButton("←")
-        self.move_region_right_btn = QPushButton("→")
-        for button, row_delta, column_delta in (
-            (self.move_region_up_btn, -1, 0),
-            (self.move_region_down_btn, 1, 0),
-            (self.move_region_left_btn, 0, -1),
-            (self.move_region_right_btn, 0, 1),
-        ):
-            button.setEnabled(False)
-            button.setToolTip(
-                f"Move the selected region by ({row_delta}, {column_delta}) "
-                "times the pixel step"
-            )
-            button.clicked.connect(
-                lambda checked=False, dr=row_delta, dc=column_delta: (
-                    self._move_selected_annotation(dr, dc)
-                )
-            )
-            move_layout.addWidget(button)
-        layout.addLayout(move_layout)
 
         self.save_destination_caption = QLabel("Save destination (editable)")
         layout.addWidget(self.save_destination_caption)
@@ -942,6 +991,127 @@ class LabelEditorWidget(QWidget):
         ):
             line_edit.textChanged.connect(self._update_project_controls)
         self._update_project_controls()
+
+    def _viewer_window(self):
+        """Return napari's public Window facade when one is available."""
+
+        window = getattr(self.viewer, "window", None)
+        if window is None:
+            return None
+        if not callable(getattr(window, "add_dock_widget", None)):
+            return None
+        if not callable(getattr(window, "remove_dock_widget", None)):
+            return None
+        return window
+
+    def _schedule_selection_actions_dock_install(self) -> None:
+        """Attach the tiny selection-action panel after our main dock exists."""
+
+        if self._viewer_window() is not None:
+            QTimer.singleShot(0, self._install_selection_actions_dock)
+
+    def _owning_dock_widget(self):
+        parent = self.parentWidget()
+        while parent is not None:
+            if isinstance(parent, QDockWidget):
+                return parent
+            parent = parent.parentWidget()
+        return None
+
+    def _install_selection_actions_dock(self) -> None:
+        """Place Delete/Clear in one compact, plugin-owned left dock."""
+
+        window = self._viewer_window()
+        if window is None:
+            return
+
+        # Reopening the editor must never accumulate orphaned copies.  Use
+        # napari's public mapping/removal APIs instead of inspecting private
+        # dock registries or modifying the built-in layer-list widget.
+        try:
+            existing = window.dock_widgets.get(SELECTION_ACTIONS_DOCK_NAME)
+        except (AttributeError, RuntimeError):
+            existing = None
+        if existing is self.selection_actions_widget:
+            return
+        if existing is not None:
+            try:
+                window.remove_dock_widget(existing)
+            except (AttributeError, LookupError, RuntimeError):
+                pass
+
+        owner_dock = self._owning_dock_widget()
+        try:
+            dock = window.add_dock_widget(
+                self.selection_actions_widget,
+                name=SELECTION_ACTIONS_DOCK_NAME,
+                area="left",
+                allowed_areas=["left"],
+                add_vertical_stretch=False,
+            )
+        except (AttributeError, RuntimeError, ValueError):
+            self.selection_actions_widget.setParent(self)
+            return
+
+        # QMainWindow otherwise gives each newly stacked left dock a generous
+        # share of the column.  Cap this one to its title and one button row so
+        # napari's layer controls/list retain the available height.
+        compact_height = max(
+            64,
+            int(self.selection_actions_widget.sizeHint().height()) + 34,
+        )
+        # napari calls QMainWindow.resizeDocks() while adding this dock.  A
+        # smaller minimum lets that initial resize keep only the custom title
+        # bar and clip the button row, notably with the Cocoa/Retina style.
+        # Pin both bounds to the compact hint so the layer list loses no more
+        # room than intended while the complete controls remain visible.
+        dock.setMinimumHeight(compact_height)
+        dock.setMaximumHeight(compact_height)
+        dock.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
+        self._selection_actions_dock = dock
+        dock.destroyed.connect(self._on_selection_actions_dock_destroyed)
+
+        self._selection_actions_owner_dock = owner_dock
+        if owner_dock is not None and owner_dock is not dock:
+            owner_dock.destroyed.connect(
+                self._remove_selection_actions_dock
+            )
+
+    def _on_selection_actions_dock_destroyed(self, *args) -> None:
+        """Keep the button widget owned if its small dock is closed."""
+
+        del args
+        self._selection_actions_dock = None
+        try:
+            if self.selection_actions_widget.parentWidget() is None:
+                self.selection_actions_widget.setParent(self)
+        except RuntimeError:
+            pass
+
+    def _remove_selection_actions_dock(self, *args) -> None:
+        """Remove the companion dock when the main editor dock is closed."""
+
+        del args
+        self._selection_actions_owner_dock = None
+        self._selection_actions_dock = None
+        window = self._viewer_window()
+        if window is not None:
+            try:
+                existing = window.dock_widgets.get(
+                    SELECTION_ACTIONS_DOCK_NAME
+                )
+            except (AttributeError, RuntimeError):
+                existing = None
+            if existing is self.selection_actions_widget:
+                try:
+                    window.remove_dock_widget(existing)
+                except (AttributeError, LookupError, RuntimeError):
+                    pass
+        try:
+            if self.selection_actions_widget.parentWidget() is None:
+                self.selection_actions_widget.setParent(self)
+        except RuntimeError:
+            pass
 
     def _file_row(self, line_edit, callback):
         row = QHBoxLayout()
@@ -1075,7 +1245,9 @@ class LabelEditorWidget(QWidget):
             self.save_btn.setText("Save class deletion [s]")
         else:
             self.save_btn.setText("Save [s]")
-        self.undo_btn.setEnabled(active_layer and not busy)
+        self.undo_btn.setEnabled(
+            active_layer and not busy and not self._undo_in_progress
+        )
         class_actions_enabled = (
             project_actions_enabled
             and destination_available
@@ -1105,17 +1277,8 @@ class LabelEditorWidget(QWidget):
             and bool(self._selection_layer.visible)
             and not busy
         )
-        self.use_selection_class_btn.setEnabled(selection_ready)
         self.delete_region_btn.setEnabled(selection_ready)
         self.clear_region_btn.setEnabled(selection_ready)
-        self.move_region_step.setEnabled(selection_ready)
-        for move_button in (
-            self.move_region_up_btn,
-            self.move_region_down_btn,
-            self.move_region_left_btn,
-            self.move_region_right_btn,
-        ):
-            move_button.setEnabled(selection_ready)
 
         self._sync_native_semantic_label_selector()
 
@@ -1339,7 +1502,6 @@ class LabelEditorWidget(QWidget):
         previous_layer_ids = {id(layer) for layer in previous_layers}
         previous_annotation_selection = self._annotation_selection
         previous_selection_layer = self._selection_layer
-        previous_selection_status = self.selection_status_label.text()
 
         try:
             # File/data validation is complete, so release the previous GPU
@@ -1439,7 +1601,6 @@ class LabelEditorWidget(QWidget):
                 )
             self._annotation_selection = previous_annotation_selection
             self._selection_layer = previous_selection_layer
-            self.selection_status_label.setText(previous_selection_status)
             raise
 
         self.image_path = image_path
@@ -1460,7 +1621,6 @@ class LabelEditorWidget(QWidget):
         self.labels_layer = labels_layer
         self._annotation_selection = None
         self._selection_layer = selection_layer
-        self.selection_status_label.setText("No region selected")
         self._selection_layer.events.visible.connect(
             self._on_selection_layer_visibility_change
         )
@@ -1836,7 +1996,7 @@ class LabelEditorWidget(QWidget):
             return
         try:
             self._set_annotation_selection(selected)
-            # Pick retains the connected-region outline for move/delete and
+            # Pick retains the connected-region outline for deletion and
             # also makes the clicked semantic class the active paint class.
             # Avoid rebuilding the same binary membership plane when it is
             # already active; background clicks are handled above as no
@@ -1857,7 +2017,6 @@ class LabelEditorWidget(QWidget):
                     self._selection_layer.visible = False
                 except Exception:
                     pass
-            self.selection_status_label.setText("No region selected")
             if self._labels_layer_is_active():
                 self.viewer.layers.selection.active = self.labels_layer
             self._update_project_controls()
@@ -1947,16 +2106,6 @@ class LabelEditorWidget(QWidget):
         layer.editable = False
         layer.visible = True
         self._annotation_selection = selection
-        class_name = self.class_map.get(selection.value, str(selection.value))
-        approximation = (
-            " (simplified outline preview)"
-            if selection.simplified_preview
-            else ""
-        )
-        self.selection_status_label.setText(
-            f"Class {selection.value}: {class_name} — "
-            f"{selection.pixel_count:,} pixels{approximation}"
-        )
         self.viewer.layers.selection.active = self.labels_layer
         self.viewer.status = (
             f"Selected visible region: class {selection.value}, "
@@ -1972,7 +2121,7 @@ class LabelEditorWidget(QWidget):
             and not self._selection_layer.visible
         ):
             self.viewer.status = (
-                "Selection outline is hidden; show it before Delete or Move."
+                "Selection outline is hidden; show it before Delete."
             )
             if self._labels_layer_is_active():
                 self.viewer.layers.selection.active = self.labels_layer
@@ -1987,7 +2136,6 @@ class LabelEditorWidget(QWidget):
             self._selection_layer.visible = False
         if self._labels_layer_is_active():
             self.viewer.layers.selection.active = self.labels_layer
-        self.selection_status_label.setText("No region selected")
         self._update_project_controls()
 
     def _selected_annotation_is_current(self) -> bool:
@@ -1995,12 +2143,12 @@ class LabelEditorWidget(QWidget):
         if selection is None or not self._labels_layer_is_active():
             return False
         revision = getattr(self.overlap_store, "revision", None)
-        if (
-            selection.store_revision is not None
-            and revision is not None
-            and int(selection.store_revision) != int(revision)
-        ):
-            return False
+        if selection.store_revision is not None and revision is not None:
+            # Store revisions change for every authoritative mutation. A
+            # matching picker revision proves freshness without gathering and
+            # comparing a multi-million-pixel projection twice around the
+            # confirmation dialog.
+            return int(selection.store_revision) == int(revision)
         return bool(
             np.all(
                 self.overlap_editor.composite[
@@ -2074,31 +2222,41 @@ class LabelEditorWidget(QWidget):
             )
             return
         try:
-            self.labels_layer.data_setitem(
-                (selection.rows, selection.columns),
-                0,
+            refresh_error = (
+                self.labels_layer._napari_histo_edit_tracker
+                .erase_visible_selection(selection)
             )
         except (MemoryError, RuntimeError, TypeError, ValueError) as error:
             self.viewer.status = f"Could not delete selected annotation: {error}"
             return
         self._clear_annotation_selection()
-        self.viewer.status = (
-            "Selected annotation deleted in memory. Press Save to write it."
-        )
+        if refresh_error is None:
+            self.viewer.status = (
+                "Selected annotation deleted in memory. Press Save to write it."
+            )
+        else:
+            self.viewer.status = (
+                "Selected annotation deleted in memory, but the display could "
+                "not refresh. Pan or zoom to redraw, then press Save."
+            )
 
     def _move_selected_annotation(
         self,
         row_direction: int,
         column_direction: int,
+        *,
+        step: int = 1,
     ) -> None:
-        """Move the selected visible region by the configured integer step."""
+        """Move a selection internally by an explicit integer step."""
 
         # The transactional store/history backend is installed below; keep
         # this UI handler explicit so unsupported states fail without edits.
         selection = self._annotation_selection
         if selection is None:
             return
-        step = int(self.move_region_step.value())
+        step = int(step)
+        if step < 1:
+            raise ValueError("The annotation move step must be at least one")
         row_delta = int(row_direction) * step
         column_delta = int(column_direction) * step
         try:
@@ -2594,20 +2752,29 @@ class LabelEditorWidget(QWidget):
             self.viewer.status = f"Class {value} is not available."
             return
 
+        class_changed = int(self.overlap_editor.active_class) != value
         # Flush any edit whose partial event was suppressed before replacing
-        # the binary working mask with the newly selected membership plane.
-        missed_changes = self.overlap_editor.full_sync()
+        # the binary working mask with a *different* membership plane. Merely
+        # returning from semantic Erase (selected label 0) to the already
+        # active paint class must not rebuild that plane or erase Undo history.
+        missed_changes = (
+            self.overlap_editor.full_sync() if class_changed else 0
+        )
         self._syncing_overlap_layer = True
         try:
-            self.overlap_editor.select_class(value)
-            self._limit_undo_history(self.labels_layer)
+            if class_changed:
+                self.overlap_editor.select_class(value)
+                # Native history stores changes to one binary class plane.
+                # It cannot safely cross a genuine plane switch.
+                self._limit_undo_history(self.labels_layer)
             self.labels_layer.selected_label = 1
             if missed_changes:
                 self.composite_layer.refresh()
-            self._refresh_overlap_layer_metadata(
-                include_composite=False,
-                update_active_colormap=False,
-            )
+            if class_changed:
+                self._refresh_overlap_layer_metadata(
+                    include_composite=False,
+                    update_active_colormap=False,
+                )
         finally:
             self._syncing_overlap_layer = False
         self.viewer.layers.selection.active = self.labels_layer
@@ -3249,38 +3416,98 @@ class LabelEditorWidget(QWidget):
             tracker.staged = []
 
     def undo(self):
+        if self._undo_in_progress:
+            self.viewer.status = "Undo is already in progress."
+            return
         if self._save_worker is not None:
             self.viewer.status = "Wait for the current label save to finish."
             return
-        tracker = getattr(
-            self.labels_layer,
-            "_napari_histo_edit_tracker",
-            None,
-        )
-        tracker_has_paired_history = bool(
-            tracker is not None and tracker.undo_items
-        )
-        if not self._labels_layer_is_active() or not self._undo_labels_layer(
-            self.labels_layer
-        ):
-            self.viewer.status = "Nothing to undo."
-            return
-
-        # A paired tracker history already restored the packed membership and
-        # sparse top projection inside ``labels_layer.undo()``. Scanning and
-        # repacking the entire slide here would duplicate that work and turn a
-        # one-pixel Undo into an O(slide) operation.
-        if tracker_has_paired_history:
-            self.viewer.status = "Undo complete."
-            return
+        self._undo_in_progress = True
+        self._undo_feedback_token += 1
+        self.undo_btn.setText("Undoing…")
+        self.undo_btn.setEnabled(False)
+        self.viewer.status = "Undoing the last annotation change…"
+        # repaint() is synchronous and does not dispatch input events, so the
+        # user sees progress without opening a re-entrant Undo opportunity.
+        self.undo_btn.repaint()
         try:
-            missed_changes = self.overlap_editor.full_sync()
-            if missed_changes:
-                self.composite_layer.refresh()
-        except (TypeError, ValueError, RuntimeError, MemoryError) as error:
-            self.viewer.status = f"Undo display changed but sync failed: {error}"
-            return
-        self.viewer.status = "Undo complete."
+            tracker = getattr(
+                self.labels_layer,
+                "_napari_histo_edit_tracker",
+                None,
+            )
+            tracker_has_paired_history = bool(
+                tracker is not None and tracker.undo_items
+            )
+            if (
+                not self._labels_layer_is_active()
+                or not self._undo_labels_layer(self.labels_layer)
+            ):
+                self._show_undo_feedback(
+                    "Nothing to undo",
+                    "Nothing to undo.",
+                )
+                return
+
+            # A paired tracker history already restored the packed membership
+            # and sparse top projection inside ``labels_layer.undo()``.
+            # Scanning the entire slide here would turn one-pixel Undo into an
+            # O(slide) operation.
+            if tracker_has_paired_history:
+                self._show_undo_feedback(
+                    "Undo complete ✓",
+                    "Undo complete.",
+                )
+                return
+            try:
+                missed_changes = self.overlap_editor.full_sync()
+                if missed_changes:
+                    self.composite_layer.refresh()
+            except (TypeError, ValueError, RuntimeError, MemoryError) as error:
+                self._show_undo_feedback(
+                    "Undo applied ⚠",
+                    f"Undo display changed but sync failed: {error}",
+                )
+                return
+            self._show_undo_feedback(
+                "Undo complete ✓",
+                "Undo complete.",
+            )
+        except Exception as error:
+            # Paired history restores its native/custom queues and sparse data
+            # transactionally before propagating a failure. Keep that safe
+            # failure visible instead of letting a Qt button callback vanish
+            # into a terminal traceback.
+            self._show_undo_feedback(
+                "Undo failed",
+                f"Undo failed safely: {error}",
+            )
+        finally:
+            self._undo_in_progress = False
+            self._update_project_controls()
+
+    def _show_undo_feedback(
+        self,
+        button_text: str,
+        status_text: str,
+        *,
+        reset_after_ms: int = 1800,
+    ) -> None:
+        """Show deterministic Undo feedback, then restore the button label."""
+
+        self._undo_feedback_token += 1
+        token = self._undo_feedback_token
+        self.undo_btn.setText(button_text)
+        self.viewer.status = status_text
+        self.undo_btn.repaint()
+
+        def restore_label() -> None:
+            if token != self._undo_feedback_token or self._undo_in_progress:
+                return
+            self.undo_btn.setText("Undo [u]")
+            self._update_project_controls()
+
+        QTimer.singleShot(max(0, int(reset_after_ms)), restore_label)
 
     def save_labels(self):
         """Save normally, or rescue to Save As when a target is unsafe."""

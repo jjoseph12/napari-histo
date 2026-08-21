@@ -33,8 +33,7 @@ The plugin overlays an integer-valued segmentation mask on an RGB histology imag
 * Bounding-box polygon rendering instead of full-slide temporary masks
 * Cursor-aligned, high-visibility polygon preview on oversized textures
 * Partial GPU brush updates even when napari downsamples the Labels texture
-* Connected-region selection with an outline, confirmed deletion, and
-  one-step move Undo/Redo
+* Connected-region selection with an outline and confirmed deletion
 * Automatic multiscale display for large RGB images
 * Non-blocking, atomic saves that keep the interface responsive
 * Save the ordinary 2-D projection and lossless overlap data together inside
@@ -183,6 +182,12 @@ The napari layer list uses four purpose-based names:
 * **Selected annotation outline (preview)** is a locked, lightweight yellow
   outline. It stays hidden until a visible region is selected.
 
+The editor deliberately reuses one **Annotation tools** working layer instead
+of creating another full-size napari layer for every overlap. On whole-slide
+images, each dense layer can consume hundreds of megabytes and add another GPU
+texture. Every overlapping membership is still retained in the compact model
+and saved losslessly inside the chosen PNG or TIFF.
+
 Keep **Annotation tools** selected while drawing. Its transparency is
 intentional. Use the original napari **opacity** slider in the Labels controls
 to change how strongly the visible **Annotations** layer is shown. The plugin
@@ -279,37 +284,44 @@ the connected visible region under the cursor and makes that region's real
 semantic class the active paint class, rather than exposing the internal
 binary edit value.
 
-All Paint, Polygon, Fill, Erase, repaint, region Delete, and region Move
-changes remain in memory until **Save** is pressed.
+All Paint, Polygon, Fill, Erase, repaint, and region Delete changes remain in
+memory until **Save** is pressed.
 
-## Selecting, outlining, deleting, or moving a visible region
+## Selecting, outlining, or deleting a visible region
 
 Choose napari's **Pick** tool and click a visible annotation. The editor draws
-a yellow outline and reports its class and pixel count under **Selected visible
-region**. Selection follows 4-connected visible pixels. Because a semantic
-pixel mask does not retain the identity of every polygon that originally drew
-it, touching regions of the same visible class are one connected region.
+a yellow outline and reports its class and pixel count in napari's status bar.
+Selection follows 4-connected visible pixels. Because a semantic pixel mask
+does not retain the identity of every polygon that originally drew it,
+touching regions of the same visible class are one connected region.
 
 The selected pixels are exact. For a very complicated boundary, only the
-yellow preview may be simplified; the Delete or Move operation still uses the
-exact selected pixels. Regions above the safe selection limit are refused
-without changing data.
+yellow preview may be simplified; Delete still uses the exact selected
+pixels. Connected regions up to 16,777,216 pixels can be selected; the picker
+uses compact coordinates and a bounded search window so it does not allocate
+another full-slide Labels layer. Regions above the safe limit are refused
+without changing data. Picking a region also makes its semantic class the
+active paint class.
 
 Available actions are:
 
-* **Use class** restores the selected region's class as the active paint class
-  if a different class was chosen after making the selection.
 * **Delete…** asks for confirmation, removes only that visible class
   membership, and reveals any annotation underneath.
-* **Step** sets an exact integer pixel distance; the four arrow buttons
-  translate the region. Other classes at the destination remain stored as
-  overlaps. Moves outside the image or into a separate region of the same
-  class are refused instead of merging annotation identities.
 * **Clear** cancels the selection without changing annotations.
 
-Delete and Move each create one Undo step. The outline preview is not saved or
-exported; it only shows the currently selected pixels. The moved/deleted
-annotation data itself remains in memory until **Save**, just like painting.
+These two buttons appear in a compact **Histology selected region** panel
+beneath napari's layer list on the left, rather than taking space in the main
+editor panel. The panel keeps its full title-and-button height so napari cannot
+collapse or clip the button row.
+
+Delete creates one Undo step. The outline preview is not saved or exported;
+it only shows the currently selected pixels. Deleted annotation data remains
+in memory until **Save**, just like painting.
+
+The plugin's **Undo [u]** button immediately changes to **Undoing…** while a
+large edit is being restored, then reports **Undo complete ✓** or
+**Nothing to undo**. Switching from Erase back to the already-active paint
+class no longer clears valid Undo history.
 
 ---
 

@@ -16,9 +16,33 @@ from skimage.measure import approximate_polygon, find_contours
 from ._fast_fill import bounded_flood_indices
 
 
-MAX_SELECTION_PIXELS = 500_000
-MAX_EXACT_OUTLINE_PIXELS = 16 * 1024 * 1024
+# A selected component keeps two compact coordinate arrays.  Sixteen million
+# pixels therefore occupy at most 128 MiB while the selection is armed.  The
+# prior 500,000-pixel ceiling rejected ordinary broad tissue annotations.
+MAX_SELECTION_PIXELS = 16 * 1024 * 1024
+
+# Component discovery is allowed to inspect a larger bounded rectangle than
+# the component itself occupies.  This is deliberately independent of the
+# outline budget: a thin or perforated annotation can span most of a slide
+# while still having a reasonably-sized exact sparse selection.  64 MiPixels
+# covers the 7,048 x 8,001 annotation canvases this editor commonly opens and
+# bounds the largest temporary flood mask to 64 MiB.
+MAX_SELECTION_SEARCH_PIXELS = 64 * 1024 * 1024
+
+# ``find_contours`` uses float work arrays that are substantially larger than
+# the uint8 local mask.  Above four MiPixels, retain the exact sparse object
+# but show its explicitly-marked rectangular preview instead.
+MAX_EXACT_OUTLINE_PIXELS = 4 * 1024 * 1024
 MAX_OUTLINE_VERTICES = 1024
+
+
+def _selection_index_dtype(shape: Sequence[int]) -> np.dtype:
+    """Return the smallest signed index dtype that can address ``shape``."""
+
+    largest_coordinate = max((int(size) - 1 for size in shape), default=0)
+    if largest_coordinate <= np.iinfo(np.int32).max:
+        return np.dtype(np.int32)
+    return np.dtype(np.int64)
 
 
 class SelectionTooLargeError(ValueError):
@@ -59,6 +83,24 @@ class AnnotationObjectSelection:
             int(self.columns.max()) + 1,
         )
 
+    def iter_indices(
+        self,
+        max_pixels: int = 256 * 1024,
+    ):
+        """Yield exact coordinate views in bounded read-only chunks.
+
+        The views preserve the flood's unique row-major ordering and do not
+        allocate new coordinate arrays. Selected-object Delete intentionally
+        uses its dedicated atomic sparse path rather than this iterator.
+        """
+
+        max_pixels = int(max_pixels)
+        if max_pixels < 1:
+            raise ValueError("max_pixels must be positive")
+        for start in range(0, self.pixel_count, max_pixels):
+            stop = min(self.pixel_count, start + max_pixels)
+            yield self.rows[start:stop], self.columns[start:stop]
+
     def translated(
         self,
         row_delta: int,
@@ -84,13 +126,25 @@ class AnnotationObjectSelection:
                 raise ValueError(
                     "The selected annotation cannot move outside the image"
                 )
-        rows = self.rows + row_delta
-        columns = self.columns + column_delta
+        # Keep ordinary slide selections compact after a translation.  The
+        # bounds check above makes the same-width signed addition safe.
+        row_offset = np.asarray(row_delta, dtype=self.rows.dtype)
+        column_offset = np.asarray(column_delta, dtype=self.columns.dtype)
+        rows = np.add(self.rows, row_offset, dtype=self.rows.dtype)
+        columns = np.add(
+            self.columns,
+            column_offset,
+            dtype=self.columns.dtype,
+        )
+        rows = np.ascontiguousarray(rows)
+        columns = np.ascontiguousarray(columns)
+        rows.setflags(write=False)
+        columns.setflags(write=False)
         offset = np.array([row_delta, column_delta], dtype=float)
         return AnnotationObjectSelection(
             value=self.value,
-            rows=np.ascontiguousarray(rows, dtype=np.intp),
-            columns=np.ascontiguousarray(columns, dtype=np.intp),
+            rows=rows,
+            columns=columns,
             outlines=tuple(
                 np.ascontiguousarray(outline + offset, dtype=float)
                 for outline in self.outlines
@@ -212,6 +266,7 @@ def select_visible_component(
     seed: Sequence[int],
     *,
     max_selection_pixels: int = MAX_SELECTION_PIXELS,
+    max_search_pixels: int = MAX_SELECTION_SEARCH_PIXELS,
     max_exact_outline_pixels: int = MAX_EXACT_OUTLINE_PIXELS,
     max_outline_vertices: int = MAX_OUTLINE_VERTICES,
     store_revision: int | None = None,
@@ -230,6 +285,8 @@ def select_visible_component(
         raise ValueError("max_exact_outline_pixels must be positive")
     if max_selection_pixels < 1:
         raise ValueError("max_selection_pixels must be positive")
+    if max_search_pixels < 1:
+        raise ValueError("max_search_pixels must be positive")
     if max_outline_vertices < 4:
         raise ValueError("max_outline_vertices must be at least 4")
     seed = tuple(seed)
@@ -241,23 +298,41 @@ def select_visible_component(
     value = int(projection[row, column])
     if value == 0:
         return None
+    index_dtype = _selection_index_dtype(projection.shape)
     try:
         rows, columns = bounded_flood_indices(
             projection,
             (row, column),
-            max_local_pixels=max_exact_outline_pixels,
+            max_local_pixels=max_search_pixels,
             max_component_pixels=max_selection_pixels,
             allow_full_fallback=False,
+            index_dtype=index_dtype,
         )
     except ValueError as error:
-        if "connected component exceeds" in str(error):
+        message = str(error)
+        if "pixel limit" in message:
             raise SelectionTooLargeError(
-                "This visible region is too large to select safely. Use "
-                "Erase/Fill for it, or select a smaller disconnected region."
+                "This connected region is too large to select safely; it "
+                "exceeds the "
+                f"{int(max_selection_pixels):,}-pixel selection limit."
+            ) from error
+        if "bounded flood window" in message:
+            raise SelectionTooLargeError(
+                "This connected region is too large to search safely; it "
+                "spans more than the "
+                f"{int(max_search_pixels):,}-pixel search window."
             ) from error
         raise
-    rows = np.ascontiguousarray(rows, dtype=np.intp)
-    columns = np.ascontiguousarray(columns, dtype=np.intp)
+    # np.nonzero (used by the compiled flood path) returns platform-sized
+    # indices.  A 32-bit signed coordinate is sufficient for normal slide
+    # dimensions and halves persistent selection memory on 64-bit systems.
+    rows = np.ascontiguousarray(rows, dtype=index_dtype)
+    columns = np.ascontiguousarray(columns, dtype=index_dtype)
+    # Delete history deliberately retains these compact arrays without a
+    # second N-pixel copy. Freeze them once the flood is final so stale UI or
+    # external references cannot redirect a later Undo/Redo target.
+    rows.setflags(write=False)
+    columns.setflags(write=False)
     outlines, full_outline = _component_outlines(
         rows,
         columns,
@@ -281,6 +356,7 @@ __all__ = [
     "MAX_EXACT_OUTLINE_PIXELS",
     "MAX_OUTLINE_VERTICES",
     "MAX_SELECTION_PIXELS",
+    "MAX_SELECTION_SEARCH_PIXELS",
     "SelectionTooLargeError",
     "select_visible_component",
 ]
